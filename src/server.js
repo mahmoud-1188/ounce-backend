@@ -16,6 +16,11 @@ import expensesRoutes from "./routes/expenses.routes.js";
 import taskirRoutes from "./routes/taskir.routes.js";
 import miscRoutes from "./routes/misc.routes.js";
 import bootstrapRoutes from "./routes/bootstrap.routes.js";
+import rfidRoutes from "./routes/rfid.routes.js";
+import fixedAssetsRoutes from "./routes/fixed-assets.routes.js";
+import payrollRoutes from "./routes/payroll.routes.js";
+import hqRoutes from "./routes/hq.routes.js";
+import priceFixRoutes from "./routes/price-fix.routes.js";
 
 const app = express();
 
@@ -57,6 +62,11 @@ app.use("/api", expensesRoutes);
 app.use("/api", taskirRoutes);
 app.use("/api", miscRoutes);
 app.use("/api", bootstrapRoutes);
+app.use("/api", rfidRoutes);
+app.use("/api", fixedAssetsRoutes);
+app.use("/api", payrollRoutes);
+app.use("/api", hqRoutes);
+app.use("/api", priceFixRoutes);
 
 // Centralized error handler — keeps internal error details out of the
 // response (they go to the server log instead), matching the "never leak

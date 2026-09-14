@@ -79,6 +79,24 @@ function requirePage(pageId) {
 }
 
 /**
+ * Like requirePage, but passes if the caller has ANY of the listed pages —
+ * for an action that legitimately belongs to more than one screen (e.g.
+ * binding an RFID tag to a unit: done from "التكويد" at intake, but also
+ * from stocktake/sales-return when an unknown tag turns up mid-scan, per
+ * the reference's RfidReaderPage/BindEpcSheet, which has no page guard of
+ * its own beyond whatever screen it's opened from).
+ */
+function requireAnyPage(...pageIds) {
+  return (req, res, next) => {
+    const allowed = req.auth?.allowedPages || [];
+    if (!pageIds.some((p) => allowed.includes(p))) {
+      return res.status(403).json({ error: "page_not_allowed", pages: pageIds });
+    }
+    next();
+  };
+}
+
+/**
  * Refuses the request if `actionId` is in the caller's role's
  * `deny_actions` — the server-side mirror of ROLES[role].denyActions in
  * constants.js. Comment there is explicit: "ما لا يُسمح به صراحةً يُمنع،
@@ -132,6 +150,7 @@ function requireManager(req, res, next) {
 export {
   authenticate,
   requirePage,
+  requireAnyPage,
   requireNotDenied,
   requireCanManageDay,
   requireCanBreak,
