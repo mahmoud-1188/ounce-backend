@@ -93,17 +93,21 @@ alter table receipts alter column amount drop not null;
 -- ============================================================
 
 alter table reservations enable row level security;
+drop policy if exists branch_isolation_reservations on reservations;
 create policy branch_isolation_reservations on reservations
   using (branch_id = current_setting('app.current_branch_id', true)::uuid);
 
 alter table repairs enable row level security;
+drop policy if exists branch_isolation_repairs on repairs;
 create policy branch_isolation_repairs on repairs
   using (branch_id = current_setting('app.current_branch_id', true)::uuid);
 
 alter table returns enable row level security;
+drop policy if exists branch_isolation_returns on returns;
 create policy branch_isolation_returns on returns
   using (branch_id = current_setting('app.current_branch_id', true)::uuid);
 
 alter table receipts enable row level security;
+drop policy if exists branch_isolation_receipts on receipts;
 create policy branch_isolation_receipts on receipts
   using (branch_id = current_setting('app.current_branch_id', true)::uuid);

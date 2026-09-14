@@ -664,4 +664,46 @@ router.post(
   }
 );
 
+// ══════════════════════════════════════════════════════════════
+//  سعر الذهب العالمي — fetchGoldPriceSAR (شاشة "سعر الذهب اليومي")
+// ══════════════════════════════════════════════════════════════
+//
+// ⚠ إصلاح أمني/وظيفي حقيقي: النسخة الأصلية في الفرونت إند كانت تنادي
+// https://api.anthropic.com/v1/messages مباشرة من المتصفح بلا أي مفتاح
+// API إطلاقًا (x-api-key) — هذا لا يعمل أصلًا (يُرفض 401 من Anthropic)،
+// وحتى لو أُضيف مفتاح فسيكون مكشوفًا لأي زائر لأنه في كود العميل. هنا
+// السعر يُجلب من الخادم فقط (gold-api.com — عام، بلا مفتاح مطلوب) ويُحوَّل
+// لريال سعودي بسعر الصرف الثابت المعروف (3.75)، مطابقةً تمامًا لمنطق
+// helpers.js الأصلي (perOunceUsd / GRAMS_PER_OUNCE * USD_TO_SAR_PEG).
+//
+// ⚠ كاش بالذاكرة لمدة دقيقة: يمنع كل مستخدمي كل الفروع المفتوحين على
+// الشاشة من ضرب gold-api.com بمعدل مرتفع غير ضروري (السعر العالمي أصلًا
+// لا يتغيّر كل ثانية)، بلا حاجة لجدول قاعدة بيانات لبيانات عابرة كهذي.
+const GRAMS_PER_OUNCE = 31.1034768;
+const USD_TO_SAR_PEG = 3.75;
+let goldPriceCache = { at: 0, data: null };
+const GOLD_PRICE_CACHE_MS = 60 * 1000;
+
+router.get("/gold-price", authenticate, async (req, res, next) => {
+  try {
+    if (goldPriceCache.data && Date.now() - goldPriceCache.at < GOLD_PRICE_CACHE_MS) {
+      return res.json(goldPriceCache.data);
+    }
+    const response = await fetch("https://api.gold-api.com/price/XAU");
+    if (!response.ok) throw new Error("gold_api_unavailable");
+    const body = await response.json();
+    const perOunceUsd = Number(body.price);
+    if (!Number.isFinite(perOunceUsd) || perOunceUsd <= 0) throw new Error("gold_api_invalid_price");
+    const perGramSar = roundMoney((perOunceUsd / GRAMS_PER_OUNCE) * USD_TO_SAR_PEG);
+    const payload = { perGram: perGramSar, asOf: body.updatedAt || body.updated_at || new Date().toISOString() };
+    goldPriceCache = { at: Date.now(), data: payload };
+    res.json(payload);
+  } catch (err) {
+    // ⚠ لا نُفشل بـ500 خام هنا: الفرونت إند يعامل أي خطأ كـ"تعذر الاتصال
+    // بالسعر العالمي" ويحتفظ بآخر سعر معروف — رسالة واضحة تكفي.
+    console.error("gold-price fetch failed:", err.message);
+    res.status(502).json({ error: "gold_price_unavailable" });
+  }
+});
+
 export default router;

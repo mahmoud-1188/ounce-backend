@@ -26,6 +26,7 @@ alter table taskir_entries alter column ref set not null;
 create unique index if not exists idx_taskir_entries_ref on taskir_entries(branch_id, ref);
 
 alter table taskir_entries enable row level security;
+drop policy if exists branch_isolation_taskir_entries on taskir_entries;
 create policy branch_isolation_taskir_entries on taskir_entries
   using (branch_id = current_setting('app.current_branch_id', true)::uuid);
 
