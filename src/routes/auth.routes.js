@@ -2,6 +2,7 @@ import { Router } from "express";
 import { withoutBranch } from "../db.js";
 import { verifyPin } from "../auth/hashPin.js";
 import { signSession } from "../auth/jwt.js";
+import { authenticate } from "../middleware/auth.js";
 
 const router = Router();
 
@@ -61,6 +62,30 @@ router.post("/auth/login", async (req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+/**
+ * GET /api/auth/me
+ *
+ * ⚠ إصلاح حقيقي: التوكن كان يُحفظ فعليًا (أولًا في sessionStorage ثم
+ * localStorage) لكن التطبيق لم يكن يملك أي مسار "استعادة جلسة" عند أي
+ * تحميل جديد للصفحة — currentUser في GoldInventoryApp.jsx هو React state
+ * فقط (يبدأ null دائمًا)، ولا شيء كان يتحقق من توكن محفوظ عند الإقلاع
+ * ليُعيد بناء الجلسة به. النتيجة: أي refresh كان يُظهر شاشة الدخول من
+ * جديد رغم أن التوكن نفسه لم تنتهِ صلاحيته بعد (12 ساعة). هذا الـendpoint
+ * يتحقق من توكن Authorization الموجود (عبر authenticate نفسه) ويرجّع
+ * بيانات المستخدم بنفس شكل استجابة /auth/login تمامًا — الفرونت إند
+ * يستخدمه عند الإقلاع لإعادة بناء الجلسة تلقائيًا بلا طلب PIN من جديد.
+ */
+router.get("/auth/me", authenticate, (req, res) => {
+  res.json({
+    user: {
+      id: req.auth.userId,
+      name: req.auth.user.name,
+      role: req.auth.role,
+      branchId: req.auth.branchId,
+    },
+  });
 });
 
 export default router;
