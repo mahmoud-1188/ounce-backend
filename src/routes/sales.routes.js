@@ -286,15 +286,20 @@ router.post("/sales", async (req, res, next) => {
         }
       }
 
-      for (const l of resolvedLines) {
+      // ⚠ line_no يُثبَّت هنا صراحةً (migration 013): sale_lines.id عشوائي
+      // (UUID) لا يعكس ترتيب الإدخال، وbootstrap/المرتجعات يحتاجان ترتيبًا
+      // حتميًا يطابق تمامًا ما رآه المستخدم في شاشة البيع (فهرس السطر عند
+      // الإرجاع لاحقًا).
+      for (let i = 0; i < resolvedLines.length; i++) {
+        const l = resolvedLines[i];
         await client.query(
           `insert into sale_lines
              (sale_id, item_id, category, karat, quantity, unit_price,
-              weight_snapshot, cost_per_gram_snapshot, workmanship_snapshot)
-           values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+              weight_snapshot, cost_per_gram_snapshot, workmanship_snapshot, line_no)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
           [
             sale.id, l.itemId, l.category, l.karat, l.quantity, l.unitPrice,
-            l.weightSnapshot, l.costPerGramSnapshot, l.workmanshipSnapshot,
+            l.weightSnapshot, l.costPerGramSnapshot, l.workmanshipSnapshot, i,
           ]
         );
       }
@@ -629,11 +634,13 @@ router.post("/sales/partial", async (req, res, next) => {
       );
       const sale = saleRows[0];
 
+      // ⚠ line_no = 0 دائمًا هنا: البيع الجزئي سطر واحد وحيد بحكم طبيعته
+      // (قطعة قابلة للانقسام واحدة لكل عملية) — لا تعداد مطلوب.
       await client.query(
         `insert into sale_lines
            (sale_id, item_id, category, karat, quantity, unit_price,
-            weight_snapshot, cost_per_gram_snapshot, workmanship_snapshot)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+            weight_snapshot, cost_per_gram_snapshot, workmanship_snapshot, line_no)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,0)`,
         [
           sale.id, item.id, item.category_id, item.karat, sellWeight, unitPrice,
           sellWeight, item.cost_per_gram, wmShare,
