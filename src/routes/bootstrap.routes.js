@@ -87,7 +87,21 @@ router.get("/bootstrap", async (req, res, next) => {
           order by sl.sale_id, sl.line_no`,
         [branchId]
       );
-      const lots = await client.query(`select * from lots where branch_id = $1 order by date desc`, [branchId]);
+      // ⚠ إصلاح حقيقي: كانت `select * from lots` تُرجِع صفّ الدفعة وحده،
+      // بلا payment_method/office_id/invoice_pending — هذه الأعمدة تعيش
+      // فعليًا على purchases (رأس الشراء)، لا على كل سطر lot بداخله.
+      // normalizeLots في الفرونت إند (core/normalize.js) تحتاجها لعرض
+      // طريقة السداد وحالة الفاتورة بنفس شكل المرجع القديم — LEFT JOIN
+      // (لا JOIN عادي) لأن lots القديمة (قبل migration 004) قد تحمل
+      // purchase_id = null.
+      const lots = await client.query(
+        `select l.*, p.payment_method, p.office_id, p.invoice_pending, p.pay_fees_now, p.notes as purchase_notes
+           from lots l
+           left join purchases p on p.id = l.purchase_id
+          where l.branch_id = $1
+          order by l.date desc`,
+        [branchId]
+      );
       const scrapItems = await client.query(`select * from scrap_items where branch_id = $1 order by created_at desc limit 500`, [branchId]);
       const scrapRequests = await client.query(`select * from scrap_requests where branch_id = $1 order by created_at desc limit 200`, [branchId]);
       const cashTx = await client.query(`select * from cash_tx where branch_id = $1 order by created_at desc limit 500`, [branchId]);
