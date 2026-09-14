@@ -402,4 +402,78 @@ router.post("/purchases", async (req, res, next) => {
   }
 });
 
+/**
+ * POST /api/suppliers  { name, phone?, isOfficial? }
+ *
+ * ⚠ ثغرة حقيقية مكتشفة: SuppliersSubPage.jsx (الفرونت إند) كان يضيف
+ * المورد عبر persistSuppliers فقط — كتابة محلية في window.storage لا
+ * تصل الباك إند إطلاقًا. النتيجة: المورد يظهر فورًا في الشاشة (state
+ * محلي)، وأي عملية شراء عليه تُبنى بمعرّف (id) لا وجود له في جدول
+ * suppliers الحقيقي. عند أي refresh/دخول جديد يُعاد استدعاء
+ * loadBootstrap() الذي يستبدل suppliers بالكامل بما يرجعه الخادم فعليًا
+ * (bootstrap.routes.js) — فيختفي المورد المحلي، ومعه أي دفعة/شراء بُني
+ * عليه. هذا الـendpoint يسدّ الفجوة: يُدرج المورد فعليًا في قاعدة
+ * البيانات بنفس شكل استجابة bootstrap (id/ref/name/phone/isOfficial)
+ * ليستبدل به الفرونت إند الكائن المحلي المؤقت.
+ */
+router.post("/suppliers", authenticate, requirePage("suppliers"), requireNotDenied("purchase"), async (req, res, next) => {
+  const body = req.body || {};
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  const phone = typeof body.phone === "string" ? body.phone.trim() : "";
+  const isOfficial = !!body.isOfficial;
+
+  if (!name) {
+    return res.status(400).json({ error: "name_required" });
+  }
+
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      const { rows: dupRows } = await client.query(
+        `select id from suppliers where branch_id = $1 and lower(trim(name)) = lower(trim($2))`,
+        [req.auth.branchId, name]
+      );
+      if (dupRows[0]) return { error: "supplier_name_exists" };
+
+      const { rows: refRows } = await client.query(
+        `select count(*)::int + 1 as n from suppliers where branch_id = $1`,
+        [req.auth.branchId]
+      );
+      const ref = `SUP-${String(refRows[0].n).padStart(6, "0")}`;
+
+      const { rows: supplierRows } = await client.query(
+        `insert into suppliers (branch_id, ref, name, phone, is_official, created_by)
+         values ($1,$2,$3,$4,$5,$6)
+         returning id, ref, name, phone, is_official, created_at`,
+        [req.auth.branchId, ref, name, phone || null, isOfficial, req.auth.userId]
+      );
+      const supplier = supplierRows[0];
+
+      await client.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
+         values ($1,'create',$2,'suppliers',$3,$4)`,
+        [req.auth.branchId, req.auth.userId, supplier.id, JSON.stringify({ ref: supplier.ref, name: supplier.name })]
+      );
+
+      return {
+        supplier: {
+          id: supplier.id,
+          ref: supplier.ref,
+          name: supplier.name,
+          phone: supplier.phone || "",
+          isOfficial: !!supplier.is_official,
+          createdAt: supplier.created_at,
+        },
+      };
+    });
+
+    if (result.error) {
+      const status = result.error === "supplier_name_exists" ? 409 : 400;
+      return res.status(status).json(result);
+    }
+    res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
 export default router;
