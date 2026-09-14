@@ -22,14 +22,17 @@ router.use("/bootstrap", authenticate);
  *
  * ⚠ نطاق متعمَّد: يغطي فقط الجداول التي بُنيت لها فعليًا endpoints كتابة
  * حقيقية حتى الآن (المبيعات، الشراء، الكسر، الخزنة/الإخراج، الأصناف،
- * المستخدمون). جداول أخرى موجودة في الـschema (رواتب، أصول ثابتة،
- * ميزانيات، GOSI...) غير موصولة بأي منطق باك إند بعد — ستُضاف لهذا
- * الـendpoint حين تُبنى فعليًا، لا نظريًا.
+ * المستخدمون، والآن الأصول الثابتة/الإهلاك — migration 015). جداول أخرى
+ * موجودة في الـschema (رواتب، ميزانيات، GOSI...) غير موصولة بأي منطق
+ * باك إند بعد — ستُضاف لهذا الـendpoint حين تُبنى فعليًا، لا نظريًا.
  *
  * ⚠ حساسية البيانات: قائمة المستخدمين هنا مُصغَّرة (بلا pin_hash وبلا
  * salary) خلافًا لـGET /api/users الكاملة (المحمية بصلاحية "access" فقط)
  * — لأن bootstrap يُحمَّل لكل مستخدم مسجَّل دخول بصرف النظر عن دوره، وراتب
- * الموظفين ليس بيانًا يجب أن يراه كل مستخدم.
+ * الموظفين ليس بيانًا يجب أن يراه كل مستخدم. لنفس السبب، بيانات الرواتب/
+ * HR كاملةً (migration 016 — payroll.routes.js) غير مُضمَّنة هنا إطلاقًا:
+ * تُجلَب فقط عند فتح شاشة الرواتب فعليًا (GET /api/hr/staff،
+ * /api/payroll/runs، ...) المحمية بصلاحية "payroll" لا كل مستخدم.
  */
 router.get("/bootstrap", async (req, res, next) => {
   try {
@@ -41,7 +44,10 @@ router.get("/bootstrap", async (req, res, next) => {
       // كل استعلام يُشغَّل بالتتابع (await) لا بالتوازي. لا مشكلة أداء
       // حقيقية هنا: كلها استعلامات فهرسة بسيطة على فرع واحد ضمن
       // معاملة قصيرة العمر أصلًا.
-      const branch = await client.query(`select id, ref, name from branches where id = $1`, [branchId]);
+      // is_hq مُضاف هنا (migration 017): بيانات فرع عادية لا حساسية فيها
+      // (خلاف الرواتب) — الواجهة تحتاجها لتقرّر إظهار تبويب "تقرير
+      // الفروع" من عدمه بلا استدعاء إضافي عند كل تحميل.
+      const branch = await client.query(`select id, ref, name, is_hq from branches where id = $1`, [branchId]);
       // ⚠ توسيع حقيقي: كان يُحمَّل عمود مُصغَّر لآخر يوم فقط، لكن WorkDayPage
       // في المرجع تعرض أيضًا سجل "الأيام السابقة" (ref، فتح/إقفال، مبيعات،
       // ربح، مصاريف) من businessDays نفسها — لا مصدر آخر له. نحمّل آخر 90
@@ -147,6 +153,18 @@ router.get("/bootstrap", async (req, res, next) => {
         `select * from receipts where branch_id = $1 order by created_at desc limit 300`,
         [branchId]
       );
+      const assetClasses = await client.query(`select * from asset_classes order by id`);
+      const fixedAssets = await client.query(
+        `select * from fixed_assets where branch_id = $1 order by purchased_at desc`,
+        [branchId]
+      );
+      const depreciationSchedule = await client.query(
+        `select d.* from depreciation_schedule d
+           join fixed_assets a on a.id = d.asset_id
+          where a.branch_id = $1
+          order by d.period`,
+        [branchId]
+      );
 
       return {
         branch: branch.rows[0] || null,
@@ -183,6 +201,9 @@ router.get("/bootstrap", async (req, res, next) => {
         repairs: repairs.rows,
         returns: returns.rows,
         receipts: receipts.rows,
+        assetClasses: assetClasses.rows,
+        fixedAssets: fixedAssets.rows,
+        depreciationSchedule: depreciationSchedule.rows,
       };
     });
 
