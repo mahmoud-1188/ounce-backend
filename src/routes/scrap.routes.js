@@ -616,4 +616,128 @@ router.post(
   }
 );
 
+// ── تحويل قطعة كسر مُصفَّاة لمخزون قابل للبيع — handleConvertScrap ──
+//
+// ⚠ لم يوجد أي مسار لكتابة items إطلاقًا قبل هذا (لا هنا ولا في
+// purchases.routes.js) — الفرونت إند كان يبني القطعة محليًا فقط ويخزّنها
+// في window.storage، فتختفي بعد إعادة تحميل الصفحة تمامًا كسجل الكسر نفسه.
+//
+// الشرط: القطعة يجب أن تكون "in_safe" فعليًا (وزنها مثبَّت من تكسير أو
+// استلام طلب مُعتمد) — لا تُدخَل قطعة "قيد الانتظار" لمخزون البيع بوزن
+// غير مؤكَّد. ووزنها لا يزال "في الخزنة" منطقيًا (دفتر خزنة الكسر 1230)؛
+// تحويلها لمخزون مشغول جاهز للبيع (1210) هو بالضبط ما يُعيد تصنيف الوزن.
+router.post(
+  "/scrap/:id/convert-to-item",
+  requireCanManageDay,
+  requireNotDenied("convertScrap"),
+  async (req, res, next) => {
+    const body = req.body || {};
+    const categoryId = body.categoryId || null;
+
+    try {
+      const result = await withBranch(req.auth.branchId, async (client) => {
+        const { rows } = await client.query(
+          "select * from scrap_items where id = $1 and branch_id = $2 for update",
+          [req.params.id, req.auth.branchId]
+        );
+        const item = rows[0];
+        if (!item) return { error: "scrap_item_not_found" };
+        if (item.stage !== "in_safe") {
+          return { error: "scrap_item_not_ready", stage: item.stage };
+        }
+        if (item.consumed_at) return { error: "scrap_item_already_converted" };
+
+        const karat = item.karat_final || item.karat_est;
+        const weight = roundWeight(Number(item.weight_remaining ?? item.weight_final ?? item.weight_est) || 0);
+        if (!(weight > 0)) return { error: "zero_weight" };
+
+        // ⚠ تصنيف صريح مطلوب: بلا category_id (NOT NULL FK) لا يمكن
+        // الإدراج — إن لم يُرسله الفرونت إند نأخذ أول تصنيف متاح للفرع
+        // (مشترك أو خاص به) بدل رفض العملية بلا داعٍ.
+        let finalCategoryId = categoryId;
+        if (finalCategoryId) {
+          const { rows: catRows } = await client.query(
+            "select id from categories where id = $1 and (branch_id = $2 or branch_id is null)",
+            [finalCategoryId, req.auth.branchId]
+          );
+          if (!catRows[0]) return { error: "category_not_found" };
+        } else {
+          const { rows: catRows } = await client.query(
+            "select id from categories where branch_id = $1 or branch_id is null order by branch_id nulls last limit 1",
+            [req.auth.branchId]
+          );
+          if (!catRows[0]) return { error: "no_category_available" };
+          finalCategoryId = catRows[0].id;
+        }
+
+        const { rows: refRows } = await client.query(
+          `select count(*)::int + 1 as n from items where branch_id = $1`,
+          [req.auth.branchId]
+        );
+        const ref = `ITM-${String(refRows[0].n).padStart(6, "0")}`;
+
+        const businessDayId = await openDay(client, req.auth.branchId);
+
+        const { rows: itemRows } = await client.query(
+          `insert into items
+             (branch_id, ref, category_id, karat, weight, stones_weight, cost_per_gram,
+              workmanship, lot_workmanship_share, from_scrap, business_day_id, created_by)
+           values ($1,$2,$3,$4,$5,0,$6, 0,0,true,$7,$8)
+           returning id, ref, karat, weight, date_added`,
+          [
+            req.auth.branchId, ref, finalCategoryId, karat, weight,
+            item.price_per_gram || null, businessDayId, req.auth.userId,
+          ]
+        );
+        const newItem = itemRows[0];
+
+        const { rows: unitRows } = await client.query(
+          `insert into item_units (item_id, code) values ($1,$2) returning id, code`,
+          [newItem.id, ref]
+        );
+
+        await client.query(
+          `update scrap_items set stage = 'used', weight_remaining = 0,
+             consumed_at = now(), consumed_by = $1, converted_item_id = $2
+           where id = $3`,
+          [req.auth.userId, newItem.id, item.id]
+        );
+
+        // ⚠ إعادة تصنيف وزن فقط (1230 → 1210) — لا قيد مالي: القيمة
+        // دخلت الدفاتر أصلًا وقت شراء الكسر (scrap_buy)، فلا تكلفة جديدة
+        // هنا، تمامًا كمنطق safe_gold_in/out بلا حساب نقدي مقابل.
+        await client.query(
+          `insert into gold_ledger_entries
+             (branch_id, business_day_id, op_type, karat, weight, fine_weight,
+              from_account, to_account, ref_table, ref_id, note, created_by)
+           values ($1,$2,'scrap_convert',$3,$4,$5, '1230','1210', 'items',$6,$7,$8)`,
+          [
+            req.auth.branchId, businessDayId, karat, weight, fineWeight(weight, karat),
+            newItem.id, `تحويل كسر ${item.ref} لمخزون`, req.auth.userId,
+          ]
+        );
+
+        return {
+          item: {
+            id: newItem.id, ref: newItem.ref, categoryId: finalCategoryId,
+            karat: newItem.karat, weight: Number(newItem.weight),
+            dateAdded: newItem.date_added, fromScrap: true,
+            scrapId: item.id, scrapRef: item.ref,
+            units: [{ code: unitRows[0].code, printed: false, sold: false }],
+          },
+        };
+      });
+      if (result.error) {
+        const status = result.error === "scrap_item_not_found" || result.error === "category_not_found"
+          ? 404
+          : 409;
+        return res.status(status).json(result);
+      }
+      res.status(201).json(result);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 export default router;

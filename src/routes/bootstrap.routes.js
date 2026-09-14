@@ -78,9 +78,13 @@ router.get("/bootstrap", async (req, res, next) => {
       const customers = await client.query(`select * from customers where branch_id = $1 order by name`, [branchId]);
       const suppliers = await client.query(`select * from suppliers where branch_id = $1 order by name`, [branchId]);
       const sales = await client.query(`select * from sales where branch_id = $1 order by date desc limit 500`, [branchId]);
+      // ⚠ ORDER BY line_no إلزامي (migration 013): بلا ترتيب حتمي، فهرس
+      // السطر الذي يراه المستخدم في الشاشة (ويُرسَل لاحقًا عند الإرجاع)
+      // قد لا يطابق أي سطر فعليًا على الخادم.
       const saleLines = await client.query(
         `select sl.* from sale_lines sl join sales s on s.id = sl.sale_id
-           where s.branch_id = $1`,
+           where s.branch_id = $1
+          order by sl.sale_id, sl.line_no`,
         [branchId]
       );
       const lots = await client.query(`select * from lots where branch_id = $1 order by date desc`, [branchId]);
@@ -107,6 +111,26 @@ router.get("/bootstrap", async (req, res, next) => {
       );
       const expenseNames = await client.query(
         `select * from expense_names where branch_id = $1 or branch_id is null order by name`,
+        [branchId]
+      );
+      // ⚠ الحجوزات/الإصلاحات/المرتجعات — migration 013 (كانت محلية بالكامل
+      // بلا أي عمود لها هنا قبل ذلك، فتختفي عند إعادة التحميل).
+      const reservations = await client.query(
+        `select r.*, c.name as customer_name from reservations r
+           left join customers c on c.id = r.customer_id
+          where r.branch_id = $1 order by r.created_at desc limit 300`,
+        [branchId]
+      );
+      const repairs = await client.query(
+        `select * from repairs where branch_id = $1 order by created_at desc limit 300`,
+        [branchId]
+      );
+      const returns = await client.query(
+        `select * from returns where branch_id = $1 order by created_at desc limit 300`,
+        [branchId]
+      );
+      const receipts = await client.query(
+        `select * from receipts where branch_id = $1 order by created_at desc limit 300`,
         [branchId]
       );
 
@@ -141,6 +165,10 @@ router.get("/bootstrap", async (req, res, next) => {
         users: users.rows,
         expenses: expenses.rows,
         expenseNames: expenseNames.rows,
+        reservations: reservations.rows,
+        repairs: repairs.rows,
+        returns: returns.rows,
+        receipts: receipts.rows,
       };
     });
 

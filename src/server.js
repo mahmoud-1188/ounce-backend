@@ -13,6 +13,8 @@ import inventoryRoutes from "./routes/inventory.routes.js";
 import dayRoutes from "./routes/day.routes.js";
 import settingsRoutes from "./routes/settings.routes.js";
 import expensesRoutes from "./routes/expenses.routes.js";
+import taskirRoutes from "./routes/taskir.routes.js";
+import miscRoutes from "./routes/misc.routes.js";
 import bootstrapRoutes from "./routes/bootstrap.routes.js";
 
 const app = express();
@@ -52,6 +54,8 @@ app.use("/api", inventoryRoutes);
 app.use("/api", dayRoutes);
 app.use("/api", settingsRoutes);
 app.use("/api", expensesRoutes);
+app.use("/api", taskirRoutes);
+app.use("/api", miscRoutes);
 app.use("/api", bootstrapRoutes);
 
 // Centralized error handler — keeps internal error details out of the
