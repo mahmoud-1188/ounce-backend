@@ -21,6 +21,7 @@ import fixedAssetsRoutes from "./routes/fixed-assets.routes.js";
 import payrollRoutes from "./routes/payroll.routes.js";
 import hqRoutes from "./routes/hq.routes.js";
 import priceFixRoutes from "./routes/price-fix.routes.js";
+import aiRoutes from "./routes/ai.routes.js";
 
 const app = express();
 
@@ -67,6 +68,7 @@ app.use("/api", fixedAssetsRoutes);
 app.use("/api", payrollRoutes);
 app.use("/api", hqRoutes);
 app.use("/api", priceFixRoutes);
+app.use("/api", aiRoutes);
 
 // Centralized error handler — keeps internal error details out of the
 // response (they go to the server log instead), matching the "never leak
