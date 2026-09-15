@@ -54,4 +54,27 @@ async function withoutBranch(fn) {
   }
 }
 
-export { pool, withBranch, withoutBranch };
+/**
+ * ⚠ مخصص للقراءة فقط (لا كتابة): يشغّل عدة استعلامات SELECT مستقلة بالتوازي
+ * (متزامنًا على اتصالات منفصلة من الـpool) بدل من التتابع على اتصال واحد كما
+ * تفعل withBranch. كل استعلام يأخذ اتصاله الخاص من الـpool ويضبط app.current_branch_id
+ * له فقط داخل معاملة قصيرة خاصة به (SET LOCAL لا يؤثر على اتصالات أخرى) — فالعزل
+ * بين الاستعلامات أمان تمامًا رغم تشغيلها في نفس اللحظة.
+ *
+ * ⚠ لا يُستخدم لأي عملية كتابة/تعديل تحتاج ذرية معاملة واحدة حقيقية (all-or-nothing) —
+ * لهذه تبقى withBranch أعلاه. يفيد فقط عند تجميع قراءات SELECT مستقلة لا تعتمد
+ * على بعضها البعض مثل GET /bootstrap.
+ *
+ * `tasks` مصفوفة من دوال async (client) => ... يُرجع كل منها قيمته
+ * بنفس الترتيب. حجم الـpool الافتراضي (10 اتصالات) يكفي لهذا
+ * الاستخدام طالما أنه يُستدعى مرة واحدة لكل دخول (لا عند كل تنقّل).
+ */
+async function withBranchParallel(branchId, tasks) {
+  return Promise.all(
+    tasks.map((task) =>
+      withBranch(branchId, task)
+    )
+  );
+}
+
+export { pool, withBranch, withoutBranch, withBranchParallel };
