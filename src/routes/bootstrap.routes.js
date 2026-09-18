@@ -86,6 +86,9 @@ router.get("/bootstrap", async (req, res, next) => {
       assetClasses,
       fixedAssets,
       depreciationSchedule,
+      journalEntriesRaw,
+      journalLinesRaw,
+      goldLedgerRaw,
     ] = await withBranchParallel(branchId, [
       // ⚠ توسيع حقيقي: كان يُحمَّل عمود مُصغَّر لآخر يوم فقط، لكن WorkDayPage
       // في المرجع تعرض أيضًا سجل "الأيام السابقة" (ref، فتح/إقفال، مبيعات،
@@ -204,7 +207,97 @@ router.get("/bootstrap", async (req, res, next) => {
             order by d.period`,
           [branchId]
         ),
+      // ⚠ إصلاح فجوة حقيقية (2026-09): كل عملية (بيع/شراء/مصروف/كسر...)
+      // تكتب فعليًا قيدًا متوازيًا في journal_entries/journal_lines عبر
+      // postJournalEntry (domain/journal.js)، ومشغّل check_journal_balance
+      // في schema.sql يمنع أي قيد غير متوازن على مستوى القاعدة نفسها — لا
+      // افتراض. لكن هذا الجدول لم يكن يُحمّل هنا إطلاقًا، فشاشات الأستاذ
+      // العام/اليومية/ميزان المراجعة/القوائم المالية المنقولة من مرجع
+      // العميل كانت تعمل على مصفوفة `journal` محلية بحتة (localStorage عبر
+      // window.storage) منفصلة تمامًا عن القيود الحقيقية. آخر 2000 قيد
+      // تكفي عمليًا (تفوق ما يعرضه أي تقرير دفعة واحدة) بلا إثقال bootstrap
+      // بسجل غير محدود.
+      (client) =>
+        client.query(
+          `select e.id, e.op_type, e.ref_table, e.ref_id, e.description,
+                  e.created_by, e.created_at, e.reversed_of,
+                  u.name as created_by_name,
+                  coalesce(pr.label, e.op_type) as label
+             from journal_entries e
+             left join users u on u.id = e.created_by
+             left join posting_rules pr on pr.op_type = e.op_type
+            where e.branch_id = $1
+            order by e.created_at desc
+            limit 2000`,
+          [branchId]
+        ),
+      (client) =>
+        client.query(
+          `select l.entry_id, l.account_code, l.side, l.amount
+             from journal_lines l
+             join journal_entries e on e.id = l.entry_id
+            where e.branch_id = $1
+            order by l.entry_id`,
+          [branchId]
+        ),
+      (client) =>
+        client.query(
+          `select g.id, g.op_type, g.karat, g.weight, g.fine_weight,
+                  g.from_account, g.to_account, g.ref_table, g.ref_id, g.note,
+                  g.created_at, u.name as created_by_name
+             from gold_ledger_entries g
+             left join users u on u.id = g.created_by
+            where g.branch_id = $1
+            order by g.created_at desc
+            limit 2000`,
+          [branchId]
+        ),
     ]);
+
+    const linesByEntry = new Map();
+    for (const l of journalLinesRaw.rows) {
+      if (!linesByEntry.has(l.entry_id)) linesByEntry.set(l.entry_id, []);
+      linesByEntry.get(l.entry_id).push({
+        account: l.account_code,
+        debit: l.side === "debit" ? Number(l.amount) : 0,
+        credit: l.side === "credit" ? Number(l.amount) : 0,
+      });
+    }
+    const reversedIds = new Set(
+      journalEntriesRaw.rows.filter((e) => e.reversed_of).map((e) => e.reversed_of)
+    );
+    const journal = journalEntriesRaw.rows.map((e) => ({
+      id: e.id,
+      ref: e.id.slice(0, 8).toUpperCase(),
+      date: e.created_at,
+      opType: e.op_type,
+      label: e.label,
+      lines: linesByEntry.get(e.id) || [],
+      note: e.description || "",
+      createdBy: e.created_by_name || "",
+      posted: true,
+      isReversal: !!e.reversed_of,
+      reversalOf: e.reversed_of || null,
+      reversed: reversedIds.has(e.id),
+      refTable: e.ref_table || null,
+      refId: e.ref_id || null,
+    }));
+
+    const goldLedger = [];
+    for (const r of goldLedgerRaw.rows) {
+      const base = {
+        id: r.id,
+        at: r.created_at,
+        ref: r.id.slice(0, 8).toUpperCase(),
+        opType: r.op_type,
+        karat: Number(r.karat),
+        weight: Number(r.weight),
+        note: r.note || "",
+        createdBy: r.created_by_name || "",
+      };
+      if (r.from_account) goldLedger.push({ ...base, accountCode: r.from_account, type: "out" });
+      if (r.to_account) goldLedger.push({ ...base, accountCode: r.to_account, type: "in" });
+    }
 
     res.json({
       branch: branch.rows[0] || null,
@@ -244,6 +337,8 @@ router.get("/bootstrap", async (req, res, next) => {
       assetClasses: assetClasses.rows,
       fixedAssets: fixedAssets.rows,
       depreciationSchedule: depreciationSchedule.rows,
+      journal,
+      goldLedger,
       currentUser: {
         id: req.auth.userId,
         name: req.auth.user.name,
