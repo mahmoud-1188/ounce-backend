@@ -1,12 +1,20 @@
 import { Router } from "express";
 import crypto from "node:crypto";
-import { withoutBranch } from "../db.js";
+import { withoutBranch, withBranch } from "../db.js";
 import { authenticateStore, requireStoreOwner, requireCanManageBranches } from "../middleware/storeAuth.js";
 import { buildConsolidatedReport } from "../domain/consolidatedReport.js";
 import { buildAnalyticsReport } from "../domain/analyticsReport.js";
 import { storeCanAddBranch } from "../domain/stores.js";
 import { hashPin } from "../auth/hashPin.js";
 import { hashPassword } from "../auth/hashPassword.js";
+import {
+  loadBranchUsersWithRoles,
+  createBranchUser,
+  renameBranchUser,
+  setBranchUserAi,
+  setBranchUserPermissions,
+  removeBranchUser,
+} from "../domain/branchUsers.js";
 
 const router = Router();
 
@@ -337,6 +345,141 @@ router.patch("/store/users/:id", requireStoreOwner, async (req, res, next) => {
       allowedPages: u.allowed_pages, canManageBranches: u.can_manage_branches,
       active: u.active, createdAt: u.created_at,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * إدارة مستخدمي فرعٍ بعينه عن بعد — نظير AccessSettingsPage.jsx تمامًا،
+ * لكن من الإدارة المركزية لا من داخل الفرع نفسه (المنطق نفسه حرفيًّا،
+ * مُستخرَجٌ في src/domain/branchUsers.js ومشترَك مع users.routes.js).
+ *
+ * ⚠ كل مسارٍ هنا يتحقق أولًا من أن الفرع فعلًا مملوكٌ لمتجر المستخدم
+ * المركزي الحالي (assertBranchInStore) قبل أي عملية — بلا هذا الفحص
+ * كان مستخدمٌ مركزي من متجرٍ سيستطيع إدارة مستخدمي فرعٍ من متجرٍ آخر
+ * تمامًا بمجرد معرفة معرّف الفرع (تسريبٌ أمني حقيقي بين مستأجرَين).
+ */
+async function assertBranchInStore(storeId, branchId) {
+  const { rows } = await withoutBranch((client) =>
+    client.query(`select 1 from branches where id = $1 and store_id = $2`, [branchId, storeId])
+  );
+  return !!rows[0];
+}
+
+/** GET /api/store/branches/:branchId/users */
+router.get("/store/branches/:branchId/users", requireCanManageBranches, async (req, res, next) => {
+  try {
+    if (!(await assertBranchInStore(req.storeAuth.storeId, req.params.branchId))) {
+      return res.status(404).json({ error: "branch_not_found" });
+    }
+    const users = await withBranch(req.params.branchId, (client) =>
+      loadBranchUsersWithRoles(client, req.params.branchId)
+    );
+    res.json(
+      users.map(({ id, name, ref, role, salary, can_use_ai, allowed_pages, allowed, active, created_at }) => ({
+        id, name, ref, role, salary, can_use_ai, allowed_pages, allowed, active, created_at,
+      }))
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** POST /api/store/branches/:branchId/users  { name, pin, role, salary } */
+router.post("/store/branches/:branchId/users", requireCanManageBranches, async (req, res, next) => {
+  const { name, pin, role, salary } = req.body || {};
+  if (!name || !String(name).trim()) {
+    return res.status(400).json({ error: "name_required" });
+  }
+  if (!/^\d{4,6}$/.test(String(pin || ""))) {
+    return res.status(400).json({ error: "pin_must_be_4_to_6_digits" });
+  }
+  try {
+    if (!(await assertBranchInStore(req.storeAuth.storeId, req.params.branchId))) {
+      return res.status(404).json({ error: "branch_not_found" });
+    }
+    const result = await withBranch(req.params.branchId, (client) =>
+      createBranchUser(client, req.params.branchId, { name, pin, role, salary })
+    );
+    if (result.error === "invalid_role") return res.status(400).json({ error: result.error });
+    if (result.error) return res.status(409).json({ error: result.error });
+    res.status(201).json(result.user);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** PATCH /api/store/branches/:branchId/users/:id/rename  { name } */
+router.patch("/store/branches/:branchId/users/:id/rename", requireCanManageBranches, async (req, res, next) => {
+  const { name } = req.body || {};
+  if (!name || !String(name).trim()) {
+    return res.status(400).json({ error: "name_required" });
+  }
+  try {
+    if (!(await assertBranchInStore(req.storeAuth.storeId, req.params.branchId))) {
+      return res.status(404).json({ error: "branch_not_found" });
+    }
+    const result = await withBranch(req.params.branchId, (client) =>
+      renameBranchUser(client, req.params.branchId, req.params.id, name)
+    );
+    if (result.error === "not_found") return res.status(404).json({ error: result.error });
+    if (result.error) return res.status(409).json({ error: result.error });
+    res.json(result.user);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** PATCH /api/store/branches/:branchId/users/:id/ai  { canUseAi } */
+router.patch("/store/branches/:branchId/users/:id/ai", requireCanManageBranches, async (req, res, next) => {
+  try {
+    if (!(await assertBranchInStore(req.storeAuth.storeId, req.params.branchId))) {
+      return res.status(404).json({ error: "branch_not_found" });
+    }
+    const result = await withBranch(req.params.branchId, (client) =>
+      setBranchUserAi(client, req.params.branchId, req.params.id, req.body?.canUseAi)
+    );
+    if (result.error === "not_found") return res.status(404).json({ error: result.error });
+    res.json(result.user);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** PATCH /api/store/branches/:branchId/users/:id/permissions  { allowedPages } */
+router.patch("/store/branches/:branchId/users/:id/permissions", requireCanManageBranches, async (req, res, next) => {
+  const { allowedPages } = req.body || {};
+  if (allowedPages !== null && !Array.isArray(allowedPages)) {
+    return res.status(400).json({ error: "allowedPages_must_be_array_or_null" });
+  }
+  try {
+    if (!(await assertBranchInStore(req.storeAuth.storeId, req.params.branchId))) {
+      return res.status(404).json({ error: "branch_not_found" });
+    }
+    const result = await withBranch(req.params.branchId, (client) =>
+      setBranchUserPermissions(client, req.params.branchId, req.params.id, allowedPages)
+    );
+    if (result.error === "not_found") return res.status(404).json({ error: result.error });
+    if (result.error) return res.status(409).json(result);
+    res.json(result.user);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** DELETE /api/store/branches/:branchId/users/:id */
+router.delete("/store/branches/:branchId/users/:id", requireCanManageBranches, async (req, res, next) => {
+  try {
+    if (!(await assertBranchInStore(req.storeAuth.storeId, req.params.branchId))) {
+      return res.status(404).json({ error: "branch_not_found" });
+    }
+    const result = await withBranch(req.params.branchId, (client) =>
+      removeBranchUser(client, req.params.branchId, req.params.id)
+    );
+    if (result.error === "not_found") return res.status(404).json({ error: result.error });
+    if (result.error) return res.status(409).json({ error: result.error });
+    res.status(204).end();
   } catch (err) {
     next(err);
   }

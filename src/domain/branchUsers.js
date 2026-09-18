@@ -1,0 +1,133 @@
+// ═══════════════════════════════════════════════════════════════════
+//  منطق مشترك لإدارة مستخدمي فرع — نظير AccessSettingsPage.jsx
+// ═══════════════════════════════════════════════════════════════════
+//
+// ⚠ استُخرج من users.routes.js (لا كُتب من الصفر) — نفس السلوك حرفيًّا،
+// فُصل ليُستدعى من مسارين مختلفين بنفس الضمانات (تكرار المنطق هنا كان
+// سيعني أن حارسًا كـwouldLockOutAccess قد يُنسى تحديثه في أحدهما لاحقًا):
+//   • /api/users/* (users.routes.js) — مستخدم فرعٍ يدير مستخدمي فرعه هو
+//     (جلسة branch عادية، PIN قصير).
+//   • /api/store/branches/:branchId/users (store.routes.js) — مستخدمٌ
+//     مركزي يدير مستخدمي أي فرعٍ من فروع متجره عن بعد (الطبقة العليا
+//     تتحقق من ملكية الفرع للمتجر أولًا — هذا الملف لا يعرف عن stores
+//     إطلاقًا، فقط عن branchId مُمرَّر إليه مُوثَّقًا مسبقًا).
+//
+// كل دالة هنا تُستدعى داخل withBranch(branchId, fn) من المستدعي (لا
+// تفتح معاملتها الخاصة) — لتبقى قابلة للتركيب مع أي معاملة أعلى مستقبلًا.
+
+import { hashPin, verifyPin } from "../auth/hashPin.js";
+import { normalizeName } from "../auth/normalizeName.js";
+import { currentAllowed, wouldLockOutAccess, wouldRemoveLastManager } from "../auth/permissions.js";
+
+async function loadBranchUsersWithRoles(client, branchId) {
+  const { rows } = await client.query(
+    `select u.*, r.allowed_tabs, r.allowed_more
+       from users u join roles r on r.id = u.role
+      where u.branch_id = $1 and u.active = true`,
+    [branchId]
+  );
+  return rows.map((u) => ({
+    ...u,
+    allowed: currentAllowed(u, { allowed_tabs: u.allowed_tabs, allowed_more: u.allowed_more }),
+  }));
+}
+
+/** POST — يُطابق add() + valid guard في AccessSettingsPage.jsx حرفيًّا. */
+async function createBranchUser(client, branchId, { name, pin, role, salary }) {
+  const roleId = role || "employee";
+  const { rows: roleRows } = await client.query("select 1 from roles where id = $1", [roleId]);
+  if (!roleRows[0]) return { error: "invalid_role" };
+
+  const existing = await loadBranchUsersWithRoles(client, branchId);
+
+  const nameTaken = existing.some((u) => normalizeName(u.name) === normalizeName(name));
+  if (nameTaken) return { error: "name_taken" };
+
+  // bcrypt hashes are salted per-row, so "is this PIN already used" can't
+  // be a SQL index lookup — نقارن ضد كل تجزئة قائمة في الفرع، تمامًا كحلقة
+  // pinTaken في الفرونت إند.
+  for (const u of existing) {
+    if (await verifyPin(pin, u.pin_hash)) return { error: "pin_taken" };
+  }
+
+  const pinHash = await hashPin(pin);
+  const { rows } = await client.query(
+    `insert into users (branch_id, name, role, pin_hash, salary)
+     values ($1, $2, $3, $4, $5)
+     returning id, name, role, salary, created_at`,
+    [branchId, name.trim(), roleId, pinHash, Number(salary) || 0]
+  );
+  return { user: rows[0] };
+}
+
+/** PATCH .../rename — يُطابق rename() حرفيًّا. */
+async function renameBranchUser(client, branchId, userId, name) {
+  const existing = await loadBranchUsersWithRoles(client, branchId);
+  const nameTaken = existing.some(
+    (u) => u.id !== userId && normalizeName(u.name) === normalizeName(name)
+  );
+  if (nameTaken) return { error: "name_taken" };
+  const { rows } = await client.query(
+    `update users set name = $1 where id = $2 and branch_id = $3 returning id, name`,
+    [name.trim(), userId, branchId]
+  );
+  if (!rows[0]) return { error: "not_found" };
+  return { user: rows[0] };
+}
+
+/** PATCH .../ai — يُطابق toggleAi() حرفيًّا. */
+async function setBranchUserAi(client, branchId, userId, canUseAi) {
+  const { rows } = await client.query(
+    `update users set can_use_ai = $1 where id = $2 and branch_id = $3
+     returning id, can_use_ai`,
+    [!!canUseAi, userId, branchId]
+  );
+  if (!rows[0]) return { error: "not_found" };
+  return { user: rows[0] };
+}
+
+/** PATCH .../permissions — يُطابق togglePage()/resetToRole() حرفيًّا (null = افتراضي الدور). */
+async function setBranchUserPermissions(client, branchId, userId, allowedPages) {
+  const existing = await loadBranchUsersWithRoles(client, branchId);
+  const target = existing.find((u) => u.id === userId);
+  if (!target) return { error: "not_found" };
+
+  if (allowedPages !== null) {
+    if (wouldLockOutAccess(existing, target.id, allowedPages)) {
+      return {
+        error: "would_lock_out_access",
+        message: "لا يمكن إزالة «صلاحيات الوصول» من آخر مستخدم يملكها — سيتعذّر تعديل أي صلاحية بعدها.",
+      };
+    }
+  }
+
+  const { rows } = await client.query(
+    `update users set allowed_pages = $1 where id = $2 and branch_id = $3
+     returning id, allowed_pages`,
+    [allowedPages === null ? null : JSON.stringify(allowedPages), userId, branchId]
+  );
+  return { user: rows[0] };
+}
+
+/** DELETE — يُطابق remove() حرفيًّا (يرفض حذف آخر manager، تعطيلٌ منطقي لا حذف). */
+async function removeBranchUser(client, branchId, userId) {
+  const existing = await loadBranchUsersWithRoles(client, branchId);
+  if (wouldRemoveLastManager(existing, userId)) {
+    return { error: "would_remove_last_manager" };
+  }
+  const { rowCount } = await client.query(
+    `update users set active = false where id = $1 and branch_id = $2`,
+    [userId, branchId]
+  );
+  if (!rowCount) return { error: "not_found" };
+  return { ok: true };
+}
+
+export {
+  loadBranchUsersWithRoles,
+  createBranchUser,
+  renameBranchUser,
+  setBranchUserAi,
+  setBranchUserPermissions,
+  removeBranchUser,
+};
