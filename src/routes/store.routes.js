@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import { withoutBranch } from "../db.js";
 import { authenticateStore, requireStoreOwner } from "../middleware/storeAuth.js";
 import { buildConsolidatedReport } from "../domain/consolidatedReport.js";
+import { buildAnalyticsReport } from "../domain/analyticsReport.js";
 import { storeCanAddBranch } from "../domain/stores.js";
 import { hashPin } from "../auth/hashPin.js";
 
@@ -59,6 +60,36 @@ router.get("/store/report", async (req, res, next) => {
 
       const { branches: rows, totals } = await buildConsolidatedReport(client, branches, periodStart);
       return { period, branches: rows, totals };
+    });
+
+    res.json(report);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/store/analytics?period=YYYY-MM
+ * نظير HqAnalytics.js في المرجع — ترتيب الفروع بمقاييس متعددة (نمو،
+ * دوران مخزون، مبيعات لكل موظف)، توزيع طرق الدفع، وتوزيع المخزون
+ * بالعيار، وأعلى البائعين. راجع src/domain/analyticsReport.js.
+ */
+router.get("/store/analytics", async (req, res, next) => {
+  try {
+    const period = /^\d{4}-\d{2}$/.test(req.query.period || "")
+      ? req.query.period
+      : new Date().toISOString().slice(0, 7);
+    const periodStart = `${period}-01`;
+
+    const report = await withoutBranch(async (client) => {
+      const { rows: branches } = await client.query(
+        `select id, ref, name from branches where store_id = $1 order by name`,
+        [req.storeAuth.storeId]
+      );
+      if (!branches.length) return { period, branches: [], byMethod: [], byKarat: [], topSellers: [] };
+
+      const analytics = await buildAnalyticsReport(client, branches, periodStart);
+      return { period, ...analytics };
     });
 
     res.json(report);
