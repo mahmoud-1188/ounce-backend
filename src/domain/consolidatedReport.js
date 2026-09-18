@@ -33,15 +33,25 @@ async function buildConsolidatedReport(client, branches, periodStart) {
     [branchIds, periodStart]
   );
 
+  // ⚠ إصلاح خطأ حقيقي (ظهر فقط عند أول استخدام فعلي بفرع ببيانات
+  // مشتريات حقيقية — لا lots ولا أي فرع اختباري فارغ كان يُظهره):
+  // weight/cost_per_gram/date_added أعمدة تعيش فعليًا على items (كل
+  // لوت يُقسَّم لعناصر، كل عنصر له وزنه وتكلفته وتاريخ إضافته الخاص —
+  // راجع schema.sql)، لا على lots نفسها مباشرة. الاستعلام الأصلي
+  // (المنقول حرفيًّا من hq.routes.js القديم) افترض عمودَين لا وجود
+  // لهما على lots، فكان يفشل بخطأ SQL "column does not exist" في كل
+  // مرة تُستدعى فيها هذه الدالة على فرع فيه مشتريات فعلية — نفس نمط
+  // الـLEFT JOIN الموثَّق في bootstrap.routes.js لنفس العلاقة.
   const { rows: purchaseRows } = await client.query(
-    `select branch_id,
-            count(*)::int as purchases_count,
-            coalesce(sum(weight), 0) as purchases_weight,
-            coalesce(sum(weight * cost_per_gram), 0) as purchases_cost
-       from lots
-      where branch_id = any($1)
-        and date_added >= $2::date and date_added < ($2::date + interval '1 month')
-      group by branch_id`,
+    `select l.branch_id,
+            count(distinct l.id)::int as purchases_count,
+            coalesce(sum(i.weight), 0) as purchases_weight,
+            coalesce(sum(i.weight * i.cost_per_gram), 0) as purchases_cost
+       from lots l
+       join items i on i.lot_id = l.id
+      where l.branch_id = any($1)
+        and i.date_added >= $2::date and i.date_added < ($2::date + interval '1 month')
+      group by l.branch_id`,
     [branchIds, periodStart]
   );
 
