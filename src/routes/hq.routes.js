@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { withoutBranch } from "../db.js";
 import { authenticate, requirePage } from "../middleware/auth.js";
-import { PURITY } from "../domain/weight.js";
+import { buildConsolidatedReport } from "../domain/consolidatedReport.js";
 
 const router = Router();
 
@@ -31,9 +31,16 @@ router.use("/hq", authenticate, requirePage("hqReports"));
 
 async function assertHqBranch(req) {
   const { rows } = await withoutBranch((client) =>
-    client.query(`select is_hq from branches where id = $1`, [req.auth.branchId])
+    client.query(`select is_hq, store_id from branches where id = $1`, [req.auth.branchId])
   );
-  return !!rows[0]?.is_hq;
+  const row = rows[0];
+  // ⚠ إصلاح فجوة عزل حقيقية (migration 020_stores_multi_tenant.sql):
+  // قبل stores كانت كل الفروع في القاعدة لمتجر واحد ضمنيًا، فكان
+  // `select ... from branches` بلا فلتر آمنًا. الآن مع تعدّد المتاجر
+  // (multi-tenant)، ذاك الاستعلام كان سيرجع فروع كل المتاجر — تسريب مالي
+  // حقيقي بين متجر وآخر. لذا يُرجع store_id الآن مع نتيجة الفحص، ليستخدمه
+  // المستدعي لقصر قائمة الفروع على متجره فقط.
+  return { isHq: !!row?.is_hq, storeId: row?.store_id || null };
 }
 
 /**
@@ -46,7 +53,7 @@ async function assertHqBranch(req) {
  */
 router.get("/hq/report", async (req, res, next) => {
   try {
-    const isHq = await assertHqBranch(req);
+    const { isHq, storeId } = await assertHqBranch(req);
     if (!isHq) {
       return res.status(403).json({ error: "not_hq_branch" });
     }
@@ -57,163 +64,19 @@ router.get("/hq/report", async (req, res, next) => {
     const periodStart = `${period}-01`;
 
     const report = await withoutBranch(async (client) => {
+      // ⚠ مقيّد بstore_id عمدًا — بلاه هذا الاستعلام كان سيرجّع فروع
+      // كل المتاجر معًا في تقرير إدارة متجر واحد — تسريب مالي حقيقي
+      // بين متجرين منفصلين تمامًا (مراجع assertHqBranch أعلاه).
       const { rows: branches } = await client.query(
-        `select id, ref, name from branches order by name`
+        `select id, ref, name from branches where store_id = $1 order by name`,
+        [storeId]
       );
       if (!branches.length) return { period, branches: [] };
-      const branchIds = branches.map((b) => b.id);
 
-      // مبيعات الفترة: إجمالي، صافٍ (بعد الضريبة)، عدد الفواتير — لكل فرع.
-      const { rows: salesRows } = await client.query(
-        `select branch_id,
-                count(*)::int as sales_count,
-                coalesce(sum(total), 0) as sales_total,
-                coalesce(sum(net_amount), 0) as sales_net
-           from sales
-          where branch_id = any($1)
-            and date >= $2::date and date < ($2::date + interval '1 month')
-          group by branch_id`,
-        [branchIds, periodStart]
-      );
-
-      // مشتريات الفترة (وزن ذهب داخل عبر lots — من جدول lots كما تُبنى
-      // شاشة المشتريات الحالية: تكلفة اللوت الإجمالية + وزنه).
-      const { rows: purchaseRows } = await client.query(
-        `select branch_id,
-                count(*)::int as purchases_count,
-                coalesce(sum(weight), 0) as purchases_weight,
-                coalesce(sum(weight * cost_per_gram), 0) as purchases_cost
-           from lots
-          where branch_id = any($1)
-            and date_added >= $2::date and date_added < ($2::date + interval '1 month')
-          group by branch_id`,
-        [branchIds, periodStart]
-      );
-
-      // مخزون قائم (غير مُباع) لكل فرع، مجمّعًا للوزن المعادل عيار 24
-      // وتكلفته — بنفس منطق PURITY المستخدم في كل الحسابات الأخرى.
-      const { rows: itemRows } = await client.query(
-        `select i.branch_id, i.karat, i.weight, i.cost_per_gram, i.workmanship
-           from items i
-           join item_units u on u.item_id = i.id
-          where i.branch_id = any($1) and u.sold = false`,
-        [branchIds]
-      );
-
-      // رصيد الخزنة نقدًا/شبكة لكل فرع.
-      const { rows: safeCashRows } = await client.query(
-        `select branch_id, method,
-                coalesce(sum(case when direction = 'in' then amount else -amount end), 0) as balance
-           from cash_tx
-          where branch_id = any($1) and pool = 'safe'
-          group by branch_id, method`,
-        [branchIds]
-      );
-
-      // رصيد ذهب الخزنة لكل فرع (معادل 24).
-      const { rows: safeGoldRows } = await client.query(
-        `select branch_id, karat,
-                coalesce(sum(case when direction = 'in' then weight else -weight end), 0) as balance
-           from safe_gold_tx
-          where branch_id = any($1)
-          group by branch_id, karat`,
-        [branchIds]
-      );
-
-      // ذمم مدينة (عملاء آجل، حساب 1310) وذمم دائنة (موردون، 2110) —
-      // من journal_lines (لا branch_id فيها مباشرة — عبر الانضمام لـ
-      // journal_entries التي تحمله) بنفس منهج رصيد أي حساب في هذا الباك
-      // إند: مجموع مدين ناقص دائن للحسابات المدينة بطبيعتها والعكس للدائنة.
-      const { rows: balanceRows } = await client.query(
-        `select e.branch_id, l.account_code,
-                coalesce(sum(case when l.side = 'debit' then l.amount else -l.amount end), 0) as balance
-           from journal_lines l
-           join journal_entries e on e.id = l.entry_id
-          where e.branch_id = any($1) and l.account_code in ('1310', '2110')
-          group by e.branch_id, l.account_code`,
-        [branchIds]
-      );
-
-      const byBranch = new Map(
-        branches.map((b) => [
-          b.id,
-          {
-            branchId: b.id,
-            branchRef: b.ref,
-            branchName: b.name,
-            sales: { count: 0, total: 0, net: 0 },
-            purchases: { count: 0, weight: 0, cost: 0 },
-            inventory: { fineWeight: 0, cost: 0 },
-            safe: { cash: 0, network: 0, goldFineWeight: 0 },
-            receivable: 0,
-            payable: 0,
-          },
-        ])
-      );
-
-      for (const r of salesRows) {
-        const b = byBranch.get(r.branch_id);
-        if (!b) continue;
-        b.sales = { count: r.sales_count, total: Number(r.sales_total), net: Number(r.sales_net) };
-      }
-      for (const r of purchaseRows) {
-        const b = byBranch.get(r.branch_id);
-        if (!b) continue;
-        b.purchases = {
-          count: r.purchases_count,
-          weight: Number(r.purchases_weight),
-          cost: Number(r.purchases_cost),
-        };
-      }
-      for (const r of itemRows) {
-        const b = byBranch.get(r.branch_id);
-        if (!b) continue;
-        const purity = PURITY[r.karat] || Number(r.karat) / 24;
-        const weight = Number(r.weight) || 0;
-        b.inventory.fineWeight += weight * purity;
-        b.inventory.cost += weight * (Number(r.cost_per_gram) || 0) + (Number(r.workmanship) || 0);
-      }
-      for (const r of safeCashRows) {
-        const b = byBranch.get(r.branch_id);
-        if (!b) continue;
-        if (r.method === "cash") b.safe.cash = Number(r.balance);
-        else if (r.method === "network") b.safe.network = Number(r.balance);
-      }
-      for (const r of safeGoldRows) {
-        const b = byBranch.get(r.branch_id);
-        if (!b) continue;
-        const purity = PURITY[r.karat] || Number(r.karat) / 24;
-        b.safe.goldFineWeight += Number(r.balance) * purity;
-      }
-      for (const r of balanceRows) {
-        const b = byBranch.get(r.branch_id);
-        if (!b) continue;
-        if (r.account_code === "1310") b.receivable = Number(r.balance);
-        else if (r.account_code === "2110") b.payable = -Number(r.balance); // دائن بطبيعته: نعكس الإشارة لعرضه رقمًا موجبًا
-      }
-
-      const rows = branches.map((b) => byBranch.get(b.id));
-      const totals = rows.reduce(
-        (acc, b) => {
-          acc.salesTotal += b.sales.total;
-          acc.salesNet += b.sales.net;
-          acc.purchasesCost += b.purchases.cost;
-          acc.inventoryFineWeight += b.inventory.fineWeight;
-          acc.inventoryCost += b.inventory.cost;
-          acc.safeCash += b.safe.cash;
-          acc.safeNetwork += b.safe.network;
-          acc.safeGoldFineWeight += b.safe.goldFineWeight;
-          acc.receivable += b.receivable;
-          acc.payable += b.payable;
-          return acc;
-        },
-        {
-          salesTotal: 0, salesNet: 0, purchasesCost: 0,
-          inventoryFineWeight: 0, inventoryCost: 0,
-          safeCash: 0, safeNetwork: 0, safeGoldFineWeight: 0,
-          receivable: 0, payable: 0,
-        }
-      );
+      // ⚠ منطق التجميع نفسه مُستخرَج إلى src/domain/consolidatedReport.js
+      // ليشترك فيه هذا المسار (القديم، فرع is_hq واحد) ومسار
+      // /api/store/report (الجديد، جلسة مستخدم مركزي) دون تكرار.
+      const { branches: rows, totals } = await buildConsolidatedReport(client, branches, periodStart);
 
       return { period, branches: rows, totals };
     });
