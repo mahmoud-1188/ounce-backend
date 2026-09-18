@@ -61,6 +61,11 @@ async function authenticateStore(req, res, next) {
       storeId: storeUser.store_id,
       role: storeUser.role,
       name: storeUser.name,
+      // ⚠ null يعني "owner بلا قيد" (نفس اتفاقية allowed_pages في جدول
+      // users لمستخدم الفرع) — لا "لا شيء مسموح". راجع
+      // migration 023_store_user_permissions.sql.
+      allowedPages: storeUser.allowed_pages,
+      canManageBranches: !!storeUser.can_manage_branches,
     };
     next();
   } catch (err) {
@@ -68,7 +73,7 @@ async function authenticateStore(req, res, next) {
   }
 }
 
-/** يقصر مسارًا على owner فقط — إضافة/حذف موظفي المركزي مثلًا. */
+/** يقصر مسارًا على owner فقط — إضافة/حذف موظفي المركزي أنفسهم مثلًا. */
 function requireStoreOwner(req, res, next) {
   if (req.storeAuth?.role !== "owner") {
     return res.status(403).json({ error: "owner_only" });
@@ -76,4 +81,17 @@ function requireStoreOwner(req, res, next) {
   next();
 }
 
-export { authenticateStore, requireStoreOwner };
+/**
+ * يقصر مسارًا على owner أو موظفٍ مُصرَّح له صراحةً بإدارة الفروع
+ * (can_manage_branches) — إنشاء فرعٍ جديد قرارٌ تجاري لا شاشة عرض،
+ * فمستقلٌّ عمدًا عن allowedPages (رؤية شاشة الفروع لا تعني إنشاء فرعٍ
+ * فيها بالضرورة).
+ */
+function requireCanManageBranches(req, res, next) {
+  if (req.storeAuth?.role === "owner" || req.storeAuth?.canManageBranches) {
+    return next();
+  }
+  return res.status(403).json({ error: "cannot_manage_branches" });
+}
+
+export { authenticateStore, requireStoreOwner, requireCanManageBranches };

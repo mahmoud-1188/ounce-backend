@@ -79,6 +79,8 @@ router.post("/store-auth/login", async (req, res, next) => {
         name: storeUser.name,
         role: storeUser.role,
         storeId: storeUser.store_id,
+        allowedPages: storeUser.allowed_pages,
+        canManageBranches: !!storeUser.can_manage_branches,
       },
     });
   } catch (err) {
@@ -98,6 +100,8 @@ router.get("/store-auth/me", authenticateStore, (req, res) => {
       name: req.storeAuth.name,
       role: req.storeAuth.role,
       storeId: req.storeAuth.storeId,
+      allowedPages: req.storeAuth.allowedPages,
+      canManageBranches: req.storeAuth.canManageBranches,
     },
   });
 });
