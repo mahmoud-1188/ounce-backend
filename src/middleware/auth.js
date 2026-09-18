@@ -25,6 +25,14 @@ async function authenticate(req, res, next) {
     return res.status(401).json({ error: "invalid_or_expired_token" });
   }
 
+  // ⚠ رفض صريح لتوكن store_users (scope: "store" — راجع
+  // storeAuth.js): بلاه كان payload.branchId المفقود سيجعل
+  // الاستعلام أدناه يفشل بصمت "مستخدم غير موجود" بدل رفض
+  // صريح لسبب الفشل الحقيقي (نوع توكن خاطئ).
+  if (payload.scope && payload.scope !== "branch") {
+    return res.status(401).json({ error: "wrong_token_scope" });
+  }
+
   try {
     const { rows } = await withoutBranch((client) =>
       client.query(
