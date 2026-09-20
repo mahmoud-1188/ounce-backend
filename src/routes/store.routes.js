@@ -5,7 +5,6 @@ import { authenticateStore, requireStoreOwner, requireCanManageBranches } from "
 import { buildConsolidatedReport } from "../domain/consolidatedReport.js";
 import { buildAnalyticsReport } from "../domain/analyticsReport.js";
 import { storeCanAddBranch } from "../domain/stores.js";
-import { hashPin } from "../auth/hashPin.js";
 import { hashPassword } from "../auth/hashPassword.js";
 import {
   loadBranchUsersWithRoles,
@@ -145,8 +144,6 @@ router.post("/store/branches", requireCanManageBranches, async (req, res, next) 
       });
     }
 
-    const pinHash = await hashPin(managerPin);
-
     const result = await withoutBranch(async (client) => {
       let ref;
       for (let attempt = 0; attempt < 5; attempt++) {
@@ -170,18 +167,23 @@ router.post("/store/branches", requireCanManageBranches, async (req, res, next) 
       );
       const branch = branchRows[0];
 
-      // ⚠ allowed_pages = null عمدًا (لا مصفوفة فارغة): permissions.js
-      // يعتبر null "استخدم صلاحيات الدور الافتراضية" — manager الجديد
-      // يحصل فورًا على كل صلاحيات دور manager الافتراضية، تمامًا كأي
+      // ⚠ عبر createBranchUser المشتركة (لا INSERT يدوي منفصل كما كان
+      // سابقًا) — نفس المسار الذي يستخدمه أي إنشاء موظفٍ آخر، فيحصل
+      // مدير الفرع الجديد على ref فورًا مثل أي موظف (كان يبقى null هنا
+      // تحديدًا قبل هذا الإصلاح، رغم أنه يُولَّد بشكل صحيح في كل مسار
+      // إنشاء موظفٍ آخر). allowed_pages تبقى null ضمنيًّا داخل الدالة —
+      // permissions.js يعتبرها "استخدم صلاحيات الدور الافتراضية"، فيحصل
+      // المدير فورًا على كل صلاحيات دور manager الافتراضية، تمامًا كأي
       // manager يُنشأ من AccessSettingsPage داخل فرع قائم.
-      const { rows: userRows } = await client.query(
-        `insert into users (branch_id, name, role, pin_hash)
-         values ($1, $2, 'manager', $3)
-         returning id, name, role, created_at`,
-        [branch.id, managerName.trim(), pinHash]
-      );
+      const created = await createBranchUser(client, branch.id, {
+        name: managerName.trim(),
+        pin: managerPin,
+        role: "manager",
+        salary: 0,
+      });
+      if (created.error) return { error: created.error };
 
-      return { branch, manager: userRows[0] };
+      return { branch, manager: created.user };
     });
 
     if (result.error) return res.status(500).json({ error: result.error });
