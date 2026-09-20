@@ -19,6 +19,36 @@ import { hashPin, verifyPin } from "../auth/hashPin.js";
 import { normalizeName } from "../auth/normalizeName.js";
 import { currentAllowed, wouldLockOutAccess, wouldRemoveLastManager } from "../auth/permissions.js";
 
+// ⚠ رمز موظف قصير (4 محارف) ليُقال ويُكتب بسهولة على أرض المحل — أقصر
+// عمدًا من رمز الفرع (BR-XXXXXXXX، ثماني محارف): الفرع يُنشأ نادرًا
+// ويُدخله مدير مرة واحدة على جهاز، بينما رمز الموظف يُكتب يوميًّا في
+// شاشة الدخول (راجع PriceLoginScreen.jsx) فطوله يُكلَّف كل يوم لا مرة.
+// حروف مستبعدة عمدًا لتفادي الالتباس: 0/O، 1/I/L — يُنطق الرمز بصوتٍ
+// عالٍ أحيانًا، فتشابه الشكل يعني خطأً متكررًا.
+const EMPLOYEE_REF_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+
+function randomEmployeeRefCandidate() {
+  let out = "";
+  for (let i = 0; i < 4; i++) {
+    out += EMPLOYEE_REF_ALPHABET[Math.floor(Math.random() * EMPLOYEE_REF_ALPHABET.length)];
+  }
+  return out;
+}
+
+/**
+ * يولّد رمز موظفٍ فريدًا (users.ref فريدٌ على مستوى كل قاعدة البيانات،
+ * لا الفرع وحده — راجع migration 002) ويتحقق من عدم تكراره فعليًّا قبل
+ * إرجاعه، بنفس نمط توليد ref الفرع في store.routes.js تمامًا.
+ */
+async function generateUniqueEmployeeRef(client) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const candidate = randomEmployeeRefCandidate();
+    const { rows } = await client.query("select 1 from users where ref = $1", [candidate]);
+    if (!rows.length) return candidate;
+  }
+  return null;
+}
+
 async function loadBranchUsersWithRoles(client, branchId) {
   const { rows } = await client.query(
     `select u.*, r.allowed_tabs, r.allowed_more
@@ -51,11 +81,12 @@ async function createBranchUser(client, branchId, { name, pin, role, salary }) {
   }
 
   const pinHash = await hashPin(pin);
+  const ref = await generateUniqueEmployeeRef(client);
   const { rows } = await client.query(
-    `insert into users (branch_id, name, role, pin_hash, salary)
-     values ($1, $2, $3, $4, $5)
-     returning id, name, role, salary, created_at`,
-    [branchId, name.trim(), roleId, pinHash, Number(salary) || 0]
+    `insert into users (branch_id, name, role, pin_hash, salary, ref)
+     values ($1, $2, $3, $4, $5, $6)
+     returning id, name, role, salary, ref, created_at`,
+    [branchId, name.trim(), roleId, pinHash, Number(salary) || 0, ref]
   );
   return { user: rows[0] };
 }
