@@ -7,6 +7,36 @@ import { authenticate } from "../middleware/auth.js";
 const router = Router();
 
 /**
+ * GET /api/branches/by-ref/:ref
+ *
+ * ⚠ يحل رمز فرعٍ عام (branches.ref، مثل BR-A1B2C3D4 — نفس الرمز المولَّد
+ * تلقائيًا عند إنشاء الفرع من ounce-central، راجع POST /store/branches)
+ * إلى {branchId, branchName} — علنيٌّ بلا مصادقة عمدًا، تمامًا كنظيره
+ * GET /branches/:branchId/users أدناه: هذا ما يستدعيه تطبيق الفرع أول
+ * مرة يُفتح فيها رابط الفرع (مثل /b/BR-A1B2C3D4) على جهاز جديد، أي
+ * *قبل* أي تسجيل دخول، ليعرف أي فرعٍ يخدم فيبدأ بحفظه محليًا.
+ *
+ * لا تسريب بيانات حسّاسة هنا (لا PIN ولا حتى قائمة الموظفين) — فقط
+ * الحد الأدنى لتفعيل الجهاز: هوية الفرع نفسها، تمامًا كما لو قرأها أحد
+ * من لافتة على باب الفرع.
+ */
+router.get("/branches/by-ref/:ref", async (req, res, next) => {
+  try {
+    const { rows } = await withoutBranch((client) =>
+      client.query(
+        `select id, ref, name from branches where ref = $1`,
+        [req.params.ref]
+      )
+    );
+    const branch = rows[0];
+    if (!branch) return res.status(404).json({ error: "branch_not_found" });
+    res.json({ branchId: branch.id, branchRef: branch.ref, branchName: branch.name });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * GET /api/branches/:branchId/users
  * Public name/role picker for the login screen — matches the tap-a-name
  * step in the frontend's login flow. Never returns pin_hash.
