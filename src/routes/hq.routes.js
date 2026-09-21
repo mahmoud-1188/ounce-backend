@@ -68,7 +68,7 @@ router.get("/hq/report", async (req, res, next) => {
       // كل المتاجر معًا في تقرير إدارة متجر واحد — تسريب مالي حقيقي
       // بين متجرين منفصلين تمامًا (مراجع assertHqBranch أعلاه).
       const { rows: branches } = await client.query(
-        `select id, ref, name from branches where store_id = $1 order by name`,
+        `select id, ref, name from branches where store_id = $1 and deleted_at is null order by name`,
         [storeId]
       );
       if (!branches.length) return { period, branches: [] };

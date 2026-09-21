@@ -34,13 +34,20 @@ async function authenticate(req, res, next) {
   }
 
   try {
+    // ⚠ إضافة b.deleted_at is null هنا عمدًا (migration
+    // 025_branches_soft_delete): بلا هذا الشرط، مديرٌ سجّل دخوله *قبل*
+    // حذف فرعه يبقى قادرًا على استخدام كل شاشات التطبيق حتى انتهاء
+    // صلاحية توكنه (12 ساعة) رغم أن الفرع "محذوف" من كل مكان آخر —
+    // authenticate يعمل على كل طلبٍ لاحقٍ لكل مسار، لا فقط عند تسجيل
+    // الدخول نفسه (راجع auth.routes.js لنفس الفحص هناك تحديدًا).
     const { rows } = await withoutBranch((client) =>
       client.query(
         `select u.*, r.allowed_tabs, r.allowed_more, r.deny_actions,
                 r.can_manage_day, r.can_break
            from users u
+           join branches b on b.id = u.branch_id
            join roles r on r.id = u.role
-          where u.id = $1 and u.branch_id = $2 and u.active = true`,
+          where u.id = $1 and u.branch_id = $2 and u.active = true and b.deleted_at is null`,
         [payload.sub, payload.branchId]
       )
     );

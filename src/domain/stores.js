@@ -19,7 +19,7 @@ async function storeCanAddBranch(storeId) {
   const { rows } = await withoutBranch((client) =>
     client.query(
       `select s.max_branches, s.status, s.subscription_expires_at,
-              (select count(*)::int from branches b where b.store_id = s.id) as branch_count
+              (select count(*)::int from branches b where b.store_id = s.id and b.deleted_at is null) as branch_count
          from stores s
         where s.id = $1`,
       [storeId]

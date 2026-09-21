@@ -22,9 +22,13 @@ const router = Router();
  */
 router.get("/branches/by-ref/:ref", async (req, res, next) => {
   try {
+    // ⚠ deleted_at is null هنا عمدًا (migration 025_branches_soft_delete):
+    // فرعٌ محذوف منطقيًّا يجب ألّا يُقرأ رابطه كأنه لا يزال حيًّا — جهازٌ
+    // يفتح رابط فرعٍ حُذف بعد ربطه به يجب أن يرى "الفرع غير موجود" بالضبط
+    // كأنه رمزٌ خاطئ من الأصل، لا أن يُربط به بصمت.
     const { rows } = await withoutBranch((client) =>
       client.query(
-        `select id, ref, name from branches where ref = $1`,
+        `select id, ref, name from branches where ref = $1 and deleted_at is null`,
         [req.params.ref]
       )
     );
@@ -43,6 +47,14 @@ router.get("/branches/by-ref/:ref", async (req, res, next) => {
  */
 router.get("/branches/:branchId/users", async (req, res, next) => {
   try {
+    // ⚠ نتحقق أولًا أن الفرع نفسه غير محذوف (لا فقط أن users.active) —
+    // فرعٌ محذوف منطقيًّا يجب أن يُعامَل كأنه غير موجود من واجهة تسجيل
+    // الدخول العلنية هذه، بصرف النظر عن حالة كل موظف فيه على حدة.
+    const { rows: branchRows } = await withoutBranch((client) =>
+      client.query(`select 1 from branches where id = $1 and deleted_at is null`, [req.params.branchId])
+    );
+    if (!branchRows.length) return res.status(404).json({ error: "branch_not_found" });
+
     const { rows } = await withoutBranch((client) =>
       client.query(
         `select id, name, ref, role from users
@@ -70,6 +82,16 @@ router.post("/auth/login", async (req, res, next) => {
     return res.status(400).json({ error: "branchId, userId and pin are required" });
   }
   try {
+    // ⚠ نفس مبدأ "لا نكشف أي جزءٍ من سبب الفشل" المتّبع في PriceLoginScreen:
+    // فرعٌ محذوف يُعطي نفس invalid_credentials تمامًا مثل مستخدم/PIN
+    // خاطئين — لا رسالة مختلفة تكشف أن السبب تحديدًا هو حذف الفرع.
+    const { rows: branchRows } = await withoutBranch((client) =>
+      client.query(`select 1 from branches where id = $1 and deleted_at is null`, [branchId])
+    );
+    if (!branchRows.length) {
+      return res.status(401).json({ error: "invalid_credentials" });
+    }
+
     const { rows } = await withoutBranch((client) =>
       client.query(
         `select * from users where id = $1 and branch_id = $2 and active = true`,

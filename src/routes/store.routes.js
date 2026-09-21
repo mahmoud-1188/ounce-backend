@@ -36,7 +36,7 @@ router.get("/store/branches", async (req, res, next) => {
       client.query(
         `select id, ref, name, is_hq, created_at
            from branches
-          where store_id = $1
+          where store_id = $1 and deleted_at is null
           order by name`,
         [req.storeAuth.storeId]
       )
@@ -61,7 +61,7 @@ router.get("/store/report", async (req, res, next) => {
 
     const report = await withoutBranch(async (client) => {
       const { rows: branches } = await client.query(
-        `select id, ref, name from branches where store_id = $1 order by name`,
+        `select id, ref, name from branches where store_id = $1 and deleted_at is null order by name`,
         [req.storeAuth.storeId]
       );
       if (!branches.length) return { period, branches: [] };
@@ -91,7 +91,7 @@ router.get("/store/analytics", async (req, res, next) => {
 
     const report = await withoutBranch(async (client) => {
       const { rows: branches } = await client.query(
-        `select id, ref, name from branches where store_id = $1 order by name`,
+        `select id, ref, name from branches where store_id = $1 and deleted_at is null order by name`,
         [req.storeAuth.storeId]
       );
       if (!branches.length) return { period, branches: [], byMethod: [], byKarat: [], topSellers: [] };
@@ -188,6 +188,57 @@ router.post("/store/branches", requireCanManageBranches, async (req, res, next) 
 
     if (result.error) return res.status(500).json({ error: result.error });
     res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * DELETE /api/store/branches/:branchId  { confirm }
+ *
+ * ⚠ تعطيل منطقي (soft-delete، migration 025_branches_soft_delete) لا
+ * حذف فعلي: فرعٌ قد يحمل مبيعات/مخزون/محاسبة حقيقية، وحذفه فعليًّا من
+ * الجدول كان سيفشل أصلًا (foreign keys من عشرات الجداول) أو سيحتاج
+ * CASCADE يمحو تاريخًا ماليًا لا يُسترجع. بعد هذا التعطيل: الفرع يختفي
+ * من كل قوائم/تقارير المتجر (راجع كل استعلامات deleted_at is null في
+ * هذا الملف)، يُرفض تسجيل الدخول إليه فورًا (auth.routes.js + middleware/
+ * auth.js)، ويتحرّر مكانه ضمن stores.max_branches لفرعٍ جديد
+ * (storeCanAddBranch يستثني الفروع المحذوفة من العدّ).
+ *
+ * ⚠ confirm يجب أن يساوي "DELETE" حرفيًّا (بالإنجليزية، حالة الأحرف
+ * كما هي) — تحقّقٌ من الخادم لا الواجهة وحدها، تمامًا لأن أي مسارٍ
+ * هدّام (destructive) في هذا التطبيق لا يجب أن يعتمد على الفرونت إند
+ * فقط لمنع ضغطة خاطئة (نفس مبدأ requirePage في الباك إند: ما يمنعه
+ * الفرونت إند مجرّد راحة، الفحص الحقيقي هنا).
+ *
+ * requireCanManageBranches لا requireStoreOwner عمدًا — تمامًا كنظيرها
+ * عند الإنشاء (POST /store/branches أعلاه): من يملك صلاحية إنشاء فرعٍ
+ * يملك صلاحية حذفه منطقيًّا أيضًا، بلا تفريقٍ لم يُطلب.
+ *
+ * ⚠ الفرع الرئيسي (is_hq = true) لا يُحذف إطلاقًا: هو الفرع الوحيد الذي
+ * يعتمد عليه مسار /api/hq/report القديم (راجع assertHqBranch في
+ * hq.routes.js) — حذفه يكسر ذلك المسار كليًّا بلا أي بديل تلقائي.
+ */
+router.delete("/store/branches/:branchId", requireCanManageBranches, async (req, res, next) => {
+  const { confirm } = req.body || {};
+  if (confirm !== "DELETE") {
+    return res.status(400).json({ error: "confirmation_required" });
+  }
+  try {
+    const { rows } = await withoutBranch((client) =>
+      client.query(
+        `select id, is_hq from branches where id = $1 and store_id = $2 and deleted_at is null`,
+        [req.params.branchId, req.storeAuth.storeId]
+      )
+    );
+    const branch = rows[0];
+    if (!branch) return res.status(404).json({ error: "branch_not_found" });
+    if (branch.is_hq) return res.status(403).json({ error: "cannot_delete_hq_branch" });
+
+    await withoutBranch((client) =>
+      client.query(`update branches set deleted_at = now() where id = $1`, [branch.id])
+    );
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }
@@ -364,7 +415,10 @@ router.patch("/store/users/:id", requireStoreOwner, async (req, res, next) => {
  */
 async function assertBranchInStore(storeId, branchId) {
   const { rows } = await withoutBranch((client) =>
-    client.query(`select 1 from branches where id = $1 and store_id = $2`, [branchId, storeId])
+    client.query(
+      `select 1 from branches where id = $1 and store_id = $2 and deleted_at is null`,
+      [branchId, storeId]
+    )
   );
   return !!rows[0];
 }
