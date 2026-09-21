@@ -66,6 +66,7 @@ async function authenticateStore(req, res, next) {
       // migration 023_store_user_permissions.sql.
       allowedPages: storeUser.allowed_pages,
       canManageBranches: !!storeUser.can_manage_branches,
+      canSendCoding: !!storeUser.can_send_coding,
     };
     next();
   } catch (err) {
@@ -94,4 +95,17 @@ function requireCanManageBranches(req, res, next) {
   return res.status(403).json({ error: "cannot_manage_branches" });
 }
 
-export { authenticateStore, requireStoreOwner, requireCanManageBranches };
+/**
+ * يقصر مسارًا على owner أو موظفٍ مُصرَّح له صراحةً بإرسال تكويد لفرع
+ * (can_send_coding) — نفس مبرّر requireCanManageBranches تمامًا: إرسال
+ * بضاعة فعليًّا فعلٌ تجاري خطير، لا مجرّد رؤية شاشة hqCoding ضمن
+ * allowedPages. راجع migration 026_store_user_coding_permission.sql.
+ */
+function requireCanSendCoding(req, res, next) {
+  if (req.storeAuth?.role === "owner" || req.storeAuth?.canSendCoding) {
+    return next();
+  }
+  return res.status(403).json({ error: "cannot_send_coding" });
+}
+
+export { authenticateStore, requireStoreOwner, requireCanManageBranches, requireCanSendCoding };

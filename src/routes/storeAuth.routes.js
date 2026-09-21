@@ -81,6 +81,7 @@ router.post("/store-auth/login", async (req, res, next) => {
         storeId: storeUser.store_id,
         allowedPages: storeUser.allowed_pages,
         canManageBranches: !!storeUser.can_manage_branches,
+        canSendCoding: !!storeUser.can_send_coding,
       },
     });
   } catch (err) {
@@ -102,6 +103,7 @@ router.get("/store-auth/me", authenticateStore, (req, res) => {
       storeId: req.storeAuth.storeId,
       allowedPages: req.storeAuth.allowedPages,
       canManageBranches: req.storeAuth.canManageBranches,
+      canSendCoding: req.storeAuth.canSendCoding,
     },
   });
 });

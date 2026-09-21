@@ -1,7 +1,7 @@
 import { Router } from "express";
 import crypto from "node:crypto";
 import { withoutBranch, withBranch } from "../db.js";
-import { authenticateStore, requireStoreOwner, requireCanManageBranches } from "../middleware/storeAuth.js";
+import { authenticateStore, requireStoreOwner, requireCanManageBranches, requireCanSendCoding } from "../middleware/storeAuth.js";
 import { buildConsolidatedReport } from "../domain/consolidatedReport.js";
 import { buildAnalyticsReport } from "../domain/analyticsReport.js";
 import { storeCanAddBranch } from "../domain/stores.js";
@@ -251,9 +251,12 @@ router.delete("/store/branches/:branchId", requireCanManageBranches, async (req,
  * أضيق من إدارة الفروع، لا يُترك حتى لموظفٍ يملك صلاحية إدارة الفروع).
  *
  * ⚠ صلاحيات مبسّطة عمدًا (لا نظام أدوار متعدّدة/فصل مهام كالمرجع —
- * راجع migration 023_store_user_permissions.sql للسبب الكامل): كل
- * موظفٍ مركزي له allowedPages (أي شاشات من الأربع الحالية يراها) و
- * canManageBranches (هل يُنشئ فروعًا جديدة) فقط.
+ * راجع migration 023_store_user_permissions.sql للسبب الكامل، وقرار
+ * الإبقاء عليه رغم توسيع الشاشات المركزية في 026_store_user_coding_
+ * permission.sql): كل موظفٍ مركزي له allowedPages (أي شاشات يراها) و
+ * canManageBranches (هل يُنشئ فروعًا جديدة) و canSendCoding (هل يُرسل
+ * تكويدًا فعليًّا لفرع) — أعلام مستقلة قابلة للتوسّع لاحقًا لنظام أدوار
+ * حقيقي دون كسر البيانات القائمة، لا مجموعة ثابتة نهائيًّا.
  */
 
 /** GET /api/store/users — موظفو المتجر المركزيون (owner فقط). */
@@ -261,7 +264,7 @@ router.get("/store/users", requireStoreOwner, async (req, res, next) => {
   try {
     const { rows } = await withoutBranch((client) =>
       client.query(
-        `select id, name, email, role, allowed_pages, can_manage_branches, active, created_at
+        `select id, name, email, role, allowed_pages, can_manage_branches, can_send_coding, active, created_at
            from store_users
           where store_id = $1
           order by created_at`,
@@ -276,6 +279,7 @@ router.get("/store/users", requireStoreOwner, async (req, res, next) => {
         role: u.role,
         allowedPages: u.allowed_pages,
         canManageBranches: u.can_manage_branches,
+        canSendCoding: u.can_send_coding,
         active: u.active,
         createdAt: u.created_at,
       }))
@@ -293,7 +297,7 @@ router.get("/store/users", requireStoreOwner, async (req, res, next) => {
  * الاتفاقية أينما ظهرت).
  */
 router.post("/store/users", requireStoreOwner, async (req, res, next) => {
-  const { name, email, password, allowedPages, canManageBranches } = req.body || {};
+  const { name, email, password, allowedPages, canManageBranches, canSendCoding } = req.body || {};
   if (!name || !String(name).trim()) {
     return res.status(400).json({ error: "name_required" });
   }
@@ -311,9 +315,9 @@ router.post("/store/users", requireStoreOwner, async (req, res, next) => {
     const passwordHash = await hashPassword(password);
     const { rows } = await withoutBranch((client) =>
       client.query(
-        `insert into store_users (store_id, name, email, password_hash, role, allowed_pages, can_manage_branches)
-         values ($1, $2, $3, $4, 'staff', $5, $6)
-         returning id, name, email, role, allowed_pages, can_manage_branches, active, created_at`,
+        `insert into store_users (store_id, name, email, password_hash, role, allowed_pages, can_manage_branches, can_send_coding)
+         values ($1, $2, $3, $4, 'staff', $5, $6, $7)
+         returning id, name, email, role, allowed_pages, can_manage_branches, can_send_coding, active, created_at`,
         [
           req.storeAuth.storeId,
           String(name).trim(),
@@ -321,13 +325,14 @@ router.post("/store/users", requireStoreOwner, async (req, res, next) => {
           passwordHash,
           allowedPages == null ? null : JSON.stringify(allowedPages),
           !!canManageBranches,
+          !!canSendCoding,
         ]
       )
     );
     const u = rows[0];
     res.status(201).json({
       id: u.id, name: u.name, email: u.email, role: u.role,
-      allowedPages: u.allowed_pages, canManageBranches: u.can_manage_branches,
+      allowedPages: u.allowed_pages, canManageBranches: u.can_manage_branches, canSendCoding: u.can_send_coding,
       active: u.active, createdAt: u.created_at,
     });
   } catch (err) {
@@ -344,14 +349,14 @@ router.post("/store/users", requireStoreOwner, async (req, res, next) => {
  * owner آخر أو نفسه من هنا؛ حراسةٌ بسيطة ضد قفل الحساب الوحيد بالخطأ).
  */
 router.patch("/store/users/:id", requireStoreOwner, async (req, res, next) => {
-  const { allowedPages, canManageBranches, active } = req.body || {};
+  const { allowedPages, canManageBranches, canSendCoding, active } = req.body || {};
   if (allowedPages !== undefined && allowedPages !== null && !Array.isArray(allowedPages)) {
     return res.status(400).json({ error: "allowed_pages_must_be_array_or_null" });
   }
   try {
     const result = await withoutBranch(async (client) => {
       const { rows: targetRows } = await client.query(
-        `select id, name, email, role, allowed_pages, can_manage_branches, active, created_at
+        `select id, name, email, role, allowed_pages, can_manage_branches, can_send_coding, active, created_at
            from store_users where id = $1 and store_id = $2`,
         [req.params.id, req.storeAuth.storeId]
       );
@@ -374,6 +379,10 @@ router.patch("/store/users/:id", requireStoreOwner, async (req, res, next) => {
         values.push(!!canManageBranches);
         sets.push(`can_manage_branches = $${values.length}`);
       }
+      if (canSendCoding !== undefined) {
+        values.push(!!canSendCoding);
+        sets.push(`can_send_coding = $${values.length}`);
+      }
       if (active !== undefined) {
         values.push(!!active);
         sets.push(`active = $${values.length}`);
@@ -383,7 +392,7 @@ router.patch("/store/users/:id", requireStoreOwner, async (req, res, next) => {
       const { rows } = await client.query(
         `update store_users set ${sets.join(", ")}
          where id = $1 and store_id = $2
-         returning id, name, email, role, allowed_pages, can_manage_branches, active, created_at`,
+         returning id, name, email, role, allowed_pages, can_manage_branches, can_send_coding, active, created_at`,
         values
       );
       return { user: rows[0] };
@@ -395,7 +404,7 @@ router.patch("/store/users/:id", requireStoreOwner, async (req, res, next) => {
     const u = result.user;
     res.json({
       id: u.id, name: u.name, email: u.email, role: u.role,
-      allowedPages: u.allowed_pages, canManageBranches: u.can_manage_branches,
+      allowedPages: u.allowed_pages, canManageBranches: u.can_manage_branches, canSendCoding: u.can_send_coding,
       active: u.active, createdAt: u.created_at,
     });
   } catch (err) {
