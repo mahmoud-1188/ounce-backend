@@ -115,7 +115,10 @@ router.get("/bootstrap", async (req, res, next) => {
       (client) =>
         client.query(`select tax_enabled, tax_rate, card_fees from branch_settings where branch_id = $1`, [branchId]),
       // فئات مشتركة بين الفروع (branch_id يمكن أن يكون null) + فئات هذا الفرع تحديدًا.
-      (client) => client.query(`select * from categories where branch_id = $1 or branch_id is null`, [branchId]),
+      // ⚠ order by sort_order صريح الآن (migration 029) — بلا هذا كان
+      // ترتيب categories يعود عشوائيًّا فعليًّا (لا ضمان ترتيب من
+      // PostgreSQL بلا order by)، فتتبدّل مواضع التصنيفات بين كل تحميل.
+      (client) => client.query(`select * from categories where branch_id = $1 or branch_id is null order by sort_order, name`, [branchId]),
       (client) => client.query(`select * from items where branch_id = $1 order by date_added desc`, [branchId]),
       (client) =>
         client.query(
