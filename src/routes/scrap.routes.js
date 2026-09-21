@@ -13,6 +13,24 @@ import { postJournalEntry } from "../domain/journal.js";
 
 const router = Router();
 
+/**
+ * ⚠ إصلاح عطل حقيقي: كانت convert-to-item (أدناه) تستدعي openDay(client,
+ * branchId) بلا أي تعريف أو استيراد لها في هذا الملف إطلاقًا — كل
+ * استدعاء لـPOST /scrap/:id/convert-to-item كان يفشل بـReferenceError
+ * (500) قبل إدراج أي شيء، أي أن تحويل الكسر لصنفٍ حقيقي كان معطوبًا
+ * بالكامل في الإنتاج. الدالة هنا مطابقة حرفيًا للنسخة المكرَّرة في كل
+ * ملفات routes الأخرى (misc.routes.js، expenses.routes.js، إلخ) —
+ * تعيد معرّف يوم العمل المفتوح الحالي، أو null إن لم يوجد.
+ */
+async function openDay(client, branchId) {
+  const { rows } = await client.query(
+    `select id from business_days where branch_id = $1 and status = 'open'
+       order by opened_at desc limit 1`,
+    [branchId]
+  );
+  return rows[0]?.id || null;
+}
+
 const KARATS = [24, 22, 21, 18, 14];
 
 /**
