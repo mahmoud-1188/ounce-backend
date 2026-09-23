@@ -458,6 +458,113 @@ router.patch("/platform/branches/:id/operating-model", async (req, res, next) =>
   }
 });
 
+// ═══════════════════════ حسابات المركزي للمتجر ═══════════════════════
+//
+// كلمات المرور مخزّنة bcrypt — لا تُقرأ ولا تُعرض أبدًا، حتى للأدمن. ما
+// يُتاح هنا: رؤية البريد، تعديله، إضافة حساب مالك، وتعيين كلمة مرور جديدة
+// تُعرض مرة واحدة لتُرسل للعميل.
+
+function shapeStoreUser(u) {
+  return { id: u.id, name: u.name, email: u.email, role: u.role, active: u.active, createdAt: u.created_at };
+}
+
+/** POST /api/platform/stores/:id/users  { name, email, password } — حساب مالك جديد. */
+router.post("/platform/stores/:id/users", async (req, res, next) => {
+  const name = String(req.body?.name || "").trim();
+  const email = String(req.body?.email || "").trim();
+  const password = String(req.body?.password || "");
+  if (!name || !email) return res.status(400).json({ error: "name_and_email_required" });
+  if (password.length < 8) return res.status(400).json({ error: "password_too_short" });
+  try {
+    const passwordHash = await hashPassword(password);
+    const result = await inTx(async (client) => {
+      const { rows: st } = await client.query(`select id from stores where id = $1`, [req.params.id]);
+      if (!st[0]) return null;
+      const { rows } = await client.query(
+        `insert into store_users (store_id, name, email, password_hash, role)
+         values ($1, $2, $3, $4, 'owner') returning *`,
+        [req.params.id, name, email, passwordHash]
+      );
+      await logAction(client, {
+        adminId: req.platformAuth.adminId,
+        action: "store_user_created",
+        storeId: req.params.id,
+        details: { name, email },
+      });
+      return rows[0];
+    });
+    if (!result) return res.status(404).json({ error: "store_not_found" });
+    res.status(201).json({ storeUser: shapeStoreUser(result) });
+  } catch (err) {
+    if (err.code === "23505") return res.status(409).json({ error: "email_already_used" });
+    if (err.code === "22P02") return res.status(404).json({ error: "store_not_found" });
+    next(err);
+  }
+});
+
+/** PATCH /api/platform/store-users/:id  { name?, email? } */
+router.patch("/platform/store-users/:id", async (req, res, next) => {
+  const b = req.body || {};
+  try {
+    const result = await inTx(async (client) => {
+      const { rows: cur } = await client.query(`select * from store_users where id = $1 for update`, [req.params.id]);
+      const u = cur[0];
+      if (!u) return { status: 404, body: { error: "store_user_not_found" } };
+      const name = b.name !== undefined ? String(b.name).trim() : u.name;
+      const email = b.email !== undefined ? String(b.email).trim() : u.email;
+      if (!name || !email) return { status: 400, body: { error: "name_and_email_required" } };
+      const { rows } = await client.query(
+        `update store_users set name = $2, email = $3 where id = $1 returning *`,
+        [u.id, name, email]
+      );
+      await logAction(client, {
+        adminId: req.platformAuth.adminId,
+        action: "store_user_updated",
+        storeId: u.store_id,
+        details: { before: { name: u.name, email: u.email }, after: { name, email } },
+      });
+      return { status: 200, body: { storeUser: shapeStoreUser(rows[0]) } };
+    });
+    res.status(result.status).json(result.body);
+  } catch (err) {
+    if (err.code === "23505") return res.status(409).json({ error: "email_already_used" });
+    if (err.code === "22P02") return res.status(404).json({ error: "store_user_not_found" });
+    next(err);
+  }
+});
+
+/**
+ * POST /api/platform/store-users/:id/password  { password }
+ * كلمة مرور جديدة لحساب مركزي (العميل نسيها، أو تسليم أول مرة). القديمة
+ * لا تُعرف ولا تُسترجع — تُستبدل فقط.
+ */
+router.post("/platform/store-users/:id/password", async (req, res, next) => {
+  const password = String(req.body?.password || "");
+  if (password.length < 8) return res.status(400).json({ error: "password_too_short" });
+  try {
+    const passwordHash = await hashPassword(password);
+    const result = await inTx(async (client) => {
+      const { rows } = await client.query(
+        `update store_users set password_hash = $2 where id = $1 returning *`,
+        [req.params.id, passwordHash]
+      );
+      if (!rows[0]) return null;
+      await logAction(client, {
+        adminId: req.platformAuth.adminId,
+        action: "store_user_password_reset",
+        storeId: rows[0].store_id,
+        details: { email: rows[0].email },
+      });
+      return rows[0];
+    });
+    if (!result) return res.status(404).json({ error: "store_user_not_found" });
+    res.json({ storeUser: shapeStoreUser(result) });
+  } catch (err) {
+    if (err.code === "22P02") return res.status(404).json({ error: "store_user_not_found" });
+    next(err);
+  }
+});
+
 /** GET /api/platform/log?storeId=&limit= — سجل العمليات، الأحدث أولًا. */
 router.get("/platform/log", async (req, res, next) => {
   const limit = Math.min(2000, Math.max(1, toNonNegInt(req.query.limit) || 300));
