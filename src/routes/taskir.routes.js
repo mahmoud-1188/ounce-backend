@@ -126,7 +126,12 @@ router.post("/taskirat", async (req, res, next) => {
       );
       const businessDayId = dayRows[0]?.id || null;
       if (poolMethod?.pool === "day" && !businessDayId) {
-        return { error: "no_open_business_day" };
+        // يوم العمل المطفأ (migration 034) يسمح بالحركة من الصندوق بلا يوم.
+        const { rows: modeRows } = await client.query(
+          "select workday_mode from branch_settings where branch_id = $1",
+          [req.auth.branchId]
+        );
+        if (modeRows[0]?.workday_mode !== "off") return { error: "no_open_business_day" };
       }
 
       const fine = fineWeight(weight, karat);

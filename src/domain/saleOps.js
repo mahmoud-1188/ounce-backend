@@ -24,6 +24,19 @@ async function isStocktakeLocked(client, branchId) {
   return !!rows[0]?.locked;
 }
 
+/**
+ * يوم العمل للحركات التي تحتاجه (بيع، استبدال…).
+ * يومٌ مفتوح ⇐ يُختم به. لا يوم والوضع 'off' ⇐ { day: null } وتمرّ الحركة
+ * بلا يوم (migration 034). لا يوم والوضع 'required' ⇐ رفض.
+ */
+async function requireBusinessDay(client, branchId) {
+  const day = await getOpenBusinessDay(client, branchId);
+  if (day) return { day };
+  const { rows } = await client.query("select workday_mode from branch_settings where branch_id = $1", [branchId]);
+  if (rows[0]?.workday_mode === "off") return { day: null };
+  return { error: "no_open_business_day" };
+}
+
 async function getOpenBusinessDay(client, branchId) {
   const { rows } = await client.query(
     `select id, ref from business_days
@@ -253,6 +266,7 @@ export {
   nextRef,
   isStocktakeLocked,
   getOpenBusinessDay,
+  requireBusinessDay,
   reserveSaleLines,
   insertSaleLines,
   postGoldMovement,

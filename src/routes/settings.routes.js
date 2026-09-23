@@ -29,10 +29,17 @@ router.patch("/settings/branch", requirePage("settings"), requireManager, async 
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
       const { rows: existingRows } = await client.query(
-        "select tax_enabled, tax_rate, card_fees from branch_settings where branch_id = $1",
+        "select tax_enabled, tax_rate, card_fees, workday_mode from branch_settings where branch_id = $1",
         [req.auth.branchId]
       );
-      const existing = existingRows[0] || { tax_enabled: true, tax_rate: 0.15, card_fees: {} };
+      const existing = existingRows[0] || { tax_enabled: true, tax_rate: 0.15, card_fees: {}, workday_mode: "required" };
+
+      // يوم العمل: 'required' (يُفتح ويُقفل) أو 'off' (الحركات بلا يوم).
+      let workdayMode = existing.workday_mode || "required";
+      if (body.workdayMode != null) {
+        if (!["required", "off"].includes(body.workdayMode)) return { error: "invalid_workday_mode" };
+        workdayMode = body.workdayMode;
+      }
 
       const taxEnabled = body.taxEnabled != null ? !!body.taxEnabled : existing.tax_enabled;
 
@@ -55,20 +62,21 @@ router.patch("/settings/branch", requirePage("settings"), requireManager, async 
       }
 
       const { rows } = await client.query(
-        `insert into branch_settings (branch_id, tax_enabled, tax_rate, card_fees)
-         values ($1, $2, $3, $4)
+        `insert into branch_settings (branch_id, tax_enabled, tax_rate, card_fees, workday_mode)
+         values ($1, $2, $3, $4, $5)
          on conflict (branch_id) do update
            set tax_enabled = excluded.tax_enabled,
                tax_rate = excluded.tax_rate,
-               card_fees = excluded.card_fees
-         returning tax_enabled, tax_rate, card_fees`,
-        [req.auth.branchId, taxEnabled, taxRate, JSON.stringify(cardFees)]
+               card_fees = excluded.card_fees,
+               workday_mode = excluded.workday_mode
+         returning tax_enabled, tax_rate, card_fees, workday_mode`,
+        [req.auth.branchId, taxEnabled, taxRate, JSON.stringify(cardFees), workdayMode]
       );
       return { settings: rows[0] };
     });
 
-    if (result.error === "invalid_tax_rate") {
-      return res.status(400).json({ error: "invalid_tax_rate" });
+    if (result.error === "invalid_tax_rate" || result.error === "invalid_workday_mode") {
+      return res.status(400).json({ error: result.error });
     }
     if (result.error === "invalid_card_fee") {
       return res.status(400).json(result);

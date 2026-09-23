@@ -4,7 +4,7 @@ import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.
 import { extractInclusiveTax } from "../domain/money.js";
 import { fineWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
-import { getOpenBusinessDay, insertSaleLines, isStocktakeLocked, postGoldMovement, reserveSaleLines } from "../domain/saleOps.js";
+import { insertSaleLines, isStocktakeLocked, postGoldMovement, requireBusinessDay, reserveSaleLines } from "../domain/saleOps.js";
 
 const router = Router();
 
@@ -111,9 +111,11 @@ router.post("/sales", async (req, res, next) => {
       // ⚠ لا بيع أثناء الجرد — نفس حارس stocktakeLock في handleCreateSale.
       if (await isStocktakeLocked(client, req.auth.branchId)) return { error: "stocktake_locked" };
 
-      // يوم عمل مفتوح إلزامي — sales.business_day_id NOT NULL في الـschema.
-      const businessDay = await getOpenBusinessDay(client, req.auth.branchId);
-      if (!businessDay) return { error: "no_open_business_day" };
+      // يوم عمل مفتوح إلزامي — إلا إن أُطفئ يوم العمل من الإعدادات
+      // (migration 034)، فتُسجَّل الفاتورة بلا يوم.
+      const dayGate = await requireBusinessDay(client, req.auth.branchId);
+      if (dayGate.error) return dayGate;
+      const businessDay = dayGate.day || { id: null, ref: null };
 
       const { rows: settingsRows } = await client.query(
         "select tax_enabled, tax_rate, card_fees from branch_settings where branch_id = $1",
@@ -447,14 +449,9 @@ router.post("/sales/partial", async (req, res, next) => {
       );
       if (lockRows[0]?.locked) return { error: "stocktake_locked" };
 
-      const { rows: dayRows } = await client.query(
-        `select id, ref from business_days
-          where branch_id = $1 and status = 'open'
-          order by opened_at desc limit 1`,
-        [req.auth.branchId]
-      );
-      const businessDay = dayRows[0];
-      if (!businessDay) return { error: "no_open_business_day" };
+      const dayGate = await requireBusinessDay(client, req.auth.branchId);
+      if (dayGate.error) return dayGate;
+      const businessDay = dayGate.day || { id: null, ref: null };
 
       const { rows: itemRows } = await client.query(
         `select i.*, c.sale_mode, c.min_sale_weight

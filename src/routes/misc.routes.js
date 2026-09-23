@@ -5,8 +5,8 @@ import { extractInclusiveTax, roundMoney } from "../domain/money.js";
 import { fineWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
 import {
-  computeReturnAmounts, getOpenBusinessDay, insertCashTx, insertReturnReceipt, insertSaleLines,
-  isStocktakeLocked, loadSaleForReturn, nextRef, postGoldMovement, reserveSaleLines, restockReturnedLines,
+  computeReturnAmounts, insertCashTx, insertReturnReceipt, insertSaleLines,
+  isStocktakeLocked, loadSaleForReturn, nextRef, postGoldMovement, requireBusinessDay, reserveSaleLines, restockReturnedLines,
 } from "../domain/saleOps.js";
 
 const router = Router();
@@ -642,8 +642,9 @@ router.post(
     try {
       const result = await withBranch(req.auth.branchId, async (client) => {
         if (await isStocktakeLocked(client, req.auth.branchId)) return { error: "stocktake_locked" };
-        const businessDay = await getOpenBusinessDay(client, req.auth.branchId);
-        if (!businessDay) return { error: "no_open_business_day" };
+        const dayGate = await requireBusinessDay(client, req.auth.branchId);
+        if (dayGate.error) return dayGate;
+        const businessDay = dayGate.day || { id: null, ref: null };
 
         const loaded = await loadSaleForReturn(client, req.auth.branchId, req.params.id, lineIndexes);
         if (loaded.error) return loaded;
