@@ -2,7 +2,7 @@ import { Router } from "express";
 import { withoutBranch } from "../db.js";
 import { verifyPin } from "../auth/hashPin.js";
 import { signSession } from "../auth/jwt.js";
-import { authenticate } from "../middleware/auth.js";
+import { authenticate, storeBlockReason } from "../middleware/auth.js";
 
 const router = Router();
 
@@ -94,7 +94,11 @@ router.post("/auth/login", async (req, res, next) => {
 
     const { rows } = await withoutBranch((client) =>
       client.query(
-        `select * from users where id = $1 and branch_id = $2 and active = true`,
+        `select u.*, s.status as store_status, s.subscription_expires_at
+           from users u
+           join branches b on b.id = u.branch_id
+           left join stores s on s.id = b.store_id
+          where u.id = $1 and u.branch_id = $2 and u.active = true`,
         [userId, branchId]
       )
     );
@@ -105,6 +109,12 @@ router.post("/auth/login", async (req, res, next) => {
     const ok = await verifyPin(pin, user.pin_hash);
     if (!ok) {
       return res.status(401).json({ error: "invalid_credentials" });
+    }
+    // ⚠ بعد التحقق من الرقم السري لا قبله: من لا يعرف الرقم لا يعرف حالة
+    // اشتراك المحل. ومن يعرفه يرى سببًا واضحًا بدل «رقم خاطئ» مضلِّل.
+    const storeBlock = storeBlockReason(user);
+    if (storeBlock) {
+      return res.status(403).json({ error: storeBlock });
     }
     const token = signSession(user);
     res.json({

@@ -3,30 +3,12 @@ import { withoutBranch } from "../db.js";
 import { verifyPassword, hashPassword } from "../auth/hashPassword.js";
 import { signStoreSession } from "../auth/jwt.js";
 import { authenticateStore } from "../middleware/storeAuth.js";
+import { requirePlatformAdminKey } from "../middleware/platformAuth.js";
 
 const router = Router();
 
-/**
- * ⚠⚠ مؤقت بصراحة (طلب المستخدم صراحةً): لا يوجد تطبيق أدمن
- * حقيقي للمنصة بعد — من يخوّل من يفتح حساب متجر جديد سؤال تصميمي لم
- * يُحسم بعد (راجع محادثة إضافة migration 020_stores_multi_tenant.sql). هذا
- * المسار مؤقت حصرًا لفتح أول حساب مالك متجر للاختبار، محمي بمفتاح
- * سري في متغيّر بيئة (PLATFORM_ADMIN_KEY) لا بأي جلسة مستخدم عادية —
- * وليس بديلًا عن لوحة تحكّم أدمن حقيقية (إدارة اشتراكات، متاجر متعددة،
- * تدقيق صلاحيات). يُزال ويُستبدل بلوحة أدمن حقيقية عند بنائها.
- */
-function requirePlatformAdminKey(req, res, next) {
-  const key = req.headers["x-platform-admin-key"];
-  if (!process.env.PLATFORM_ADMIN_KEY) {
-    // ⚠ رفض لا سماح ضمني: متغيّر بيئة غير مضبوط يعني هذا المسار
-    // مقفول كليًّا — لا مفتوحًا لأي طلب.
-    return res.status(503).json({ error: "platform_admin_key_not_configured" });
-  }
-  if (!key || key !== process.env.PLATFORM_ADMIN_KEY) {
-    return res.status(401).json({ error: "invalid_platform_admin_key" });
-  }
-  next();
-}
+// requirePlatformAdminKey انتقلت إلى middleware/platformAuth.js (migration
+// 032 — لوحة الأدمن الحقيقية) لتُشارَك مع مسارات /platform بدل نسختين.
 
 /**
  * POST /api/store-auth/login  { email, password }

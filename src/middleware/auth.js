@@ -11,6 +11,18 @@ import { currentAllowed } from "../auth/permissions.js";
  * Every route below this middleware in the chain can trust req.auth
  * without re-checking the token.
  */
+/**
+ * سبب منع الدخول بسبب اشتراك المتجر، أو null إن كان سليمًا.
+ * store_status = null (فرعٌ بلا متجر — بيانات قديمة) لا يُمنع.
+ */
+function storeBlockReason(row) {
+  if (row.store_status && row.store_status !== "active") return `store_${row.store_status}`;
+  if (row.subscription_expires_at && new Date(row.subscription_expires_at).getTime() < Date.now()) {
+    return "subscription_expired";
+  }
+  return null;
+}
+
 async function authenticate(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
@@ -43,10 +55,12 @@ async function authenticate(req, res, next) {
     const { rows } = await withoutBranch((client) =>
       client.query(
         `select u.*, r.allowed_tabs, r.allowed_more, r.deny_actions,
-                r.can_manage_day, r.can_break
+                r.can_manage_day, r.can_break,
+                s.status as store_status, s.subscription_expires_at
            from users u
            join branches b on b.id = u.branch_id
            join roles r on r.id = u.role
+           left join stores s on s.id = b.store_id
           where u.id = $1 and u.branch_id = $2 and u.active = true and b.deleted_at is null`,
         [payload.sub, payload.branchId]
       )
@@ -54,6 +68,14 @@ async function authenticate(req, res, next) {
     const user = rows[0];
     if (!user) {
       return res.status(401).json({ error: "user_not_found_or_inactive" });
+    }
+    // ⚠ اشتراك المتجر يُفرض على الفرع أيضًا لا على المركزي وحده (migration
+    // 032 — لوحة الأدمن): قبل هذا، متجرٌ موقوف أو منتهي الاشتراك كان يُقفل
+    // تطبيق المركزي فقط، بينما فروعه تواصل البيع والشراء كأن شيئًا لم يكن.
+    // الفحص هنا على كل طلب، فالإيقاف يسري فورًا لا بعد انتهاء التوكن.
+    const storeBlock = storeBlockReason(user);
+    if (storeBlock) {
+      return res.status(403).json({ error: storeBlock });
     }
 
     const role = {
@@ -162,7 +184,7 @@ function requireManager(req, res, next) {
   next();
 }
 
-export {
+export { storeBlockReason,
   authenticate,
   requirePage,
   requireAnyPage,

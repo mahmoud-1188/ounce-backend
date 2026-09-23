@@ -50,8 +50,22 @@ function signStoreSession(storeUser) {
   );
 }
 
+/**
+ * جلسة أدمن المنصة (platform_admins — migration 032) — ثالث نوع جلسة،
+ * منفصل عن الفرع والمتجر معًا: لا branchId ولا storeId، فأدمن المنصة لا
+ * ينتمي لمتجر بعينه بل يدير المتاجر كلها. scope: "platform" يمنع أي توكن
+ * فرعٍ أو متجرٍ من المرور على مسارات /platform والعكس.
+ */
+function signPlatformSession(admin) {
+  return jwt.sign(
+    { scope: "platform", sub: admin.id, name: admin.name },
+    SECRET,
+    { expiresIn: EXPIRES_IN }
+  );
+}
+
 function verifySession(token) {
   return jwt.verify(token, SECRET);
 }
 
-export { signSession, signStoreSession, verifySession };
+export { signSession, signStoreSession, signPlatformSession, verifySession };

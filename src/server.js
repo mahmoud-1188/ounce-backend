@@ -28,6 +28,7 @@ import storeRoutes from "./routes/store.routes.js";
 import hqTransactionsRoutes from "./routes/hqTransactions.routes.js";
 import itemsRoutes from "./routes/items.routes.js";
 import categoriesRoutes from "./routes/categories.routes.js";
+import platformRoutes from "./routes/platform.routes.js";
 
 const app = express();
 
@@ -81,6 +82,7 @@ app.use("/api", storeRoutes);
 app.use("/api", hqTransactionsRoutes);
 app.use("/api", itemsRoutes);
 app.use("/api", categoriesRoutes);
+app.use("/api", platformRoutes);
 
 // Centralized error handler — keeps internal error details out of the
 // response (they go to the server log instead), matching the "never leak
