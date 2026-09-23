@@ -172,6 +172,56 @@ router.get("/platform/auth/me", (req, res) => {
   res.json({ admin: { id: req.platformAuth.adminId, name: req.platformAuth.name, email: req.platformAuth.email } });
 });
 
+/**
+ * PATCH /api/platform/auth/me  { currentPassword, name?, email?, newPassword? }
+ * الأدمن يغيّر اسمه وبريده (اسم الدخول) وكلمة مروره. كلمة المرور الحالية
+ * مطلوبة دائمًا — جلسة مفتوحة على جهازٍ منسيّ لا تكفي لتغيير بيانات الدخول.
+ */
+router.patch("/platform/auth/me", async (req, res, next) => {
+  const b = req.body || {};
+  const currentPassword = String(b.currentPassword || "");
+  if (!currentPassword) return res.status(400).json({ error: "current_password_required" });
+  if (b.newPassword !== undefined && String(b.newPassword).length < 8) {
+    return res.status(400).json({ error: "password_too_short" });
+  }
+  try {
+    const result = await inTx(async (client) => {
+      const { rows } = await client.query(
+        `select * from platform_admins where id = $1 and active = true for update`,
+        [req.platformAuth.adminId]
+      );
+      const a = rows[0];
+      if (!a) return { status: 401, body: { error: "admin_not_found_or_inactive" } };
+      if (!(await verifyPassword(currentPassword, a.password_hash))) {
+        return { status: 403, body: { error: "wrong_current_password" } };
+      }
+      const name = b.name !== undefined ? String(b.name).trim() : a.name;
+      const email = b.email !== undefined ? String(b.email).trim() : a.email;
+      if (!name || !email) return { status: 400, body: { error: "name_and_email_required" } };
+      const hash = b.newPassword !== undefined ? await hashPassword(b.newPassword) : a.password_hash;
+      const { rows: upd } = await client.query(
+        `update platform_admins set name = $2, email = $3, password_hash = $4
+          where id = $1 returning id, name, email`,
+        [a.id, name, email, hash]
+      );
+      await logAction(client, {
+        adminId: a.id,
+        action: "admin_updated",
+        details: {
+          before: { name: a.name, email: a.email },
+          after: { name: upd[0].name, email: upd[0].email },
+          passwordChanged: b.newPassword !== undefined,
+        },
+      });
+      return { status: 200, body: { admin: upd[0] } };
+    });
+    res.status(result.status).json(result.body);
+  } catch (err) {
+    if (err.code === "23505") return res.status(409).json({ error: "email_already_used" });
+    next(err);
+  }
+});
+
 /** GET /api/platform/stores — كل المتاجر مع عدد فروعها ومالكها وحالة اشتراكها. */
 router.get("/platform/stores", async (req, res, next) => {
   try {
