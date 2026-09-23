@@ -1,9 +1,13 @@
 import { Router } from "express";
 import { withBranch } from "../db.js";
 import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.js";
-import { roundMoney } from "../domain/money.js";
+import { extractInclusiveTax, roundMoney } from "../domain/money.js";
 import { fineWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
+import {
+  computeReturnAmounts, getOpenBusinessDay, insertCashTx, insertReturnReceipt, insertSaleLines,
+  isStocktakeLocked, loadSaleForReturn, nextRef, postGoldMovement, reserveSaleLines, restockReturnedLines,
+} from "../domain/saleOps.js";
 
 const router = Router();
 
@@ -34,6 +38,14 @@ const CATEGORY_ACCOUNTS = {
   repair_income: "4130",
   repair_gold_added: "5320", // لا يُستخدَم هنا (وزن لا نقد) — موثَّق للمرجعية فقط.
   sales_return: "4190",
+};
+
+// ⚠ journal_entries.op_type مفتاحٌ أجنبي على posting_rules، وفئتا
+// customer_deposit_refund وsales_return ليستا فيه — فكان استرداد العربون
+// والإرجاع السريع يفشلان بخطأ خادم. القيد يأخذ نوع العملية المزروع.
+const OP_TYPE_FOR_CATEGORY = {
+  customer_deposit_refund: "customer_deposit",
+  sales_return: "sale_return",
 };
 
 function normalizeFundingSource(id) {
@@ -74,7 +86,7 @@ async function moveCash(client, { branchId, businessDayId, direction, sourceId, 
     journalEntryId = await postJournalEntry(client, {
       branchId,
       businessDayId,
-      opType: category,
+      opType: OP_TYPE_FOR_CATEGORY[category] || category,
       refTable,
       refId,
       description: note,
@@ -343,12 +355,14 @@ router.post(
         const refund = roundMoney(returnedLines.reduce((a, l) => a + Number(l.unit_price) * Number(l.quantity), 0));
 
         for (const l of returnedLines) {
+          // ⚠ quantity numeric يصل نصًّا "1.000" — LIMIT يحتاج عددًا صحيحًا.
+          const qty = Math.round(Number(l.quantity) || 0);
           const { rows: soldUnits } = await client.query(
             `select id from item_units where item_id = $1 and sold = true order by code limit $2`,
-            [l.item_id, l.quantity]
+            [l.item_id, qty]
           );
-          if (soldUnits.length < l.quantity) {
-            return { error: "unit_mismatch", itemId: l.item_id, available: soldUnits.length, requested: l.quantity };
+          if (soldUnits.length < qty) {
+            return { error: "unit_mismatch", itemId: l.item_id, available: soldUnits.length, requested: qty };
           }
           await client.query(
             `update item_units set sold = false where id = any($1::uuid[])`,
@@ -444,19 +458,18 @@ router.post(
 //  استرجاع مبيعات كامل — processSalesReturn (شاشة "استرجاع مبيعات" المخصصة)
 // ══════════════════════════════════════════════════════════════
 //
-// ⚠ أعقد بكثير من /sales/:id/return أعلاه (الإرجاع السريع): تلك تكتب
-// بسطر posting_rules.sale_return المبسَّط (4140/1130 فقط، بلا ضريبة ولا
-// عكس تكلفة). processSalesReturn في المرجع كانت تبني قيدًا حقيقيًا:
-// عكس صافي البيع (4190) + الضريبة (2220) + عكس تكلفة البضاعة المباعة
-// (1200 مدين / 5100 دائن) + دائن حساب الوجهة المختارة (نقد/شبكة/آجل).
+// القيد (buildReturnJournal في المرجع):
+//   مدين 4190 مردودات المبيعات  الصافي
+//   مدين 2220 الضريبة            الضريبة
+//   دائن حساب الوجهة             الإجمالي (نقد/شبكة/ذمم)
 //
-// ⚠ إصلاح حقيقي أُصلح هنا: computeReturnAmounts في المرجع كانت تقرأ
-// l.unitCost || l.costSnapshot — حقلان لا يُكتبان في أي مكان بالمشروع
-// كله (بحث كامل تأكيدي)، فكانت amounts.cost يساوي صفر دائمًا، وسطرا
-// 1200/5100 لا يُكتبان أبدًا (محروسان بـ`if (cost > 0)`) — عكس التكلفة
-// كان معطَّلًا بصمت منذ البداية. هنا التكلفة تُحسب فعليًا من نفس
-// اللقطات المحفوظة أصلًا على كل سطر بيع (cost_per_gram_snapshot ×
-// weight_snapshot + workmanship_snapshot × الكمية).
+// ⚠ ثلاثة إصلاحات هنا:
+//  ① الإجمالي = قيمة الأسطر كما دُفعت (سعر السطر شامل الضريبة)، والضريبة
+//     جزءٌ منه — كانت تُضاف فوقه فيُردّ للعميل أكثر مما دفع.
+//  ② لا سطر تكلفة (1200/5100): النظام دوري لا يقيّد تكلفة عند البيع،
+//     و1200/5100 حسابا مجموعة — مطابقةً للمرجع الأحدث.
+//  ③ حركة النقد تُكتب بلا قيد ثانٍ: moveCash كان يرحّل 4190/النقد مرةً
+//     أخرى فوق قيد المرتجع، فيتضاعف أثرهما في الأستاذ.
 const REFUND_TARGET_ACCOUNTS = {
   daily_cash: "1130",
   safe_cash: "1110",
@@ -472,6 +485,33 @@ const RETURN_RESTOCK = {
   changed_mind: "available", wrong_size: "available", wrong_item: "available",
   defect: "damaged", damaged: "damaged",
 };
+
+function returnJournalLines(amounts, creditAccount) {
+  const lines = [];
+  if (amounts.net > 0) lines.push({ account: "4190", side: "debit", amount: amounts.net });
+  if (amounts.tax > 0) lines.push({ account: "2220", side: "debit", amount: amounts.tax });
+  lines.push({ account: creditAccount, side: "credit", amount: amounts.gross });
+  return lines;
+}
+
+async function insertReturnRow(client, { branchId, sale, allLines, lineIndexes, returnedLines, amounts, businessDayId, refundSource, note, createdBy, exchange = null }) {
+  const ref = await nextRef(client, "returns", branchId, "RTN");
+  const { rows } = await client.query(
+    `insert into returns
+       (branch_id, ref, sale_id, business_day_id, amount, weight, reason,
+        line_indexes, lines, full_return, refund_source, customer_id, customer_name, created_by,
+        exchange_settle, exchange_diff)
+     values ($1,$2,$3,$4,$5,$6,$7, $8,$9,$10,$11,$12,$13,$14, $15,$16)
+     returning *`,
+    [
+      branchId, ref, sale.id, businessDayId, amounts.gross, amounts.totalWeight, note || null,
+      JSON.stringify(lineIndexes), JSON.stringify(returnedLines), lineIndexes.length === allLines.length,
+      refundSource, sale.customer_id, sale.customer_name, createdBy,
+      exchange?.settle || null, exchange ? exchange.diff : null,
+    ]
+  );
+  return rows[0];
+}
 
 router.post(
   "/sales/:id/return-full",
@@ -491,170 +531,259 @@ router.post(
 
     try {
       const result = await withBranch(req.auth.branchId, async (client) => {
-        const { rows: saleRows } = await client.query(
-          "select * from sales where id = $1 and branch_id = $2 for update",
-          [req.params.id, req.auth.branchId]
-        );
-        const sale = saleRows[0];
-        if (!sale) return { error: "sale_not_found" };
-        // ⚠ الآجل يُخصم من الدَّين لا يُردّ نقدًا — نفس تحقّق
-        // validateReturnRequest صراحةً.
+        const loaded = await loadSaleForReturn(client, req.auth.branchId, req.params.id, lineIndexes);
+        if (loaded.error) return loaded;
+        const { sale, allLines, returnedLines } = loaded;
+        // ⚠ الآجل يُخصم من الدَّين لا يُردّ نقدًا — نفس validateReturnRequest.
         if (refundTarget !== "credit" && sale.payment_method === "credit") {
           return { error: "credit_sale_requires_credit_refund" };
         }
 
-        const { rows: allLines } = await client.query(
-          `select * from sale_lines where sale_id = $1 order by line_no`,
-          [sale.id]
-        );
-        for (const i of lineIndexes) {
-          if (i < 0 || i >= allLines.length) return { error: "line_index_out_of_range", index: i };
-        }
+        const amounts = computeReturnAmounts(sale, allLines, returnedLines);
+        if (!(amounts.gross > 0)) return { error: "zero_amount" };
 
-        // ⚠ منع الإرجاع المزدوج لنفس السطر — نفس فحص المرجع، هنا على
-        // بيانات returns الحقيقية بدل مصفوفة محلية.
-        const { rows: priorReturns } = await client.query(
-          `select line_indexes from returns where sale_id = $1 and branch_id = $2`,
-          [sale.id, req.auth.branchId]
-        );
-        const alreadyReturned = new Set();
-        for (const r of priorReturns) {
-          for (const i of r.line_indexes || []) alreadyReturned.add(i);
-        }
-        const dup = lineIndexes.find((i) => alreadyReturned.has(i));
-        if (dup != null) return { error: "line_already_returned", index: dup };
-
-        const returnedLines = lineIndexes.map((i) => allLines[i]);
-
-        // ── الحساب: صافي + ضريبة (بمعدّل الفاتورة الفعلي) + تكلفة ──
-        const net = roundMoney(returnedLines.reduce((a, l) => a + Number(l.unit_price) * Number(l.quantity), 0));
-        const saleNet = roundMoney(allLines.reduce((a, l) => a + Number(l.unit_price) * Number(l.quantity), 0));
-        const saleTax = Number(sale.tax_amount) || 0;
-        const effectiveRate = saleNet > 0 ? saleTax / saleNet : 0;
-        const tax = roundMoney(net * effectiveRate);
-        const gross = roundMoney(net + tax);
-        if (!(gross > 0)) return { error: "zero_amount" };
-
-        const cost = roundMoney(returnedLines.reduce((a, l) => {
-          const perUnit = (Number(l.cost_per_gram_snapshot) || 0) * (Number(l.weight_snapshot) || 0)
-            + (Number(l.workmanship_snapshot) || 0);
-          return a + perUnit * Number(l.quantity);
-        }, 0));
-
-        const weightByKarat = new Map();
-        for (const l of returnedLines) {
-          const w = Number(l.weight_snapshot) * Number(l.quantity);
-          weightByKarat.set(l.karat, (weightByKarat.get(l.karat) || 0) + w);
-        }
-
-        // ⚠ نفس تقريب الإرجاع السريع أعلاه: لا ربط مخزَّن بين سطر البيع
-        // ووحدة item_units بعينها — تُعاد أي N وحدة مباعة من نفس الصنف.
-        // القطعة التالفة تعود لغير مباعة (sold=false) لكن غير قابلة
-        // للعرض حتى تُفحص — issued=true يمنع بيعها ثانية بلا فحص، مطابقةً
-        // لمعنى sellable=false في المرجع (لا عمود منفصل لهذا في الباك
-        // إند، وissued هو الأقرب لغرضه: "خارج تداول البيع العادي").
-        for (const l of returnedLines) {
-          const { rows: soldUnits } = await client.query(
-            `select id from item_units where item_id = $1 and sold = true order by code limit $2`,
-            [l.item_id, l.quantity]
-          );
-          if (soldUnits.length < l.quantity) {
-            return { error: "unit_mismatch", itemId: l.item_id, available: soldUnits.length, requested: l.quantity };
-          }
-          const ids = soldUnits.map((r) => r.id);
-          if (restock === "damaged") {
-            await client.query(`update item_units set sold = false, issued = true where id = any($1::uuid[])`, [ids]);
-          } else {
-            await client.query(`update item_units set sold = false where id = any($1::uuid[])`, [ids]);
-          }
-        }
+        const restocked = await restockReturnedLines(client, returnedLines, restock);
+        if (restocked.error) return restocked;
 
         const businessDayId = sale.business_day_id;
-        const { rows: refRows } = await client.query(
-          `select count(*)::int + 1 as n from returns where branch_id = $1`,
-          [req.auth.branchId]
-        );
-        const ref = `RTN-${String(refRows[0].n).padStart(6, "0")}`;
-        const totalWeight = [...weightByKarat.values()].reduce((a, w) => a + w, 0);
+        const returnRec = await insertReturnRow(client, {
+          branchId: req.auth.branchId, sale, allLines, lineIndexes, returnedLines, amounts,
+          businessDayId, refundSource: refundTarget, note: body.note, createdBy: req.auth.userId,
+        });
 
-        const { rows: retRows } = await client.query(
-          `insert into returns
-             (branch_id, ref, sale_id, business_day_id, amount, weight, reason,
-              line_indexes, lines, full_return, refund_source, customer_id, customer_name, created_by)
-           values ($1,$2,$3,$4,$5,$6,$7, $8,$9,$10,$11,$12,$13,$14)
-           returning *`,
-          [
-            req.auth.branchId, ref, sale.id, businessDayId, gross, totalWeight, body.note || null,
-            JSON.stringify(lineIndexes), JSON.stringify(returnedLines), lineIndexes.length === allLines.length,
-            refundTarget, sale.customer_id, sale.customer_name, req.auth.userId,
-          ]
-        );
-        const returnRec = retRows[0];
+        await postGoldMovement(client, {
+          branchId: req.auth.branchId, businessDayId, opType: "sale_return",
+          weightByKarat: amounts.weightByKarat, refTable: "returns", refId: returnRec.id,
+          note: `مرتجع ${sale.ref}`, createdBy: req.auth.userId,
+        });
 
-        // ── دفتر الوزن: الذهب يعود للمخزون (1210) ──
-        for (const [karat, weight] of weightByKarat) {
-          await client.query(
-            `insert into gold_ledger_entries
-               (branch_id, business_day_id, op_type, karat, weight, fine_weight,
-                from_account, to_account, ref_table, ref_id, note, created_by)
-             values ($1,$2,'sale_return',$3,$4,$5, null,'1210', 'returns',$6,$7,$8)`,
-            [req.auth.branchId, businessDayId, karat, weight, fineWeight(weight, karat), returnRec.id, `مرتجع ${sale.ref}`, req.auth.userId]
-          );
-        }
-
-        // ── القيد المزدوج الكامل: عكس البيع + عكس التكلفة في قيد واحد ──
-        const lines = [];
-        if (net > 0) lines.push({ account: "4190", side: "debit", amount: net });
-        if (tax > 0) lines.push({ account: "2220", side: "debit", amount: tax });
-        lines.push({ account: REFUND_TARGET_ACCOUNTS[refundTarget], side: "credit", amount: gross });
-        if (cost > 0) {
-          lines.push({ account: "1200", side: "debit", amount: cost });
-          lines.push({ account: "5100", side: "credit", amount: cost });
-        }
         const journalEntryId = await postJournalEntry(client, {
           branchId: req.auth.branchId, businessDayId, opType: "sale_return",
           refTable: "returns", refId: returnRec.id,
-          description: `مرتجع مبيعات — ${sale.ref}`, createdBy: req.auth.userId, lines,
+          description: `مرتجع مبيعات — ${sale.ref}`, createdBy: req.auth.userId,
+          lines: returnJournalLines(amounts, REFUND_TARGET_ACCOUNTS[refundTarget]),
         });
 
-        // ── حركة النقد/الذمم الفعلية ──
         let receiptRec = null;
-        let cashResult = null;
+        let cashTx = null;
         if (refundTarget === "credit") {
-          const { rows: recRows } = await client.query(
-            `select count(*)::int + 1 as n from receipts where branch_id = $1`,
-            [req.auth.branchId]
-          );
-          const receiptRef = `RCP-${String(recRows[0].n).padStart(6, "0")}`;
-          const { rows: rcRows } = await client.query(
-            `insert into receipts
-               (branch_id, ref, customer_id, customer_name, sale_id, amount, method, category, note, business_day_id, created_by)
-             values ($1,$2,$3,$4,$5,$6,'adjust','sales_return',$7,$8,$9)
-             returning *`,
-            [
-              req.auth.branchId, receiptRef, sale.customer_id, sale.customer_name, sale.id, -gross,
-              `خصم مرتجع ${ref}`, businessDayId, req.auth.userId,
-            ]
-          );
-          receiptRec = rcRows[0];
+          receiptRec = await insertReturnReceipt(client, {
+            branchId: req.auth.branchId, sale, amount: -amounts.gross,
+            note: `خصم مرتجع ${returnRec.ref}`, businessDayId, createdBy: req.auth.userId,
+          });
         } else {
-          cashResult = await moveCash(client, {
-            branchId: req.auth.branchId, businessDayId, direction: "out",
-            sourceId: REFUND_TARGET_CASH_SOURCE[refundTarget], amount: gross, category: "sales_return",
-            note: `مرتجع ${ref} — ${sale.ref}`,
-            refTable: "returns", refId: returnRec.id, createdBy: req.auth.userId,
+          const { pool, method } = CASH_ACCOUNTS[REFUND_TARGET_CASH_SOURCE[refundTarget]];
+          cashTx = await insertCashTx(client, {
+            branchId: req.auth.branchId, businessDayId, pool, method, direction: "out",
+            amount: amounts.gross, category: "sales_return", refTable: "returns", refId: returnRec.id,
+            note: `مرتجع ${returnRec.ref} — ${sale.ref}`, createdBy: req.auth.userId,
           });
         }
 
         return {
           return: { ...returnRec, restock, journalEntryId },
           receipt: receiptRec,
-          cashTx: cashResult?.cashTx || null,
-          amounts: { net, tax, gross, cost },
+          cashTx,
+          amounts: { net: amounts.net, tax: amounts.tax, gross: amounts.gross, cost: amounts.cost },
         };
       });
       if (result.error) {
         const status = result.error === "sale_not_found" ? 404 : 409;
+        return res.status(status).json(result);
+      }
+      res.status(201).json(result);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════
+//  الاستبدال — processExchange: مرتجعٌ وفاتورةٌ جديدة في معاملةٍ واحدة
+// ══════════════════════════════════════════════════════════════
+//
+// ليس عمليةً ثالثة بمحاسبةٍ خاصة: مستندان مرتبطان — مرتجعٌ كامل الأثر
+// (إيراد مردود، وزن يعود) وفاتورةٌ كاملة الأثر (إيراد، وزن يخرج). طرفا
+// النقد في القيدين حسابٌ واحد (1130 نقدًا · 1140 شبكة · 1310 ذمم العميل)
+// فيتقاصّان في الأستاذ إلى الفرق، والدرج يتحرّك بالفرق وحده.
+//
+// diff = إجمالي الجديدة − إجمالي المرتجع: موجب يدفعه العميل، سالب يُردّ له.
+// الضريبة على الجديدة تتبع الفاتورة الأصل (خاضعة أم لا) بالمعدّل الحالي.
+// المرتجع والفاتورة على يوم العمل المفتوح الآن.
+const EXCHANGE_SETTLE = {
+  cash: { account: "1130", opType: "sale_cash", paymentMethod: "cash", method: "cash" },
+  card: { account: "1140", opType: "sale_card", paymentMethod: "card", method: "network" },
+  credit: { account: "1310", opType: "sale_credit", paymentMethod: "credit", method: null },
+};
+
+router.post(
+  "/sales/:id/exchange",
+  authenticate,
+  requirePage("salesReturn"),
+  requireNotDenied("sale"),
+  async (req, res, next) => {
+    const body = req.body || {};
+    const lineIndexes = Array.isArray(body.lineIndexes) ? body.lineIndexes : [];
+    const newLines = Array.isArray(body.newLines) ? body.newLines : [];
+    const reasonId = body.reasonId || "changed_mind";
+    const restock = RETURN_RESTOCK[reasonId];
+    const settle = EXCHANGE_SETTLE[body.settle];
+
+    if (!lineIndexes.length) return res.status(400).json({ error: "no_lines_selected" });
+    if (!restock) return res.status(400).json({ error: "invalid_reason" });
+    if (!settle) return res.status(400).json({ error: "invalid_exchange_settle" });
+    if (!newLines.length) return res.status(400).json({ error: "no_new_lines" });
+    for (const l of newLines) {
+      if (!l.itemId || !(Number(l.quantity) > 0) || !(Number(l.unitPrice) > 0)) {
+        return res.status(400).json({ error: "invalid_line", line: l });
+      }
+    }
+
+    try {
+      const result = await withBranch(req.auth.branchId, async (client) => {
+        if (await isStocktakeLocked(client, req.auth.branchId)) return { error: "stocktake_locked" };
+        const businessDay = await getOpenBusinessDay(client, req.auth.branchId);
+        if (!businessDay) return { error: "no_open_business_day" };
+
+        const loaded = await loadSaleForReturn(client, req.auth.branchId, req.params.id, lineIndexes);
+        if (loaded.error) return loaded;
+        const { sale, allLines, returnedLines } = loaded;
+        if (body.settle === "credit" && !sale.customer_id) return { error: "credit_settle_requires_customer" };
+
+        const amounts = computeReturnAmounts(sale, allLines, returnedLines);
+        if (!(amounts.gross > 0)) return { error: "zero_amount" };
+
+        // ① القطع العائدة أولًا، ثم الجديدة مع استثناء العائدة للتوّ.
+        const restocked = await restockReturnedLines(client, returnedLines, restock);
+        if (restocked.error) return restocked;
+        const reserved = await reserveSaleLines(client, req.auth.branchId, newLines, { excludeUnitIds: restocked.unitIds });
+        if (reserved.error) return reserved;
+
+        const { rows: settingsRows } = await client.query(
+          "select tax_rate from branch_settings where branch_id = $1",
+          [req.auth.branchId]
+        );
+        const taxApplicable = !!sale.tax_applicable;
+        const taxRate = taxApplicable ? Number(settingsRows[0]?.tax_rate ?? 0.15) : 0;
+        const total = roundMoney(reserved.subtotal);
+        const taxAmount = taxApplicable ? extractInclusiveTax(total, taxRate) : 0;
+        const netAmount = roundMoney(total - taxAmount);
+        const diff = roundMoney(total - amounts.gross);
+
+        // الردّ نقدًا لا يتجاوز رصيد الدرج (نفس حارس المرجع).
+        if (body.settle === "cash" && diff < -0.005) {
+          const { rows: balRows } = await client.query(
+            `select coalesce(sum(case when direction='in' then amount else -amount end), 0) as balance
+               from cash_tx where branch_id = $1 and pool = 'daily' and method = 'cash'`,
+            [req.auth.branchId]
+          );
+          const available = roundMoney(balRows[0]?.balance);
+          if (Math.abs(diff) > available + 0.01) {
+            return { error: "insufficient_daily_cash", available, requested: Math.abs(diff) };
+          }
+        }
+
+        // ② الفاتورة الجديدة
+        const saleRef = await nextRef(client, "sales", req.auth.branchId, "SALE");
+        const { rows: saleRows } = await client.query(
+          `insert into sales
+             (branch_id, ref, business_day_id, customer_id, customer_name, payment_method,
+              price24_snapshot, subtotal, total, tax_applicable, tax_rate, tax_amount, net_amount,
+              seller_id, created_by, exchange_of_sale_id)
+           values ($1,$2,$3,$4,$5,$6, $7,$8,$9,$10,$11,$12,$13, $14,$14,$15)
+           returning *`,
+          [
+            req.auth.branchId, saleRef, businessDay.id, sale.customer_id, sale.customer_name, settle.paymentMethod,
+            Number(body.price24Snapshot) || 0, total, total, taxApplicable, taxRate, taxAmount, netAmount,
+            req.auth.userId, sale.id,
+          ]
+        );
+        const newSale = saleRows[0];
+        await insertSaleLines(client, newSale.id, reserved.resolvedLines);
+
+        // ③ المرتجع مربوطًا بالفاتورة الجديدة
+        const returnRec = await insertReturnRow(client, {
+          branchId: req.auth.branchId, sale, allLines, lineIndexes, returnedLines, amounts,
+          businessDayId: businessDay.id, refundSource: `exchange_${body.settle}`, note: body.note,
+          createdBy: req.auth.userId, exchange: { settle: body.settle, diff },
+        });
+        await client.query(`update returns set exchange_sale_id = $1 where id = $2`, [newSale.id, returnRec.id]);
+
+        // ④ الوزن: يعود المرتجع ويخرج الجديد
+        await postGoldMovement(client, {
+          branchId: req.auth.branchId, businessDayId: businessDay.id, opType: "sale_return",
+          weightByKarat: amounts.weightByKarat, refTable: "returns", refId: returnRec.id,
+          note: `مرتجع استبدال ${returnRec.ref}`, createdBy: req.auth.userId,
+        });
+        await postGoldMovement(client, {
+          branchId: req.auth.branchId, businessDayId: businessDay.id, opType: "sale",
+          weightByKarat: reserved.weightByKarat, refTable: "sales", refId: newSale.id,
+          note: `بيع استبدال ${newSale.ref}`, createdBy: req.auth.userId,
+        });
+
+        // ⑤ القيدان — طرفهما النقدي حسابٌ واحد فيتقاصّان إلى الفرق
+        const returnJournalId = await postJournalEntry(client, {
+          branchId: req.auth.branchId, businessDayId: businessDay.id, opType: "sale_return",
+          refTable: "returns", refId: returnRec.id,
+          description: `مرتجع استبدال — ${sale.ref}`, createdBy: req.auth.userId,
+          lines: returnJournalLines(amounts, settle.account),
+        });
+        const saleJournalLines = [{ account: settle.account, side: "debit", amount: total }];
+        if (taxAmount > 0) {
+          saleJournalLines.push({ account: "4140", side: "credit", amount: netAmount });
+          saleJournalLines.push({ account: "2220", side: "credit", amount: taxAmount });
+        } else {
+          saleJournalLines.push({ account: "4140", side: "credit", amount: total });
+        }
+        const saleJournalId = await postJournalEntry(client, {
+          branchId: req.auth.branchId, businessDayId: businessDay.id, opType: settle.opType,
+          refTable: "sales", refId: newSale.id,
+          description: `فاتورة استبدال ${newSale.ref} — بدل ${sale.ref}`, createdBy: req.auth.userId,
+          lines: saleJournalLines,
+        });
+
+        // ⑥ الدرج بالفرق وحده — أو ذمة العميل
+        let cashTx = null;
+        let receipt = null;
+        if (settle.method && Math.abs(diff) > 0.005) {
+          cashTx = await insertCashTx(client, {
+            branchId: req.auth.branchId, businessDayId: businessDay.id, pool: "daily", method: settle.method,
+            direction: diff > 0 ? "in" : "out", amount: Math.abs(diff),
+            category: diff > 0 ? "sales_revenue" : "sales_return", refTable: "sales", refId: newSale.id,
+            note: `فرق استبدال ${returnRec.ref} — ${sale.ref} ← ${newSale.ref}`, createdBy: req.auth.userId,
+          });
+        } else if (body.settle === "credit") {
+          // المرتجع يُخصم من دَينه، والفاتورة الجديدة الآجلة تُضاف إليه.
+          receipt = await insertReturnReceipt(client, {
+            branchId: req.auth.branchId, sale, amount: -amounts.gross,
+            note: `خصم مرتجع استبدال ${returnRec.ref}`, businessDayId: businessDay.id, createdBy: req.auth.userId,
+          });
+        }
+
+        await client.query(
+          `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
+           values ($1,'create',$2,'returns',$3,$4)`,
+          [req.auth.branchId, req.auth.userId, returnRec.id, JSON.stringify({
+            kind: "exchange", fromSale: sale.ref, returnRef: returnRec.ref, newSale: newSale.ref,
+            returned: amounts.gross, newTotal: total, diff, settle: body.settle,
+          })]
+        );
+
+        return {
+          return: { ...returnRec, exchange_sale_id: newSale.id, restock, journalEntryId: returnJournalId },
+          sale: { ...newSale, journalEntryId: saleJournalId },
+          saleLines: reserved.resolvedLines,
+          cashTx,
+          receipt,
+          amounts: {
+            returned: { net: amounts.net, tax: amounts.tax, gross: amounts.gross, cost: amounts.cost },
+            newTotal: total, newTax: taxAmount, newNet: netAmount,
+            diff, direction: diff > 0.005 ? "customer_pays" : diff < -0.005 ? "shop_refunds" : "even",
+          },
+        };
+      });
+      if (result.error) {
+        const status = result.error === "sale_not_found" || result.error === "item_not_found" ? 404 : 409;
         return res.status(status).json(result);
       }
       res.status(201).json(result);

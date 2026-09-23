@@ -30,6 +30,14 @@ async function withBranch(branchId, fn) {
       branchId,
     ]);
     const result = await fn(client);
+    // ⚠ المسارات ترفض بإرجاع { error } لا برمي استثناء، والمستدعي يردّ
+    // 4xx. الإيداع هنا كان يُبقي ما كُتب قبل الرفض: بيعٌ بسطرين نفد
+    // مخزون ثانيهما كان يترك قطع الأول مباعةً بلا فاتورة، ومرتجعٌ تعثّر
+    // سطره الثاني يُبقي الأول عائدًا بلا مستند. الرفض الآن تراجعٌ كامل.
+    if (result && typeof result === "object" && result.error) {
+      await client.query("ROLLBACK");
+      return result;
+    }
     await client.query("COMMIT");
     return result;
   } catch (err) {

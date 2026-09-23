@@ -4,6 +4,7 @@ import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.
 import { extractInclusiveTax } from "../domain/money.js";
 import { fineWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
+import { getOpenBusinessDay, insertSaleLines, isStocktakeLocked, postGoldMovement, reserveSaleLines } from "../domain/saleOps.js";
 
 const router = Router();
 
@@ -108,21 +109,10 @@ router.post("/sales", async (req, res, next) => {
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
       // ⚠ لا بيع أثناء الجرد — نفس حارس stocktakeLock في handleCreateSale.
-      const { rows: lockRows } = await client.query(
-        "select locked from stocktake_locks where branch_id = $1",
-        [req.auth.branchId]
-      );
-      if (lockRows[0]?.locked) return { error: "stocktake_locked" };
+      if (await isStocktakeLocked(client, req.auth.branchId)) return { error: "stocktake_locked" };
 
-      // يوم عمل مفتوح إلزامي — sales.business_day_id NOT NULL في الـschema،
-      // وهذا يطبّق فعليًا مبدأ "كل حركة تحمل معرّف يوم العمل" من data-model-spec.md.
-      const { rows: dayRows } = await client.query(
-        `select id, ref from business_days
-          where branch_id = $1 and status = 'open'
-          order by opened_at desc limit 1`,
-        [req.auth.branchId]
-      );
-      const businessDay = dayRows[0];
+      // يوم عمل مفتوح إلزامي — sales.business_day_id NOT NULL في الـschema.
+      const businessDay = await getOpenBusinessDay(client, req.auth.branchId);
       if (!businessDay) return { error: "no_open_business_day" };
 
       const { rows: settingsRows } = await client.query(
@@ -134,68 +124,9 @@ router.post("/sales", async (req, res, next) => {
         body.taxApplicable != null ? !!body.taxApplicable : settings.tax_enabled;
 
       // ── تحميل القطع والتحقق من التوفر، وحجز الأسطر ──
-      const resolvedLines = [];
-      let subtotal = 0;
-      const weightByKarat = new Map(); // karat -> total grams sold
-
-      for (const line of lines) {
-        const { rows: itemRows } = await client.query(
-          `select i.*, c.sale_mode
-             from items i join categories c on c.id = i.category_id
-            where i.id = $1 and i.branch_id = $2
-            for update of i`,
-          [line.itemId, req.auth.branchId]
-        );
-        const item = itemRows[0];
-        if (!item) return { error: "item_not_found", itemId: line.itemId };
-        if (item.sale_mode === "partial") {
-          return { error: "item_requires_partial_sale_endpoint", itemId: line.itemId };
-        }
-
-        // ⚠ إصلاح حقيقي: أُضيف عمود item_units.issued لاحقًا (migration 006،
-        // إخراج بضاعة من النظام دون بيع). بدون استثنائه هنا، قطعة أُخرجت
-        // (تالفة/فاقد/إلخ) كانت ستبقى قابلة للبيع فعليًا طالما sold=false —
-        // اكتُشف أثناء اختبار endpoint الإخراج الجديد نفسه.
-        const { rows: unsoldRows } = await client.query(
-          `select id from item_units where item_id = $1 and sold = false and issued = false order by code limit $2`,
-          [item.id, line.quantity]
-        );
-        if (unsoldRows.length < line.quantity) {
-          return {
-            error: "insufficient_stock",
-            itemId: line.itemId,
-            available: unsoldRows.length,
-            requested: line.quantity,
-          };
-        }
-
-        await client.query(
-          `update item_units set sold = true where id = any($1::uuid[])`,
-          [unsoldRows.map((r) => r.id)]
-        );
-
-        const lineTotal = Number(line.unitPrice) * Number(line.quantity);
-        subtotal += lineTotal;
-
-        const lineWeight = Number(item.weight) * Number(line.quantity);
-        weightByKarat.set(item.karat, (weightByKarat.get(item.karat) || 0) + lineWeight);
-
-        resolvedLines.push({
-          itemId: item.id,
-          category: item.category_id,
-          karat: item.karat,
-          quantity: line.quantity,
-          unitPrice: line.unitPrice,
-          weightSnapshot: item.weight,
-          costPerGramSnapshot: item.cost_per_gram,
-          // Simplification vs. the reference's `item.workmanshipPerUnit` (a
-          // frontend-derived field not stored as such in this schema): we
-          // snapshot the item's own workmanship figure. Correct for this
-          // transaction's atomicity; profit-split reporting is a later
-          // concern that can refine this if needed.
-          workmanshipSnapshot: item.workmanship,
-        });
-      }
+      const reserved = await reserveSaleLines(client, req.auth.branchId, lines);
+      if (reserved.error) return reserved;
+      const { resolvedLines, subtotal, weightByKarat } = reserved;
 
       const total = Math.round(subtotal * 100) / 100;
       const taxRate = taxApplicable ? Number(settings.tax_rate) : 0;
@@ -286,40 +217,14 @@ router.post("/sales", async (req, res, next) => {
         }
       }
 
-      // ⚠ line_no يُثبَّت هنا صراحةً (migration 013): sale_lines.id عشوائي
-      // (UUID) لا يعكس ترتيب الإدخال، وbootstrap/المرتجعات يحتاجان ترتيبًا
-      // حتميًا يطابق تمامًا ما رآه المستخدم في شاشة البيع (فهرس السطر عند
-      // الإرجاع لاحقًا).
-      for (let i = 0; i < resolvedLines.length; i++) {
-        const l = resolvedLines[i];
-        await client.query(
-          `insert into sale_lines
-             (sale_id, item_id, category, karat, quantity, unit_price,
-              weight_snapshot, cost_per_gram_snapshot, workmanship_snapshot, line_no)
-           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-          [
-            sale.id, l.itemId, l.category, l.karat, l.quantity, l.unitPrice,
-            l.weightSnapshot, l.costPerGramSnapshot, l.workmanshipSnapshot, i,
-          ]
-        );
-      }
+      // ⚠ line_no يُثبَّت صراحةً (migration 013) — راجع insertSaleLines.
+      await insertSaleLines(client, sale.id, resolvedLines);
 
       // ── دفتر الوزن: الذهب يخرج من 1210 (مشغول جاهز للبيع) ──
-      // نفس اتجاه sale_cash/sale_card/sale_credit في POSTING_RULES —
-      // الثلاثة متطابقون هنا (from:1210, to:null) فلا حاجة للتفريع بحسب
-      // طريقة الدفع لهذا الدفتر تحديدًا.
-      for (const [karat, weight] of weightByKarat) {
-        await client.query(
-          `insert into gold_ledger_entries
-             (branch_id, business_day_id, op_type, karat, weight, fine_weight,
-              from_account, to_account, ref_table, ref_id, note, created_by)
-           values ($1,$2,$3,$4,$5,$6, $7,$8, $9,$10,$11,$12)`,
-          [
-            req.auth.branchId, businessDay.id, "sale", karat, weight, fineWeight(weight, karat),
-            "1210", null, "sales", sale.id, `بيع ${sale.ref}`, req.auth.userId,
-          ]
-        );
-      }
+      await postGoldMovement(client, {
+        branchId: req.auth.branchId, businessDayId: businessDay.id, opType: "sale",
+        weightByKarat, refTable: "sales", refId: sale.id, note: `بيع ${sale.ref}`, createdBy: req.auth.userId,
+      });
 
       // ── الصندوق ──
       let fee = 0;
