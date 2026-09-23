@@ -1,6 +1,9 @@
 import { Router } from "express";
 import { withBranch } from "../db.js";
 import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.js";
+import { postJournalEntry } from "../domain/journal.js";
+import { roundMoney } from "../domain/money.js";
+import { fineWeight } from "../domain/weight.js";
 
 const router = Router();
 
@@ -59,6 +62,17 @@ router.post("/lots/:id/items", async (req, res, next) => {
       if (!lot) return { error: "lot_not_found" };
       if (lot.status !== "open") return { error: "lot_not_open" };
       if (!KARATS.includes(Number(lot.karat))) return { error: "lot_missing_karat" };
+
+      // ⚠ الدفعة الافتتاحية (migration 035) تُكوَّد في وضع الافتتاح وحده —
+      //   بعد إطفائه لا يُدخل رصيدٌ افتتاحي على أنه تشغيل.
+      const isOpeningLot = lot.source === "opening";
+      if (isOpeningLot) {
+        const { rows: stRows } = await client.query(
+          "select opening_mode from branch_settings where branch_id = $1",
+          [req.auth.branchId]
+        );
+        if (!stRows[0]?.opening_mode) return { error: "opening_mode_off" };
+      }
 
       // تحقق التصنيفات كلها دفعة واحدة قبل أي إدراج.
       const categoryIds = [...new Set(rows.map((r) => r.categoryId))];
@@ -170,7 +184,49 @@ router.post("/lots/:id/items", async (req, res, next) => {
         );
       }
 
-      return { items: createdItems };
+      // ── الدفعة الافتتاحية تنمو بما يُكوَّد، ويدخل الدفترين هنا لا عند
+      //    شراء (لا شراء): وزنًا إلى 1210، ونقدًا مخزونًا مقابل رأس المال.
+      let openingEntry = null;
+      if (isOpeningLot) {
+        const pieces = createdItems.reduce((a, it) => a + it.units.length, 0);
+        const weightNow = createdItems.reduce((a, it) => a + it.weight * it.units.length, 0);
+        const goldValue = roundMoney(createdItems.reduce((a, it) => a + (it.costPerGram || 0) * it.weight * it.units.length, 0));
+        const value = roundMoney(createdItems.reduce((a, it) => a + ((it.costPerGram || 0) * it.weight + (it.workmanship || 0)) * it.units.length, 0));
+        const { rows: upd } = await client.query(
+          `update lots set weight = coalesce(weight, 0) + $1,
+                           gold_cost = coalesce(gold_cost, 0) + $2,
+                           total_cost = coalesce(total_cost, 0) + $3
+            where id = $4 returning weight, gold_cost, total_cost`,
+          [weightNow, goldValue, value, lot.id]
+        );
+        await client.query(
+          `insert into gold_ledger_entries
+             (branch_id, business_day_id, op_type, karat, weight, fine_weight,
+              from_account, to_account, ref_table, ref_id, note, created_by)
+           values ($1,$2,'opening_inventory',$3,$4,$5, null,'1210', 'lots',$6,$7,$8)`,
+          [req.auth.branchId, businessDayId, karat, weightNow, fineWeight(weightNow, karat), lot.id,
+            `افتتاحي ${lot.ref}`, req.auth.userId]
+        );
+        let journalEntryId = null;
+        if (value > 0) {
+          journalEntryId = await postJournalEntry(client, {
+            branchId: req.auth.branchId, businessDayId, opType: "opening_inventory",
+            refTable: "lots", refId: lot.id,
+            description: `مخزون افتتاحي مكوَّد — ${lot.ref} — ${pieces} قطعة`,
+            createdBy: req.auth.userId,
+            lines: [
+              { account: "1210", side: "debit", amount: value },
+              { account: "3100", side: "credit", amount: value },
+            ],
+          });
+        }
+        openingEntry = {
+          value, weight: weightNow, pieces, journalEntryId,
+          lot: { weight: Number(upd[0].weight), goldCost: Number(upd[0].gold_cost), totalCost: Number(upd[0].total_cost) },
+        };
+      }
+
+      return { items: createdItems, opening: openingEntry };
     });
 
     if (result.error) {

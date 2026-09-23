@@ -113,7 +113,7 @@ router.get("/bootstrap", async (req, res, next) => {
       (client) =>
         client.query(`select * from daily_custody where branch_id = $1 order by opened_at desc limit 60`, [branchId]),
       (client) =>
-        client.query(`select tax_enabled, tax_rate, card_fees, workday_mode from branch_settings where branch_id = $1`, [branchId]),
+        client.query(`select tax_enabled, tax_rate, card_fees, workday_mode, opening_mode, opening_finished_at from branch_settings where branch_id = $1`, [branchId]),
       // فئات مشتركة بين الفروع (branch_id يمكن أن يكون null) + فئات هذا الفرع تحديدًا.
       // ⚠ order by sort_order صريح الآن (migration 029) — بلا هذا كان
       // ترتيب categories يعود عشوائيًّا فعليًّا (لا ضمان ترتيب من
@@ -312,7 +312,7 @@ router.get("/bootstrap", async (req, res, next) => {
       businessDays: businessDay.rows,
       stocktakeLock: stocktakeLock.rows[0] || null,
       dailyCustody: dailyCustody.rows,
-      settings: branchSettings.rows[0] || { tax_enabled: true, tax_rate: 0.15, card_fees: {}, workday_mode: "required" },
+      settings: branchSettings.rows[0] || { tax_enabled: true, tax_rate: 0.15, card_fees: {}, workday_mode: "required", opening_mode: false, opening_finished_at: null },
       categories: categories.rows,
       items: items.rows,
       itemUnits: itemUnits.rows,
