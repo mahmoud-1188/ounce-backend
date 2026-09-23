@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { withBranch } from "../db.js";
-import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.js";
+import { authenticate, requireAnyPage, requirePage, requireNotDenied } from "../middleware/auth.js";
 import { roundMoney } from "../domain/money.js";
 import { fineWeight, roundWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
@@ -471,6 +471,65 @@ router.post("/suppliers", authenticate, requirePage("suppliers"), requireNotDeni
       return res.status(status).json(result);
     }
     res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/suppliers/statements — مصادر كشف المورد كاملةً بلا حدود
+ * (bootstrap يقصّ cash_tx عند 500 والتسكيرات عند 200، فالرصيد السابق
+ * والرصيد الجاري يخطئان للتاريخ الأقدم). الواجهة تبني الكشف نفسه
+ * (buildSupplierStatement) من هذه المصفوفات، وledger هو رصيد
+ * supplier_ledger الرسمي لكل مورد للمطابقة.
+ */
+router.get("/suppliers/statements", authenticate, requireAnyPage("suppliers", "supplierLedger"), async (req, res, next) => {
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      const b = req.auth.branchId;
+      const [lots, taskir, safeGold, fees, ledger, taskirFees] = await Promise.all([
+        client.query(
+          `select l.*, p.payment_method, p.office_id, p.invoice_pending, p.pay_fees_now, p.notes as purchase_notes
+             from lots l left join purchases p on p.id = l.purchase_id
+            where l.branch_id = $1 and l.supplier_id is not null and coalesce(l.source, 'purchase') <> 'opening'`,
+          [b]
+        ),
+        client.query(`select * from taskir_entries where branch_id = $1 and supplier_id is not null`, [b]),
+        client.query(
+          `select * from safe_gold_tx where branch_id = $1 and supplier_id is not null and direction = 'out' and destination = 'supplier'`,
+          [b]
+        ),
+        client.query(
+          `select c.* from cash_tx c
+            where c.branch_id = $1 and c.direction = 'out' and c.category = 'gold_workmanship'
+              and ((c.ref_table = 'purchases' and c.ref_id in (select id from purchases where branch_id = $1))
+                or (c.ref_table = 'taskir_entries' and c.ref_id in (select id from taskir_entries where branch_id = $1)))`,
+          [b]
+        ),
+        client.query(
+          `select supplier_id,
+                  coalesce(sum(case when direction = 'increase' then gold_fine_grams else -gold_fine_grams end), 0) as gold,
+                  coalesce(sum(case when direction = 'increase' then fees_amount else -fees_amount end), 0) as fees
+             from supplier_ledger where branch_id = $1 group by supplier_id`,
+          [b]
+        ),
+        // ما سدّدته أجور كل تسكير من التزام الأجور (والباقي أجورٌ جديدة)
+        client.query(
+          `select ref_id, fees_amount from supplier_ledger
+            where branch_id = $1 and ref_table = 'taskir_entries' and direction = 'decrease'`,
+          [b]
+        ),
+      ]);
+      return {
+        lots: lots.rows,
+        taskirEntries: taskir.rows,
+        safeGoldTx: safeGold.rows,
+        feeCashTx: fees.rows,
+        ledger: ledger.rows.map((r) => ({ supplierId: r.supplier_id, gold: Number(r.gold), fees: Number(r.fees) })),
+        taskirFeesSettled: Object.fromEntries(taskirFees.rows.map((r) => [r.ref_id, Number(r.fees_amount) || 0])),
+      };
+    });
+    res.json(result);
   } catch (err) {
     next(err);
   }

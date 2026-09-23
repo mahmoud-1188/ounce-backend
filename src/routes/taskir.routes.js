@@ -25,10 +25,12 @@ function fundingToPoolMethod(fundingSource) {
   // البادئة daily_* تعني صندوق اليوم (يوم عمل مفتوح إلزامي)، safe_* تعني
   // خزنة الفرع مباشرة (لا يشترط يوم عمل).
   switch (fundingSource) {
+    // ⚠ cash_tx.pool يقبل 'daily' لا 'day' (قيد CHECK) — كان كل تسكير
+    //   يموَّل من الصندوق اليومي يفشل بخطأ خادم.
     case "daily_cash":
-      return { pool: "day", method: "cash" };
+      return { pool: "daily", method: "cash" };
     case "daily_network":
-      return { pool: "day", method: "network" };
+      return { pool: "daily", method: "network" };
     case "safe_cash":
       return { pool: "safe", method: "cash" };
     case "safe_network":
@@ -125,7 +127,7 @@ router.post("/taskirat", async (req, res, next) => {
         [req.auth.branchId]
       );
       const businessDayId = dayRows[0]?.id || null;
-      if (poolMethod?.pool === "day" && !businessDayId) {
+      if (poolMethod?.pool === "daily" && !businessDayId) {
         // يوم العمل المطفأ (migration 034) يسمح بالحركة من الصندوق بلا يوم.
         const { rows: modeRows } = await client.query(
           "select workday_mode from branch_settings where branch_id = $1",
@@ -221,19 +223,36 @@ router.post("/taskirat", async (req, res, next) => {
         );
       }
 
-      // ── دين المورد ينخفض بمقدار الوزن الصافي المسدَّد ──
+      // ── الأجور المدفوعة هنا تسدّد أولًا أجور المورد المستحقة (2120 —
+      //    قيّدتها المشتريات الآجلة مصروفًا والتزامًا)، والزائد وحده أجورٌ
+      //    جديدة (5210). كانت كلها تُقيَّد 5210 فتُصرف الأجور مرتين ويبقى
+      //    2120 والتزام المورد في دفتره لا يُسدَّدان أبدًا.
+      let feesSettled = 0;
+      if (workmanshipAmount > 0) {
+        const { rows: owedRows } = await client.query(
+          `select coalesce(sum(case when direction = 'increase' then fees_amount else -fees_amount end), 0) as owed
+             from supplier_ledger where branch_id = $1 and supplier_id = $2`,
+          [req.auth.branchId, supplierId]
+        );
+        feesSettled = roundMoney(Math.max(0, Math.min(workmanshipAmount, Number(owedRows[0]?.owed) || 0)));
+      }
+
+      // ── دين المورد ينخفض بمقدار الوزن الصافي المسدَّد (والأجور المسدَّدة) ──
       await client.query(
         `insert into supplier_ledger
            (branch_id, supplier_id, business_day_id, direction, gold_fine_grams, fees_amount,
             ref_table, ref_id, note, created_by)
-         values ($1,$2,$3,'decrease',$4,0,'taskir_entries',$5,$6,$7)`,
-        [req.auth.branchId, supplierId, businessDayId, fine, entry.id, label, req.auth.userId]
+         values ($1,$2,$3,'decrease',$4,$5,'taskir_entries',$6,$7,$8)`,
+        [req.auth.branchId, supplierId, businessDayId, fine, feesSettled, entry.id, label, req.auth.userId]
       );
 
       // ── الأجور: نقدًا دائمًا، من مصدر التمويل المختار ──
       let workmanshipJournalEntryId = null;
       if (workmanshipAmount > 0) {
-        const creditAccount = poolMethod.method === "cash" ? "1110" : "1120";
+        // الحساب النقدي بحسب الوعاء: الخزنة 1110/1120 · الصندوق اليومي 1130/1140
+        const creditAccount = poolMethod.pool === "daily"
+          ? (poolMethod.method === "cash" ? "1130" : "1140")
+          : (poolMethod.method === "cash" ? "1110" : "1120");
         await client.query(
           `insert into cash_tx
              (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
@@ -252,7 +271,8 @@ router.post("/taskirat", async (req, res, next) => {
           description: `${label} — أجور`,
           createdBy: req.auth.userId,
           lines: [
-            { account: "5210", side: "debit", amount: workmanshipAmount },
+            { account: "2120", side: "debit", amount: feesSettled },
+            { account: "5210", side: "debit", amount: roundMoney(workmanshipAmount - feesSettled) },
             { account: creditAccount, side: "credit", amount: workmanshipAmount },
           ],
         });
@@ -472,7 +492,10 @@ router.post("/taskir-offices/:officeId/settle", requireManager, async (req, res,
            values ($1,$2,$3,'out','cash',$4,$5,24,'taskir_offices',$6,$7)`,
           [req.auth.branchId, officeId, businessDayId, amount, fine, label, req.auth.userId]
         );
-        const creditAccount = poolMethod.method === "cash" ? "1110" : "1120";
+        // الحساب النقدي بحسب الوعاء: الخزنة 1110/1120 · الصندوق اليومي 1130/1140
+        const creditAccount = poolMethod.pool === "daily"
+          ? (poolMethod.method === "cash" ? "1130" : "1140")
+          : (poolMethod.method === "cash" ? "1110" : "1120");
         await client.query(
           `insert into cash_tx
              (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)

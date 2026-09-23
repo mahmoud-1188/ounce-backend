@@ -30,6 +30,7 @@ import itemsRoutes from "./routes/items.routes.js";
 import categoriesRoutes from "./routes/categories.routes.js";
 import platformRoutes from "./routes/platform.routes.js";
 import openingRoutes from "./routes/opening.routes.js";
+import stocktakeRoutes from "./routes/stocktake.routes.js";
 
 const app = express();
 
@@ -84,6 +85,7 @@ app.use("/api", hqTransactionsRoutes);
 app.use("/api", itemsRoutes);
 app.use("/api", categoriesRoutes);
 app.use("/api", openingRoutes);
+app.use("/api", stocktakeRoutes);
 app.use("/api", platformRoutes);
 
 // Centralized error handler — keeps internal error details out of the
