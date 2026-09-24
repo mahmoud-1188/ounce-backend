@@ -1,9 +1,10 @@
 import { Router } from "express";
-import { withBranch } from "../db.js";
+import { withBranch, withoutBranch } from "../db.js";
 import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.js";
 import { extractInclusiveTax, roundMoney } from "../domain/money.js";
 import { fineWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
+import { applyMarkup, loadBranchPricePolicy } from "../domain/pricePolicy.js";
 import { approvalGate } from "../domain/approvals.js";
 import {
   computeReturnAmounts, insertCashTx, insertReturnReceipt, insertSaleLines,
@@ -834,20 +835,42 @@ const USD_TO_SAR_PEG = 3.75;
 let goldPriceCache = { at: 0, data: null };
 const GOLD_PRICE_CACHE_MS = 60 * 1000;
 
+async function fetchWorldPrice() {
+  if (goldPriceCache.data && Date.now() - goldPriceCache.at < GOLD_PRICE_CACHE_MS) return goldPriceCache.data;
+  const response = await fetch("https://api.gold-api.com/price/XAU");
+  if (!response.ok) throw new Error("gold_api_unavailable");
+  const body = await response.json();
+  const perOunceUsd = Number(body.price);
+  if (!Number.isFinite(perOunceUsd) || perOunceUsd <= 0) throw new Error("gold_api_invalid_price");
+  const perGramSar = roundMoney((perOunceUsd / GRAMS_PER_OUNCE) * USD_TO_SAR_PEG);
+  const payload = { perGram: perGramSar, asOf: body.updatedAt || body.updated_at || new Date().toISOString() };
+  goldPriceCache = { at: Date.now(), data: payload };
+  return payload;
+}
+
+// ⚠ السعر يعود ومعه سياسة الإدارة (migration 038): العالمي (آليًّا، أو
+//   يدويًّا إن ضبطته الإدارة) + الزيادة المعتمدة = سعر العمل. `perGram`
+//   يبقى السعر العالمي كما كان — والواجهة تطبّق الزيادة وتعرض التركيب.
 router.get("/gold-price", authenticate, async (req, res, next) => {
   try {
-    if (goldPriceCache.data && Date.now() - goldPriceCache.at < GOLD_PRICE_CACHE_MS) {
-      return res.json(goldPriceCache.data);
+    const policy = await withoutBranch((client) => loadBranchPricePolicy(client, req.auth.branchId));
+    let world;
+    let source = "auto";
+    if (policy.world24Manual > 0) {
+      world = { perGram: roundMoney(policy.world24Manual), asOf: policy.at };
+      source = "hq";
+    } else {
+      world = await fetchWorldPrice();
     }
-    const response = await fetch("https://api.gold-api.com/price/XAU");
-    if (!response.ok) throw new Error("gold_api_unavailable");
-    const body = await response.json();
-    const perOunceUsd = Number(body.price);
-    if (!Number.isFinite(perOunceUsd) || perOunceUsd <= 0) throw new Error("gold_api_invalid_price");
-    const perGramSar = roundMoney((perOunceUsd / GRAMS_PER_OUNCE) * USD_TO_SAR_PEG);
-    const payload = { perGram: perGramSar, asOf: body.updatedAt || body.updated_at || new Date().toISOString() };
-    goldPriceCache = { at: Date.now(), data: payload };
-    res.json(payload);
+    res.json({
+      ...world,
+      world24: world.perGram,
+      markup: policy.markup,
+      price24: applyMarkup(world.perGram, policy.markup),
+      source,
+      policyAt: policy.at,
+      policyBy: policy.by,
+    });
   } catch (err) {
     // ⚠ لا نُفشل بـ500 خام هنا: الفرونت إند يعامل أي خطأ كـ"تعذر الاتصال
     // بالسعر العالمي" ويحتفظ بآخر سعر معروف — رسالة واضحة تكفي.

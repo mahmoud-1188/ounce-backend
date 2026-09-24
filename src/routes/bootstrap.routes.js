@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { shapeApproval } from "../domain/approvals.js";
+import { loadBranchNotices, loadBranchPricePolicy } from "../domain/pricePolicy.js";
 import { withBranch, withBranchParallel } from "../db.js";
 import { authenticate } from "../middleware/auth.js";
 
@@ -92,6 +93,8 @@ router.get("/bootstrap", async (req, res, next) => {
       goldLedgerRaw,
       approvalsRaw,
       reviewsRaw,
+      pricePolicy,
+      notices,
     ] = await withBranchParallel(branchId, [
       // ⚠ توسيع حقيقي: كان يُحمَّل عمود مُصغَّر لآخر يوم فقط، لكن WorkDayPage
       // في المرجع تعرض أيضًا سجل "الأيام السابقة" (ref، فتح/إقفال، مبيعات،
@@ -269,6 +272,9 @@ router.get("/bootstrap", async (req, res, next) => {
       // أحكام المراجعة المحاسبية — آخر حكمٍ لكل بند يحدّد بقاءه في الطابور
       (client) =>
         client.query(`select * from reviews where branch_id = $1 order by created_at desc limit 1000`, [branchId]),
+      // زيادة الإدارة على السعر وإعلاناتها (migration 038) — من متجر الفرع
+      (client) => loadBranchPricePolicy(client, branchId),
+      (client) => loadBranchNotices(client, branchId),
     ]);
 
     const linesByEntry = new Map();
@@ -358,6 +364,8 @@ router.get("/bootstrap", async (req, res, next) => {
       goldLedger,
       approvals: approvalsRaw.rows.map((a) => shapeApproval(a, { label: a.rule_label })),
       reviews: reviewsRaw.rows,
+      pricePolicy,
+      notices,
       currentUser: {
         id: req.auth.userId,
         name: req.auth.user.name,

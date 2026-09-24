@@ -180,6 +180,52 @@ async function removeBranchUser(client, branchId, userId, actor = {}) {
   return { ok: true };
 }
 
+/**
+ * إعادة الرقم السري من الإدارة (user_pin في المرجع).
+ *
+ * ⚠ الرقم لا يتكرّر في الفرع (حارس الإضافة نفسه)، ولا يُسجَّل في سجل
+ * الصلاحيات — تسجيلُه يجعل السجل نفسه بابًا.
+ */
+async function resetBranchUserPin(client, branchId, userId, pin, actor = {}) {
+  const { rows } = await client.query(
+    "select id, name from users where id = $1 and branch_id = $2 and active = true",
+    [userId, branchId]
+  );
+  const u = rows[0];
+  if (!u) return { error: "not_found" };
+  const { rows: others } = await client.query(
+    "select pin_hash from users where branch_id = $1 and active = true and id <> $2",
+    [branchId, userId]
+  );
+  for (const o of others) if (await verifyPin(String(pin), o.pin_hash)) return { error: "pin_taken" };
+  await client.query("update users set pin_hash = $1 where id = $2", [await hashPin(String(pin)), userId]);
+  await logPermission(client, branchId, { targetId: u.id, targetName: u.name, kind: "pin", actor });
+  return { ok: true, user: { id: u.id, name: u.name } };
+}
+
+/**
+ * تفعيل مستخدمٍ معطَّل أو تعطيله (user_toggle في المرجع).
+ * ⚠ لا يُعطَّل آخر مدير — الفرع يبقى بلا من يديره.
+ */
+async function setBranchUserActive(client, branchId, userId, active, actor = {}) {
+  const { rows } = await client.query(
+    "select id, name, role, active from users where id = $1 and branch_id = $2",
+    [userId, branchId]
+  );
+  const u = rows[0];
+  if (!u) return { error: "not_found" };
+  if (!active) {
+    const existing = await loadBranchUsersWithRoles(client, branchId);
+    if (wouldRemoveLastManager(existing, userId)) return { error: "would_remove_last_manager" };
+  }
+  if (!!u.active === !!active) return { ok: true, user: { id: u.id, name: u.name, active: !!active } };
+  await client.query("update users set active = $1 where id = $2", [!!active, userId]);
+  await logPermission(client, branchId, {
+    targetId: u.id, targetName: u.name, kind: "activate", before: { active: !!u.active }, after: { active: !!active }, actor,
+  });
+  return { ok: true, user: { id: u.id, name: u.name, active: !!active } };
+}
+
 export {
   loadBranchUsersWithRoles,
   createBranchUser,
@@ -187,4 +233,6 @@ export {
   setBranchUserAi,
   setBranchUserPermissions,
   removeBranchUser,
+  resetBranchUserPin,
+  setBranchUserActive,
 };

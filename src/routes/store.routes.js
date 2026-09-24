@@ -13,7 +13,11 @@ import {
   setBranchUserAi,
   setBranchUserPermissions,
   removeBranchUser,
+  resetBranchUserPin,
+  setBranchUserActive,
 } from "../domain/branchUsers.js";
+import { closeBusinessDay } from "../domain/businessDay.js";
+import { applyMarkup, shapePolicy } from "../domain/pricePolicy.js";
 
 const router = Router();
 
@@ -34,10 +38,18 @@ router.get("/store/branches", async (req, res, next) => {
   try {
     const { rows } = await withoutBranch((client) =>
       client.query(
-        `select id, ref, name, is_hq, created_at, locked, lock_reason, locked_at, locked_by
-           from branches
-          where store_id = $1 and deleted_at is null
-          order by name`,
+        // ⚠ صحّة الفرع في بطاقته (المرجع: الإصدار · المستخدمون · اليوم · آخر بيع):
+        //   تُقرأ من الجداول نفسها لا من لقطةٍ يرسلها الفرع — فلا تتأخّر.
+        `select b.id, b.ref, b.name, b.is_hq, b.created_at, b.locked, b.lock_reason, b.locked_at, b.locked_by,
+                (select count(*)::int from users u where u.branch_id = b.id and u.active = true) as users_count,
+                (select max(s.date) from sales s where s.branch_id = b.id) as last_sale_at,
+                (select d.ref from business_days d where d.branch_id = b.id and d.status = 'open'
+                   order by d.opened_at desc limit 1) as open_day_ref,
+                (select d.opened_at from business_days d where d.branch_id = b.id and d.status = 'open'
+                   order by d.opened_at desc limit 1) as open_day_at
+           from branches b
+          where b.store_id = $1 and b.deleted_at is null
+          order by b.name`,
         [req.storeAuth.storeId]
       )
     );
@@ -469,8 +481,20 @@ router.get("/store/branches/:branchId/users", requireCanManageBranches, async (r
     const users = await withBranch(req.params.branchId, (client) =>
       loadBranchUsersWithRoles(client, req.params.branchId)
     );
+    // المعطَّلون أيضًا حين يُطلب (لإعادة تفعيلهم من الإدارة) — بلا صلاحيات محسوبة
+    let inactive = [];
+    if (req.query.includeInactive) {
+      const { rows } = await withBranch(req.params.branchId, (client) =>
+        client.query(
+          `select id, name, ref, role, salary, can_use_ai, allowed_pages, active, created_at
+             from users where branch_id = $1 and active = false order by name`,
+          [req.params.branchId]
+        )
+      );
+      inactive = rows.map((u) => ({ ...u, allowed: [] }));
+    }
     res.json(
-      users.map(({ id, name, ref, role, salary, can_use_ai, allowed_pages, allowed, active, created_at }) => ({
+      [...users, ...inactive].map(({ id, name, ref, role, salary, can_use_ai, allowed_pages, allowed, active, created_at }) => ({
         id, name, ref, role, salary, can_use_ai, allowed_pages, allowed, active, created_at,
       }))
     );
@@ -574,6 +598,188 @@ router.delete("/store/branches/:branchId/users/:id", requireCanManageBranches, a
     if (result.error) return res.status(409).json({ error: result.error });
     res.status(204).end();
   } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * PATCH /api/store/branches/:branchId/users/:id/pin  { pin }
+ * إعادة الرقم السري من الإدارة — لا يتكرّر في الفرع، ولا يُسجَّل الرقم.
+ */
+router.patch("/store/branches/:branchId/users/:id/pin", requireCanManageBranches, async (req, res, next) => {
+  const pin = String(req.body?.pin || "");
+  if (!/^\d{4,6}$/.test(pin)) return res.status(400).json({ error: "pin_must_be_4_to_6_digits" });
+  try {
+    if (!(await assertBranchInStore(req.storeAuth.storeId, req.params.branchId))) {
+      return res.status(404).json({ error: "branch_not_found" });
+    }
+    const result = await withBranch(req.params.branchId, (client) =>
+      resetBranchUserPin(client, req.params.branchId, req.params.id, pin, { name: req.storeAuth.name, kind: "store" })
+    );
+    if (result.error === "not_found") return res.status(404).json({ error: result.error });
+    if (result.error) return res.status(409).json({ error: result.error });
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** PATCH /api/store/branches/:branchId/users/:id/active  { active } — لا يُعطَّل آخر مدير */
+router.patch("/store/branches/:branchId/users/:id/active", requireCanManageBranches, async (req, res, next) => {
+  try {
+    if (!(await assertBranchInStore(req.storeAuth.storeId, req.params.branchId))) {
+      return res.status(404).json({ error: "branch_not_found" });
+    }
+    const result = await withBranch(req.params.branchId, (client) =>
+      setBranchUserActive(client, req.params.branchId, req.params.id, !!req.body?.active, { name: req.storeAuth.name, kind: "store" })
+    );
+    if (result.error === "not_found") return res.status(404).json({ error: result.error });
+    if (result.error) return res.status(409).json({ error: result.error });
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/store/branches/:branchId/close-day  { note }
+ * إقفال يوم عمل الفرع من الإدارة — بالمعالج نفسه الذي يُقفل به الفرع يومه
+ * (لقطةٌ واحدة لا لقطتان)، ويُدوَّن في سجل تدقيق الفرع باسم من أقفل.
+ */
+router.post("/store/branches/:branchId/close-day", requireCanManageBranches, async (req, res, next) => {
+  try {
+    if (!(await assertBranchInStore(req.storeAuth.storeId, req.params.branchId))) {
+      return res.status(404).json({ error: "branch_not_found" });
+    }
+    const by = req.storeAuth.name || "الإدارة";
+    const extra = String(req.body?.note || "").trim();
+    const result = await withBranch(req.params.branchId, async (client) => {
+      const r = await closeBusinessDay(client, req.params.branchId, { closedBy: null, note: `إقفال من الإدارة — ${by}${extra ? ` · ${extra}` : ""}` });
+      if (r.error) return r;
+      await client.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
+         values ($1,'update',null,'business_days',$2,$3)`,
+        [req.params.branchId, r.day.id, JSON.stringify({ kind: "close_day", by, byKind: "store", note: extra || null })]
+      );
+      return r;
+    });
+    if (result.error) return res.status(409).json(result);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** GET /api/store/branches/:branchId/audit — آخر 200 حركة في سجل تدقيق الفرع */
+router.get("/store/branches/:branchId/audit", requireCanManageBranches, async (req, res, next) => {
+  try {
+    if (!(await assertBranchInStore(req.storeAuth.storeId, req.params.branchId))) {
+      return res.status(404).json({ error: "branch_not_found" });
+    }
+    const { rows } = await withBranch(req.params.branchId, (client) =>
+      client.query(
+        `select a.id, a.event_type, a.ref_table, a.details, a.created_at, u.name as actor_name
+           from audit_log a left join users u on u.id = a.actor_id
+          where a.branch_id = $1 order by a.created_at desc limit 200`,
+        [req.params.branchId]
+      )
+    );
+    res.json({ audit: rows.map((a) => ({
+      id: a.id, event: a.event_type, table: a.ref_table, details: a.details || {},
+      actor: a.actor_name || a.details?.by || "", date: a.created_at,
+    })) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ══ زيادة الإدارة على السعر العالمي (migration 038) ═══════════════════
+//
+// سعر العمل في كل فروع المتجر = العالمي (آليًّا، أو يدويًّا تضبطه الإدارة)
+// + زيادةٌ ثابتة (ريال/جم24 أو ٪). الفروع تستلمها مع كل جلبٍ للسعر.
+router.get("/store/price-policy", async (req, res, next) => {
+  try {
+    const { rows } = await withoutBranch((client) =>
+      client.query(
+        "select price_markup_mode, price_markup_value, price_world24_manual, price_policy_at, price_policy_by from stores where id = $1",
+        [req.storeAuth.storeId]
+      )
+    );
+    res.json({ policy: shapePolicy(rows[0]) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.put("/store/price-policy", requireCanManageBranches, async (req, res, next) => {
+  const b = req.body || {};
+  const mode = b.mode === "percent" ? "percent" : "amount";
+  const value = Number(b.value);
+  const manual = b.world24Manual == null || b.world24Manual === "" ? null : Number(b.world24Manual);
+  if (!Number.isFinite(value) || value < 0) return res.status(400).json({ error: "invalid_markup" });
+  if (mode === "percent" && value > 100) return res.status(400).json({ error: "invalid_markup" });
+  if (manual != null && !(manual > 0)) return res.status(400).json({ error: "invalid_world_price" });
+  try {
+    const { rows } = await withoutBranch((client) =>
+      client.query(
+        `update stores set price_markup_mode = $1, price_markup_value = $2, price_world24_manual = $3,
+                price_policy_at = now(), price_policy_by = $4
+          where id = $5
+          returning price_markup_mode, price_markup_value, price_world24_manual, price_policy_at, price_policy_by`,
+        [mode, value, manual, req.storeAuth.name || "الإدارة", req.storeAuth.storeId]
+      )
+    );
+    const policy = shapePolicy(rows[0]);
+    res.json({ policy, example: manual ? { world24: manual, price24: applyMarkup(manual, policy.markup) } : null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ══ إعلانات الإدارة لكل الفروع ══════════════════════════════════════════
+router.get("/store/notices", async (req, res, next) => {
+  try {
+    const { rows } = await withoutBranch((client) =>
+      client.query(
+        "select id, text, created_by, created_at, until from store_notices where store_id = $1 and until > now() order by created_at desc limit 50",
+        [req.storeAuth.storeId]
+      )
+    );
+    res.json({ notices: rows.map((n) => ({ id: n.id, text: n.text, by: n.created_by, at: n.created_at, until: n.until })) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/store/notices", requireCanManageBranches, async (req, res, next) => {
+  const text = String(req.body?.text || "").trim();
+  const days = Math.max(1, Math.min(90, Math.round(Number(req.body?.days) || 7)));
+  if (!text) return res.status(400).json({ error: "notice_text_required" });
+  if (text.length > 500) return res.status(400).json({ error: "notice_too_long" });
+  try {
+    const { rows } = await withoutBranch((client) =>
+      client.query(
+        `insert into store_notices (store_id, text, created_by, until)
+         values ($1,$2,$3, now() + ($4 || ' days')::interval)
+         returning id, text, created_by, created_at, until`,
+        [req.storeAuth.storeId, text, req.storeAuth.name || "الإدارة", String(days)]
+      )
+    );
+    const n = rows[0];
+    res.status(201).json({ notice: { id: n.id, text: n.text, by: n.created_by, at: n.created_at, until: n.until } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete("/store/notices/:id", requireCanManageBranches, async (req, res, next) => {
+  try {
+    await withoutBranch((client) =>
+      client.query("delete from store_notices where id = $1 and store_id = $2", [req.params.id, req.storeAuth.storeId])
+    );
+    res.status(204).end();
+  } catch (err) {
+    if (err && err.code === "22P02") return res.status(404).json({ error: "not_found" });
     next(err);
   }
 });
