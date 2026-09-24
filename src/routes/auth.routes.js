@@ -2,7 +2,7 @@ import { Router } from "express";
 import { withoutBranch } from "../db.js";
 import { verifyPin } from "../auth/hashPin.js";
 import { signSession } from "../auth/jwt.js";
-import { authenticate, storeBlockReason } from "../middleware/auth.js";
+import { authenticate, branchLockBody, storeBlockReason } from "../middleware/auth.js";
 
 const router = Router();
 
@@ -94,7 +94,9 @@ router.post("/auth/login", async (req, res, next) => {
 
     const { rows } = await withoutBranch((client) =>
       client.query(
-        `select u.*, s.status as store_status, s.subscription_expires_at
+        `select u.*, s.status as store_status, s.subscription_expires_at,
+                b.locked as branch_locked, b.lock_reason as branch_lock_reason,
+                b.locked_at as branch_locked_at, b.locked_by as branch_locked_by
            from users u
            join branches b on b.id = u.branch_id
            left join stores s on s.id = b.store_id
@@ -116,6 +118,8 @@ router.post("/auth/login", async (req, res, next) => {
     if (storeBlock) {
       return res.status(403).json({ error: storeBlock });
     }
+    const lock = branchLockBody(user);
+    if (lock) return res.status(423).json(lock);
     const token = signSession(user);
     res.json({
       token,

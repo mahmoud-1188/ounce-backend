@@ -34,7 +34,7 @@ router.get("/store/branches", async (req, res, next) => {
   try {
     const { rows } = await withoutBranch((client) =>
       client.query(
-        `select id, ref, name, is_hq, created_at
+        `select id, ref, name, is_hq, created_at, locked, lock_reason, locked_at, locked_by
            from branches
           where store_id = $1 and deleted_at is null
           order by name`,
@@ -180,7 +180,7 @@ router.post("/store/branches", requireCanManageBranches, async (req, res, next) 
         pin: managerPin,
         role: "manager",
         salary: 0,
-      });
+      }, { name: req.storeAuth.name, kind: "store" });
       if (created.error) return { error: created.error };
 
       return { branch, manager: created.user };
@@ -239,6 +239,34 @@ router.delete("/store/branches/:branchId", requireCanManageBranches, async (req,
       client.query(`update branches set deleted_at = now() where id = $1`, [branch.id])
     );
     res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * PATCH /api/store/branches/:branchId/lock  { locked, reason }
+ * قفل الفرع من الإدارة (migration 037): الفرع يرى شاشة قفلٍ بالسبب،
+ * والخادم يرفض كل طلباته (423 branch_locked) حتى يُفكّ — يسري فورًا لأن
+ * authenticate يقرأ القفل على كل طلب. القفل يحتاج سببًا يُقرأ في الفرع.
+ */
+router.patch("/store/branches/:branchId/lock", requireCanManageBranches, async (req, res, next) => {
+  const locked = !!req.body?.locked;
+  const reason = String(req.body?.reason || "").trim();
+  if (locked && !reason) return res.status(400).json({ error: "lock_reason_required" });
+  try {
+    const { rows } = await withoutBranch((client) =>
+      client.query(
+        `update branches
+            set locked = $1, lock_reason = $2, locked_at = case when $1 then now() else null end,
+                locked_by = case when $1 then $3 else null end
+          where id = $4 and store_id = $5 and deleted_at is null
+          returning id, ref, name, is_hq, locked, lock_reason, locked_at, locked_by`,
+        [locked, locked ? reason : null, req.storeAuth.name || null, req.params.branchId, req.storeAuth.storeId]
+      )
+    );
+    if (!rows[0]) return res.status(404).json({ error: "branch_not_found" });
+    res.json({ branch: rows[0] });
   } catch (err) {
     next(err);
   }
@@ -465,7 +493,7 @@ router.post("/store/branches/:branchId/users", requireCanManageBranches, async (
       return res.status(404).json({ error: "branch_not_found" });
     }
     const result = await withBranch(req.params.branchId, (client) =>
-      createBranchUser(client, req.params.branchId, { name, pin, role, salary })
+      createBranchUser(client, req.params.branchId, { name, pin, role, salary }, { name: req.storeAuth.name, kind: "store" })
     );
     if (result.error === "invalid_role") return res.status(400).json({ error: result.error });
     if (result.error) return res.status(409).json({ error: result.error });
@@ -486,7 +514,7 @@ router.patch("/store/branches/:branchId/users/:id/rename", requireCanManageBranc
       return res.status(404).json({ error: "branch_not_found" });
     }
     const result = await withBranch(req.params.branchId, (client) =>
-      renameBranchUser(client, req.params.branchId, req.params.id, name)
+      renameBranchUser(client, req.params.branchId, req.params.id, name, { name: req.storeAuth.name, kind: "store" })
     );
     if (result.error === "not_found") return res.status(404).json({ error: result.error });
     if (result.error) return res.status(409).json({ error: result.error });
@@ -503,7 +531,7 @@ router.patch("/store/branches/:branchId/users/:id/ai", requireCanManageBranches,
       return res.status(404).json({ error: "branch_not_found" });
     }
     const result = await withBranch(req.params.branchId, (client) =>
-      setBranchUserAi(client, req.params.branchId, req.params.id, req.body?.canUseAi)
+      setBranchUserAi(client, req.params.branchId, req.params.id, req.body?.canUseAi, { name: req.storeAuth.name, kind: "store" })
     );
     if (result.error === "not_found") return res.status(404).json({ error: result.error });
     res.json(result.user);
@@ -523,7 +551,7 @@ router.patch("/store/branches/:branchId/users/:id/permissions", requireCanManage
       return res.status(404).json({ error: "branch_not_found" });
     }
     const result = await withBranch(req.params.branchId, (client) =>
-      setBranchUserPermissions(client, req.params.branchId, req.params.id, allowedPages)
+      setBranchUserPermissions(client, req.params.branchId, req.params.id, allowedPages, { name: req.storeAuth.name, kind: "store" })
     );
     if (result.error === "not_found") return res.status(404).json({ error: result.error });
     if (result.error) return res.status(409).json(result);
@@ -540,7 +568,7 @@ router.delete("/store/branches/:branchId/users/:id", requireCanManageBranches, a
       return res.status(404).json({ error: "branch_not_found" });
     }
     const result = await withBranch(req.params.branchId, (client) =>
-      removeBranchUser(client, req.params.branchId, req.params.id)
+      removeBranchUser(client, req.params.branchId, req.params.id, { name: req.storeAuth.name, kind: "store" })
     );
     if (result.error === "not_found") return res.status(404).json({ error: result.error });
     if (result.error) return res.status(409).json({ error: result.error });

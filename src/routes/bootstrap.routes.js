@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { shapeApproval } from "../domain/approvals.js";
 import { withBranch, withBranchParallel } from "../db.js";
 import { authenticate } from "../middleware/auth.js";
 
@@ -89,6 +90,8 @@ router.get("/bootstrap", async (req, res, next) => {
       journalEntriesRaw,
       journalLinesRaw,
       goldLedgerRaw,
+      approvalsRaw,
+      reviewsRaw,
     ] = await withBranchParallel(branchId, [
       // ⚠ توسيع حقيقي: كان يُحمَّل عمود مُصغَّر لآخر يوم فقط، لكن WorkDayPage
       // في المرجع تعرض أيضًا سجل "الأيام السابقة" (ref، فتح/إقفال، مبيعات،
@@ -113,7 +116,7 @@ router.get("/bootstrap", async (req, res, next) => {
       (client) =>
         client.query(`select * from daily_custody where branch_id = $1 order by opened_at desc limit 60`, [branchId]),
       (client) =>
-        client.query(`select tax_enabled, tax_rate, card_fees, workday_mode, opening_mode, opening_finished_at from branch_settings where branch_id = $1`, [branchId]),
+        client.query(`select tax_enabled, tax_rate, card_fees, workday_mode, opening_mode, opening_finished_at, approvals_enabled, approval_thresholds, lock_all::text as lock_all, lock_posted::text as lock_posted from branch_settings where branch_id = $1`, [branchId]),
       // فئات مشتركة بين الفروع (branch_id يمكن أن يكون null) + فئات هذا الفرع تحديدًا.
       // ⚠ order by sort_order صريح الآن (migration 029) — بلا هذا كان
       // ترتيب categories يعود عشوائيًّا فعليًّا (لا ضمان ترتيب من
@@ -255,6 +258,17 @@ router.get("/bootstrap", async (req, res, next) => {
             limit 2000`,
           [branchId]
         ),
+      // الاعتمادات (migration 037) — المعلّقة والأخيرة، لطابور المراجعة والشارات
+      (client) =>
+        client.query(
+          `select a.*, r.label as rule_label from approvals a
+             left join approval_rules r on r.id = a.rule_id
+            where a.branch_id = $1 order by a.created_at desc limit 200`,
+          [branchId]
+        ),
+      // أحكام المراجعة المحاسبية — آخر حكمٍ لكل بند يحدّد بقاءه في الطابور
+      (client) =>
+        client.query(`select * from reviews where branch_id = $1 order by created_at desc limit 1000`, [branchId]),
     ]);
 
     const linesByEntry = new Map();
@@ -342,6 +356,8 @@ router.get("/bootstrap", async (req, res, next) => {
       depreciationSchedule: depreciationSchedule.rows,
       journal,
       goldLedger,
+      approvals: approvalsRaw.rows.map((a) => shapeApproval(a, { label: a.rule_label })),
+      reviews: reviewsRaw.rows,
       currentUser: {
         id: req.auth.userId,
         name: req.auth.user.name,

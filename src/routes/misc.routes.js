@@ -4,6 +4,7 @@ import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.
 import { extractInclusiveTax, roundMoney } from "../domain/money.js";
 import { fineWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
+import { approvalGate } from "../domain/approvals.js";
 import {
   computeReturnAmounts, insertCashTx, insertReturnReceipt, insertSaleLines,
   isStocktakeLocked, loadSaleForReturn, nextRef, postGoldMovement, requireBusinessDay, reserveSaleLines, restockReturnedLines,
@@ -293,6 +294,7 @@ router.post(
 
         return { repair, cashTx: cashResult?.cashTx || null };
       });
+      if (result.approvalPending) return res.status(202).json(result);
       res.status(201).json(result);
     } catch (err) {
       next(err);
@@ -353,6 +355,13 @@ router.post(
         // الصنف لغير مباعة، لا وحدة بعينها. القيد نفسه (المبلغ/الوزن)
         // صحيح تمامًا بصرف النظر عن أي وحدة فعليًا أُعيدت.
         const refund = roundMoney(returnedLines.reduce((a, l) => a + Number(l.unit_price) * Number(l.quantity), 0));
+        // ⚖ الردّ الكبير يُعتمد (قاعدة refund)
+        const gateQ = await approvalGate(client, req.auth, {
+          kind: "refund", amount: refund, approvalId: body.approvalId || null,
+          note: `مرتجع ${sale.ref || ""}`.trim(), payload: { route: "return", saleId: sale.id, ...body, approvalId: undefined },
+        });
+        if (gateQ.error) return gateQ;
+        if (gateQ.pending) return { approvalPending: gateQ.pending };
 
         for (const l of returnedLines) {
           // ⚠ quantity numeric يصل نصًّا "1.000" — LIMIT يحتاج عددًا صحيحًا.
@@ -447,6 +456,7 @@ router.post(
         const status = result.error === "sale_not_found" ? 404 : 409;
         return res.status(status).json(result);
       }
+      if (result.approvalPending) return res.status(202).json(result);
       res.status(201).json(result);
     } catch (err) {
       next(err);
@@ -542,6 +552,14 @@ router.post(
         const amounts = computeReturnAmounts(sale, allLines, returnedLines);
         if (!(amounts.gross > 0)) return { error: "zero_amount" };
 
+        // ⚖ الردّ الكبير يُعتمد (قاعدة refund) — ما فوق الحدّ يُحفظ طلبًا
+        const gate = await approvalGate(client, req.auth, {
+          kind: "refund", amount: amounts.gross, approvalId: body.approvalId || null,
+          note: `مرتجع ${sale.ref}`, payload: { route: "return-full", saleId: sale.id, ...body, approvalId: undefined },
+        });
+        if (gate.error) return gate;
+        if (gate.pending) return { approvalPending: gate.pending };
+
         const restocked = await restockReturnedLines(client, returnedLines, restock);
         if (restocked.error) return restocked;
 
@@ -591,6 +609,7 @@ router.post(
         const status = result.error === "sale_not_found" ? 404 : 409;
         return res.status(status).json(result);
       }
+      if (result.approvalPending) return res.status(202).json(result);
       res.status(201).json(result);
     } catch (err) {
       next(err);
@@ -787,6 +806,7 @@ router.post(
         const status = result.error === "sale_not_found" || result.error === "item_not_found" ? 404 : 409;
         return res.status(status).json(result);
       }
+      if (result.approvalPending) return res.status(202).json(result);
       res.status(201).json(result);
     } catch (err) {
       next(err);

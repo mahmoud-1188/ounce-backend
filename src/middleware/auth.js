@@ -15,6 +15,15 @@ import { currentAllowed } from "../auth/permissions.js";
  * سبب منع الدخول بسبب اشتراك المتجر، أو null إن كان سليمًا.
  * store_status = null (فرعٌ بلا متجر — بيانات قديمة) لا يُمنع.
  */
+/**
+ * قفل الفرع من الإدارة (migration 037): الفرع موقوفٌ بسبب — لا بيعَ ولا
+ * حركة حتى يُفكّ. 423 مع السبب لتعرض الواجهة شاشة القفل لا خطأً عامًّا.
+ */
+function branchLockBody(row) {
+  if (!row.branch_locked) return null;
+  return { error: "branch_locked", reason: row.branch_lock_reason || null, lockedAt: row.branch_locked_at || null, lockedBy: row.branch_locked_by || null };
+}
+
 function storeBlockReason(row) {
   if (row.store_status && row.store_status !== "active") return `store_${row.store_status}`;
   if (row.subscription_expires_at && new Date(row.subscription_expires_at).getTime() < Date.now()) {
@@ -56,7 +65,9 @@ async function authenticate(req, res, next) {
       client.query(
         `select u.*, r.allowed_tabs, r.allowed_more, r.deny_actions,
                 r.can_manage_day, r.can_break,
-                s.status as store_status, s.subscription_expires_at
+                s.status as store_status, s.subscription_expires_at,
+                b.locked as branch_locked, b.lock_reason as branch_lock_reason,
+                b.locked_at as branch_locked_at, b.locked_by as branch_locked_by
            from users u
            join branches b on b.id = u.branch_id
            join roles r on r.id = u.role
@@ -77,6 +88,8 @@ async function authenticate(req, res, next) {
     if (storeBlock) {
       return res.status(403).json({ error: storeBlock });
     }
+    const lock = branchLockBody(user);
+    if (lock) return res.status(423).json(lock);
 
     const role = {
       allowed_tabs: user.allowed_tabs,
@@ -184,7 +197,7 @@ function requireManager(req, res, next) {
   next();
 }
 
-export { storeBlockReason,
+export { storeBlockReason, branchLockBody,
   authenticate,
   requirePage,
   requireAnyPage,

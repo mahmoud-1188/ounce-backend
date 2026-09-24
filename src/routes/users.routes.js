@@ -59,7 +59,7 @@ router.post("/users", async (req, res, next) => {
   }
   try {
     const result = await withBranch(req.auth.branchId, (client) =>
-      createBranchUser(client, req.auth.branchId, { name, pin, role, salary })
+      createBranchUser(client, req.auth.branchId, { name, pin, role, salary }, { id: req.auth.userId, name: req.auth.user?.name, kind: "branch" })
     );
     if (result.error === "invalid_role") return res.status(400).json({ error: result.error });
     if (result.error) return res.status(409).json({ error: result.error });
@@ -77,7 +77,7 @@ router.patch("/users/:id/rename", async (req, res, next) => {
   }
   try {
     const result = await withBranch(req.auth.branchId, (client) =>
-      renameBranchUser(client, req.auth.branchId, req.params.id, name)
+      renameBranchUser(client, req.auth.branchId, req.params.id, name, { id: req.auth.userId, name: req.auth.user?.name, kind: "branch" })
     );
     if (result.error === "not_found") return res.status(404).json({ error: result.error });
     if (result.error) return res.status(409).json({ error: result.error });
@@ -91,7 +91,7 @@ router.patch("/users/:id/rename", async (req, res, next) => {
 router.patch("/users/:id/ai", async (req, res, next) => {
   try {
     const result = await withBranch(req.auth.branchId, (client) =>
-      setBranchUserAi(client, req.auth.branchId, req.params.id, req.body?.canUseAi)
+      setBranchUserAi(client, req.auth.branchId, req.params.id, req.body?.canUseAi, { id: req.auth.userId, name: req.auth.user?.name, kind: "branch" })
     );
     if (result.error === "not_found") return res.status(404).json({ error: result.error });
     res.json(result.user);
@@ -113,7 +113,7 @@ router.patch("/users/:id/permissions", async (req, res, next) => {
   }
   try {
     const result = await withBranch(req.auth.branchId, (client) =>
-      setBranchUserPermissions(client, req.auth.branchId, req.params.id, allowedPages)
+      setBranchUserPermissions(client, req.auth.branchId, req.params.id, allowedPages, { id: req.auth.userId, name: req.auth.user?.name, kind: "branch" })
     );
     if (result.error === "not_found") return res.status(404).json({ error: result.error });
     if (result.error) return res.status(409).json(result);
@@ -133,7 +133,7 @@ router.patch("/users/:id/permissions", async (req, res, next) => {
 router.delete("/users/:id", async (req, res, next) => {
   try {
     const result = await withBranch(req.auth.branchId, (client) =>
-      removeBranchUser(client, req.auth.branchId, req.params.id)
+      removeBranchUser(client, req.auth.branchId, req.params.id, { id: req.auth.userId, name: req.auth.user?.name, kind: "branch" })
     );
     if (result.error === "not_found") return res.status(404).json({ error: result.error });
     if (result.error) return res.status(409).json({ error: result.error });

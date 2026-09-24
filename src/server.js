@@ -31,6 +31,7 @@ import categoriesRoutes from "./routes/categories.routes.js";
 import platformRoutes from "./routes/platform.routes.js";
 import openingRoutes from "./routes/opening.routes.js";
 import stocktakeRoutes from "./routes/stocktake.routes.js";
+import controlRoutes from "./routes/control.routes.js";
 
 const app = express();
 
@@ -86,12 +87,17 @@ app.use("/api", itemsRoutes);
 app.use("/api", categoriesRoutes);
 app.use("/api", openingRoutes);
 app.use("/api", stocktakeRoutes);
+app.use("/api", controlRoutes);
 app.use("/api", platformRoutes);
 
 // Centralized error handler — keeps internal error details out of the
 // response (they go to the server log instead), matching the "never leak
 // stack traces to the client" default for a production API.
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
+  // ⚠ الفترة المقفلة ليست عطلًا: قيدٌ رُفض بقاعدة — 409 بسببه لا 500.
+  if (err && err.code === "period_locked") {
+    return res.status(409).json({ error: "period_locked", why: err.why || null });
+  }
   console.error(err);
   res.status(500).json({ error: "internal_error" });
 });

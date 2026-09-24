@@ -16,6 +16,7 @@
 // تفتح معاملتها الخاصة) — لتبقى قابلة للتركيب مع أي معاملة أعلى مستقبلًا.
 
 import { hashPin, verifyPin } from "../auth/hashPin.js";
+import { diffPages, logPermission } from "./permissionLog.js";
 import { normalizeName } from "../auth/normalizeName.js";
 import { currentAllowed, wouldLockOutAccess, wouldRemoveLastManager } from "../auth/permissions.js";
 
@@ -63,7 +64,7 @@ async function loadBranchUsersWithRoles(client, branchId) {
 }
 
 /** POST — يُطابق add() + valid guard في AccessSettingsPage.jsx حرفيًّا. */
-async function createBranchUser(client, branchId, { name, pin, role, salary }) {
+async function createBranchUser(client, branchId, { name, pin, role, salary }, actor = {}) {
   const roleId = role || "employee";
   const { rows: roleRows } = await client.query("select 1 from roles where id = $1", [roleId]);
   if (!roleRows[0]) return { error: "invalid_role" };
@@ -88,11 +89,14 @@ async function createBranchUser(client, branchId, { name, pin, role, salary }) {
      returning id, name, role, salary, ref, created_at`,
     [branchId, name.trim(), roleId, pinHash, Number(salary) || 0, ref]
   );
+  await logPermission(client, branchId, {
+    targetId: rows[0].id, targetName: rows[0].name, kind: "create", after: { role: roleId }, actor,
+  });
   return { user: rows[0] };
 }
 
 /** PATCH .../rename — يُطابق rename() حرفيًّا. */
-async function renameBranchUser(client, branchId, userId, name) {
+async function renameBranchUser(client, branchId, userId, name, actor = {}) {
   const existing = await loadBranchUsersWithRoles(client, branchId);
   const nameTaken = existing.some(
     (u) => u.id !== userId && normalizeName(u.name) === normalizeName(name)
@@ -103,22 +107,29 @@ async function renameBranchUser(client, branchId, userId, name) {
     [name.trim(), userId, branchId]
   );
   if (!rows[0]) return { error: "not_found" };
+  const old = existing.find((u) => u.id === userId);
+  await logPermission(client, branchId, {
+    targetId: userId, targetName: rows[0].name, kind: "rename", before: { name: old?.name || null }, after: { name: rows[0].name }, actor,
+  });
   return { user: rows[0] };
 }
 
 /** PATCH .../ai — يُطابق toggleAi() حرفيًّا. */
-async function setBranchUserAi(client, branchId, userId, canUseAi) {
+async function setBranchUserAi(client, branchId, userId, canUseAi, actor = {}) {
   const { rows } = await client.query(
     `update users set can_use_ai = $1 where id = $2 and branch_id = $3
-     returning id, can_use_ai`,
+     returning id, name, can_use_ai`,
     [!!canUseAi, userId, branchId]
   );
   if (!rows[0]) return { error: "not_found" };
-  return { user: rows[0] };
+  await logPermission(client, branchId, {
+    targetId: userId, targetName: rows[0].name, kind: "ai", after: { canUseAi: !!canUseAi }, actor,
+  });
+  return { user: { id: rows[0].id, can_use_ai: rows[0].can_use_ai } };
 }
 
 /** PATCH .../permissions — يُطابق togglePage()/resetToRole() حرفيًّا (null = افتراضي الدور). */
-async function setBranchUserPermissions(client, branchId, userId, allowedPages) {
+async function setBranchUserPermissions(client, branchId, userId, allowedPages, actor = {}) {
   const existing = await loadBranchUsersWithRoles(client, branchId);
   const target = existing.find((u) => u.id === userId);
   if (!target) return { error: "not_found" };
@@ -137,11 +148,22 @@ async function setBranchUserPermissions(client, branchId, userId, allowedPages) 
      returning id, allowed_pages`,
     [allowedPages === null ? null : JSON.stringify(allowedPages), userId, branchId]
   );
+  // الفرق بين ما كان يملكه فعليًّا وما صار له (الافتراضي يُحلّ لصفحات الدور)
+  const { rows: roleRows } = await client.query("select allowed_tabs, allowed_more from roles where id = $1", [target.role]);
+  const roleDefault = roleRows[0] ? currentAllowed({ allowed_pages: null }, roleRows[0]) : [];
+  const nextEffective = allowedPages === null ? roleDefault : allowedPages;
+  const { added, removed } = diffPages(target.allowed, nextEffective);
+  if (added.length || removed.length || allowedPages === null) {
+    await logPermission(client, branchId, {
+      targetId: userId, targetName: target.name, kind: allowedPages === null ? "reset" : "pages",
+      before: target.allowed, after: nextEffective, added, removed, actor,
+    });
+  }
   return { user: rows[0] };
 }
 
 /** DELETE — يُطابق remove() حرفيًّا (يرفض حذف آخر manager، تعطيلٌ منطقي لا حذف). */
-async function removeBranchUser(client, branchId, userId) {
+async function removeBranchUser(client, branchId, userId, actor = {}) {
   const existing = await loadBranchUsersWithRoles(client, branchId);
   if (wouldRemoveLastManager(existing, userId)) {
     return { error: "would_remove_last_manager" };
@@ -151,6 +173,10 @@ async function removeBranchUser(client, branchId, userId) {
     [userId, branchId]
   );
   if (!rowCount) return { error: "not_found" };
+  const gone = existing.find((u) => u.id === userId);
+  await logPermission(client, branchId, {
+    targetId: userId, targetName: gone?.name || null, kind: "delete", before: { role: gone?.role || null, pages: gone?.allowed || [] }, actor,
+  });
   return { ok: true };
 }
 

@@ -28,6 +28,33 @@ async function postJournalEntry(
     );
   }
 
+  // ⚠ الفترة المقفلة لا تُقبل قيدًا (isPeriodLocked في المرجع):
+  //   lock_all نهائيٌّ للجميع، وlock_posted يستثني المدير. القيد يُؤرَّخ
+  //   بلحظة ترحيله، فالقفل «حتى تاريخ» يمنع كل قيدٍ حتى نهاية ذلك اليوم.
+  const { rows: lockRows } = await client.query(
+    "select lock_all::text as lock_all, lock_posted::text as lock_posted from branch_settings where branch_id = $1",
+    [branchId]
+  );
+  const locks = lockRows[0];
+  if (locks && (locks.lock_all || locks.lock_posted)) {
+    const today = new Date().toISOString().slice(0, 10);
+    const d = (x) => (x ? String(x).slice(0, 10) : null);
+    const all = d(locks.lock_all);
+    const posted = d(locks.lock_posted);
+    let why = null;
+    if (all && today <= all) why = `الفترة حتى ${all} مقفلة نهائيًّا — لا قيود فيها`;
+    else if (posted && today <= posted) {
+      const { rows: ur } = await client.query("select role from users where id = $1", [createdBy]);
+      if (ur[0]?.role !== "manager") why = `الفترة حتى ${posted} مقفلة — المدير وحده يُعدّل فيها`;
+    }
+    if (why) {
+      const err = new Error(`period_locked:${opType}`);
+      err.code = "period_locked";
+      err.why = why;
+      throw err;
+    }
+  }
+
   const { rows } = await client.query(
     `insert into journal_entries (branch_id, business_day_id, op_type, ref_table, ref_id, description, created_by)
      values ($1, $2, $3, $4, $5, $6, $7) returning id`,

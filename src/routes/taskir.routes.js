@@ -4,6 +4,7 @@ import { authenticate, requirePage, requireNotDenied, requireManager } from "../
 import { roundMoney } from "../domain/money.js";
 import { fineWeight, roundWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
+import { approvalGate } from "../domain/approvals.js";
 
 const router = Router();
 
@@ -160,6 +161,14 @@ router.post("/taskirat", async (req, res, next) => {
 
       const goldCost = goldSource === "purchased" ? roundMoney(weight * pricePerGram) : 0;
       const totalCashPaid = roundMoney(goldCost + workmanshipAmount);
+
+      // ⚖ السداد الكبير للمورد يُعتمد (قاعدة supplier_settle)
+      const gate = await approvalGate(client, req.auth, {
+        kind: "supplier_settle", amount: totalCashPaid, approvalId: body.approvalId || null,
+        note: `تسكير لمورد ${supplier.name}`, payload: { ...body, approvalId: undefined },
+      });
+      if (gate.error) return gate;
+      if (gate.pending) return { approvalPending: gate.pending };
 
       const { rows: refRows } = await client.query(
         `select count(*)::int + 1 as n from taskir_entries where branch_id = $1`,
@@ -323,6 +332,7 @@ router.post("/taskirat", async (req, res, next) => {
         : 409;
       return res.status(status).json(result);
     }
+    if (result.approvalPending) return res.status(202).json(result);
     res.status(201).json(result);
   } catch (err) {
     next(err);

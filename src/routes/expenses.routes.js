@@ -3,6 +3,7 @@ import { withBranch } from "../db.js";
 import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.js";
 import { roundMoney } from "../domain/money.js";
 import { postJournalEntry } from "../domain/journal.js";
+import { approvalGate } from "../domain/approvals.js";
 
 const router = Router();
 
@@ -89,6 +90,14 @@ router.post("/expenses", async (req, res, next) => {
 
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
+      // ⚖ ما فوق حدّ الاعتماد لا يُنفَّذ بل يُحفظ طلبًا بحمولته
+      const gate = await approvalGate(client, req.auth, {
+        kind: "expense", amount, approvalId: body.approvalId || null, note: name,
+        payload: { ...body, approvalId: undefined },
+      });
+      if (gate.error) return gate;
+      if (gate.pending) return { approvalPending: gate.pending };
+
       const businessDayId = await openDay(client, req.auth.branchId);
 
       if (isPayroll) {
@@ -158,6 +167,8 @@ router.post("/expenses", async (req, res, next) => {
     if (result.error === "employee_not_found") {
       return res.status(404).json({ error: "employee_not_found" });
     }
+    if (result.error) return res.status(409).json(result);
+    if (result.approvalPending) return res.status(202).json(result);
     res.json(result);
   } catch (err) {
     next(err);
