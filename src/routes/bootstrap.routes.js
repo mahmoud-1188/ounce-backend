@@ -2,6 +2,7 @@ import { Router } from "express";
 import { loadBranchApprovalRouting, shapeApproval } from "../domain/approvals.js";
 import { loadBranchNotices, loadBranchPricePolicy } from "../domain/pricePolicy.js";
 import { branchPolicyView } from "../domain/hqPolicy.js";
+import { loadProvision } from "../domain/branchProvision.js";
 import { withBranch, withBranchParallel } from "../db.js";
 import { authenticate } from "../middleware/auth.js";
 
@@ -97,6 +98,7 @@ router.get("/bootstrap", async (req, res, next) => {
       pricePolicy,
       notices,
       approvalRouting,
+      provision,
     ] = await withBranchParallel(branchId, [
       // ⚠ توسيع حقيقي: كان يُحمَّل عمود مُصغَّر لآخر يوم فقط، لكن WorkDayPage
       // في المرجع تعرض أيضًا سجل "الأيام السابقة" (ref، فتح/إقفال، مبيعات،
@@ -278,6 +280,8 @@ router.get("/bootstrap", async (req, res, next) => {
       (client) => loadBranchPricePolicy(client, branchId),
       (client) => loadBranchNotices(client, branchId),
       (client) => loadBranchApprovalRouting(client, branchId),
+      // تجهيز الإدارة للفرع (migration 042): الهوية، والإعدادات المُدارة وقفلها
+      (client) => loadProvision(client, branchId),
     ]);
 
     const linesByEntry = new Map();
@@ -372,6 +376,7 @@ router.get("/bootstrap", async (req, res, next) => {
       approvalRouting,
       // سياسة الإدارة على الشاشات والعمليات (migration 040) — الخادم يفرضها، والواجهة تُخفي وتُنبّه
       hqPolicy: branchPolicyView(req.auth.user.hq_policy, branchId),
+      branchProvision: provision ? { profile: provision.profile, local: provision.local, locked: provision.locked, at: provision.at, by: provision.by } : null,
       currentUser: {
         id: req.auth.userId,
         name: req.auth.user.name,

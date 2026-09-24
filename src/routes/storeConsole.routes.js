@@ -8,6 +8,7 @@ import { monthRange, recordedNetworkFees, settleBankFeePeriod } from "../domain/
 import { buildServerReviewQueue } from "../domain/reviewQueueServer.js";
 import { postManualAdjustment, reverseJournalEntry } from "../domain/journalOps.js";
 import { ACTION_GROUPS, BRANCH_SCREENS, HQ_ACTIONS, sanitizePolicy } from "../domain/hqPolicy.js";
+import { loadProvision, saveProvision } from "../domain/branchProvision.js";
 
 const router = Router();
 
@@ -440,6 +441,31 @@ router.put("/store/hq-policy", requireCanManageBranches, async (req, res, next) 
     res.json({ policy, at: rows[0]?.hq_policy_at || null, by: actorOf(req) });
   } catch (err) {
     next(err);
+  }
+});
+
+// ══ ⑮ تجهيز الفرع — الهوية والإعدادات، مع قفلها من الإدارة ═══════════════
+router.get("/store/branches/:branchId/provision", async (req, res, next) => {
+  try {
+    if (!(await branchOfStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const r = await withBranch(req.params.branchId, async (c) => ({ p: await loadProvision(c, req.params.branchId) }));
+    res.json({ provision: r.p });
+  } catch (err) {
+    notFoundOn22P02(err, res, next);
+  }
+});
+
+router.put("/store/branches/:branchId/provision", requireCanManageBranches, async (req, res, next) => {
+  try {
+    if (!(await branchOfStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const b = req.body || {};
+    const result = await withBranch(req.params.branchId, (c) =>
+      saveProvision(c, req.params.branchId, { profile: b.profile, settings: b.settings, locked: b.locked, actorName: actorOf(req) })
+    );
+    if (result.error) return res.status(400).json(result);
+    res.json(result);
+  } catch (err) {
+    notFoundOn22P02(err, res, next);
   }
 });
 

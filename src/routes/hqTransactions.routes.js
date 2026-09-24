@@ -2,7 +2,11 @@ import { Router } from "express";
 import { withBranch, withoutBranch } from "../db.js";
 import { authenticate, requirePage } from "../middleware/auth.js";
 import { authenticateStore, requireCanManageBranches, requireCanSendCoding } from "../middleware/storeAuth.js";
-import { HQ_FLOWS, RECEIVER_SIDE, validateHqTransactionFields, postGoodsFromHqReceipt } from "../domain/hqTransactions.js";
+import {
+  HQ_FLOWS, RECEIVER_SIDE, validateHqTransactionFields, postGoodsFromHqReceipt,
+  safeCashBalance, postCashFromHqSend, postCashFromHqReceipt,
+} from "../domain/hqTransactions.js";
+import { roundMoney } from "../domain/money.js";
 
 const router = Router();
 
@@ -19,8 +23,9 @@ const router = Router();
  * الجدول متى طُلب الربط الفعلي لاحقًا.
  */
 
+// ⚠ ما تبدؤه الإدارة (goods_from_hq, cash_from_hq) لا يُعتمد — يُستلم من pending مباشرةً
 const RECEIVE_REQUIRES_APPROVAL = new Set(
-  Object.keys(HQ_FLOWS).filter((f) => f !== "goods_from_hq")
+  Object.keys(HQ_FLOWS).filter((f) => HQ_FLOWS[f].dir !== "hq")
 );
 
 function serializeTxn(row) {
@@ -37,6 +42,8 @@ function serializeTxn(row) {
     pieces: row.pieces,
     amount: row.amount,
     note: row.note,
+    fromBranchId: row.from_branch_id || null,
+    fromBranchName: row.from_branch_name || null,
     branchId: row.branch_id,
     branchName: row.branch_name,
     branchRef: row.branch_ref,
@@ -140,6 +147,9 @@ router.post("/branch/hq-transactions/:id/receive", async (req, res, next) => {
         [txn.id, req.auth.userId]
       );
 
+      if (txn.flow === "cash_from_hq") {
+        await postCashFromHqReceipt(client, { branchId: req.auth.branchId, txn: updated[0], userId: req.auth.userId, userName: req.auth.user?.name });
+      }
       if (txn.flow === "goods_from_hq") {
         const { rows: dayRows } = await client.query(
           `select id from business_days where branch_id = $1 and status = 'open'
@@ -160,6 +170,7 @@ router.post("/branch/hq-transactions/:id/receive", async (req, res, next) => {
     if (result.error) return res.status(409).json({ error: result.error });
     res.json(serializeTxn(result.txn));
   } catch (err) {
+    if (err && err.code === "period_locked") return res.status(409).json({ error: "period_locked", why: err.why || null });
     next(err);
   }
 });
@@ -184,9 +195,10 @@ router.get("/store/hq-transactions", async (req, res, next) => {
     const rows = await withoutBranch((client) =>
       client
         .query(
-          `select t.*, b.name as branch_name, b.ref as branch_ref
+          `select t.*, b.name as branch_name, b.ref as branch_ref, fb.name as from_branch_name
              from hq_transactions t
              join branches b on b.id = t.branch_id
+             left join branches fb on fb.id = t.from_branch_id
             where b.store_id = $1 and b.deleted_at is null
             order by t.created_at desc
             limit 300`,
@@ -236,6 +248,52 @@ router.post("/store/hq-transactions", requireCanSendCoding, async (req, res, nex
 });
 
 /**
+ * POST /api/store/hq-transactions/cash  { toBranchId, fromBranchId?, amount, note? }
+ * تحويل نقد من خزنة المصدر (الفرع الرئيسي افتراضًا) إلى خزنة فرع — يُرحَّل
+ * طرف الإرسال فورًا (1160/1110)، وطرف الاستلام حين يؤكّده الفرع (1110/1160).
+ */
+router.post("/store/hq-transactions/cash", requireCanManageBranches, async (req, res, next) => {
+  const { toBranchId, note } = req.body || {};
+  let { fromBranchId } = req.body || {};
+  const amount = roundMoney(req.body?.amount);
+  if (!toBranchId) return res.status(400).json({ error: "branch_id_required" });
+  if (!(amount > 0)) return res.status(400).json({ error: "invalid_amount" });
+  try {
+    const { rows: brs } = await withoutBranch((c) =>
+      c.query("select id, name, is_hq from branches where store_id = $1 and deleted_at is null", [req.storeAuth.storeId])
+    );
+    const to = brs.find((b) => b.id === toBranchId);
+    if (!to) return res.status(404).json({ error: "branch_not_found" });
+    if (!fromBranchId) fromBranchId = brs.find((b) => b.is_hq)?.id || null;
+    const from = brs.find((b) => b.id === fromBranchId);
+    if (!from) return res.status(409).json({ error: "source_branch_required" });
+    if (from.id === to.id) return res.status(400).json({ error: "same_branch" });
+    const cleanNote = String(note || "").trim().slice(0, 200) || null;
+    const actor = req.storeAuth.name || "الإدارة";
+
+    const result = await withBranch(from.id, async (c) => {
+      const bal = await safeCashBalance(c, from.id);
+      if (amount > bal + 0.005) return { error: "insufficient_source_cash", available: roundMoney(bal) };
+      // ⚠ المستند يخصّ فرع الوجهة (RLS) — ننتقل لسياقه داخل المعاملة نفسها ثم نعود للمصدر
+      await c.query("select set_config('app.current_branch_id', $1, true)", [to.id]);
+      const { rows } = await c.query(
+        `insert into hq_transactions (branch_id, flow, amount, note, requested_by_store_user_id, from_branch_id)
+         values ($1,'cash_from_hq',$2,$3,$4,$5) returning *`,
+        [to.id, amount, cleanNote, req.storeAuth.storeUserId, from.id]
+      );
+      await c.query("select set_config('app.current_branch_id', $1, true)", [from.id]);
+      await postCashFromHqSend(c, { fromBranchId: from.id, txnId: rows[0].id, amount, toName: to.name, note: cleanNote, actorName: actor });
+      return { txn: { ...rows[0], branch_name: to.name, from_branch_name: from.name } };
+    });
+    if (result.error) return res.status(409).json(result);
+    res.status(201).json(serializeTxn(result.txn));
+  } catch (err) {
+    if (err && err.code === "period_locked") return res.status(409).json({ error: "period_locked", why: err.why || null });
+    next(err);
+  }
+});
+
+/**
  * PATCH /api/store/hq-transactions/:id/decide  { decision: 'approved'|'rejected', note? }
  * تعتمد/ترفض الإدارة معاملةً بدأها الفرع — canManageBranches (سلطة
  * إشراف مركزية عامة، لا صلاحية منفصلة لكل نوع معاملة على حدة).
@@ -255,7 +313,7 @@ router.patch("/store/hq-transactions/:id/decide", requireCanManageBranches, asyn
       );
       const txn = rows[0];
       if (!txn) return { notFound: true };
-      if (txn.flow === "goods_from_hq") return { error: "flow_has_no_decision_step" };
+      if (HQ_FLOWS[txn.flow]?.dir === "hq") return { error: "flow_has_no_decision_step" };
       if (txn.status !== "pending") return { error: "already_" + txn.status };
 
       const { rows: updated } = await client.query(

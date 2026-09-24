@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { provisionLocked } from "../domain/branchProvision.js";
 import crypto from "crypto";
 import { withBranch, withoutBranch } from "../db.js";
 import { authenticate, requireAnyPage, requireManager, requirePage } from "../middleware/auth.js";
@@ -161,6 +162,15 @@ router.patch("/settings/controls", authenticate, requirePage("settings"), requir
     const row = await withBranch(req.auth.branchId, async (client) => {
       const { rows: cur } = await client.query("select * from branch_settings where branch_id = $1", [req.auth.branchId]);
       const c = cur[0] || {};
+      // ⚠ فرعٌ مقفول الإعدادات من الإدارة: حدود الاعتماد لها — وقفل الفترات يبقى للفرع
+      const lock = await provisionLocked(client, req.auth.branchId);
+      if (lock) {
+        const norm = (o) => JSON.stringify(Object.fromEntries(Object.entries(o || {}).map(([k, v]) => [k, Number(v)]).sort()));
+        const changed =
+          (b.approvalsEnabled != null && !!b.approvalsEnabled !== (c.approvals_enabled !== false)) ||
+          (thresholds && norm(thresholds) !== norm(c.approval_thresholds));
+        if (changed) return { error: "settings_locked_by_hq", by: lock.by };
+      }
       const { rows } = await client.query(
         `insert into branch_settings (branch_id, approvals_enabled, approval_thresholds, lock_all, lock_posted)
          values ($1,$2,$3,$4,$5)
@@ -185,6 +195,7 @@ router.patch("/settings/controls", authenticate, requirePage("settings"), requir
       );
       return rows[0];
     });
+    if (row?.error) return res.status(409).json(row);
     res.json({ controls: row });
   } catch (err) {
     next(err);

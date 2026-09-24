@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { withBranch } from "../db.js";
 import { authenticate, requirePage, requireManager } from "../middleware/auth.js";
+import { provisionLocked } from "../domain/branchProvision.js";
 
 const router = Router();
 
@@ -33,6 +34,16 @@ router.patch("/settings/branch", requirePage("settings"), requireManager, async 
         [req.auth.branchId]
       );
       const existing = existingRows[0] || { tax_enabled: true, tax_rate: 0.15, card_fees: {}, workday_mode: "required" };
+
+      // ⚠ فرعٌ مُجهَّز ومقفول من الإدارة: الضريبة ويوم العمل لا تُغيَّر من هنا
+      const lock = await provisionLocked(client, req.auth.branchId);
+      if (lock) {
+        const changed =
+          (body.taxEnabled != null && !!body.taxEnabled !== !!existing.tax_enabled) ||
+          (body.taxRate != null && Math.abs(Number(body.taxRate) - Number(existing.tax_rate)) > 1e-9) ||
+          (body.workdayMode != null && body.workdayMode !== (existing.workday_mode || "required"));
+        if (changed) return { error: "settings_locked_by_hq", by: lock.by };
+      }
 
       // يوم العمل: 'required' (يُفتح ويُقفل) أو 'off' (الحركات بلا يوم).
       let workdayMode = existing.workday_mode || "required";
@@ -77,6 +88,9 @@ router.patch("/settings/branch", requirePage("settings"), requireManager, async 
 
     if (result.error === "invalid_tax_rate" || result.error === "invalid_workday_mode") {
       return res.status(400).json({ error: result.error });
+    }
+    if (result.error === "settings_locked_by_hq") {
+      return res.status(409).json(result);
     }
     if (result.error === "invalid_card_fee") {
       return res.status(400).json(result);
