@@ -1,5 +1,6 @@
 import { roundMoney } from "./money.js";
 import { roundWeight } from "./weight.js";
+import { buildServerReviewQueue } from "./reviewQueueServer.js";
 
 /**
  * المساعد المحاسبي — أدواتٌ تقرأ الدفاتر على الخادم (Function Calling).
@@ -200,46 +201,9 @@ async function runAccountantTool(client, branchId, name, input = {}, ctx = {}) {
     return { pieces, weight: roundWeight(weight), fineWeight24: roundWeight(fine), costValue: n2(cost), byKarat, byCategory };
   }
   if (name === "review_queue") {
-    const items = [];
-    const { rows: noJ } = await client.query(
-      `select s.ref, s.date, s.total from sales s
-        where s.branch_id = $1 and not exists (select 1 from journal_entries e where e.ref_table = 'sales' and e.ref_id = s.id)
-        order by s.date desc limit 30`,
-      [branchId]
-    );
-    noJ.forEach((s) => items.push({ severity: "block", kind: "sale_no_journal", ref: s.ref, why: `فاتورة ${n2(s.total)} بلا قيد`, date: s.date }));
-    const { rows: noJE } = await client.query(
-      `select x.ref, x.created_at, x.amount from expenses x
-        where x.branch_id = $1 and x.amount > 0 and not exists (select 1 from journal_entries e where e.ref_table = 'expenses' and e.ref_id = x.id)
-        order by x.created_at desc limit 30`,
-      [branchId]
-    );
-    noJE.forEach((x) => items.push({ severity: "block", kind: "expense_no_journal", ref: x.ref, why: `مصروف ${n2(x.amount)} بلا قيد`, date: x.created_at }));
-    const { rows: neg } = await client.query(
-      `select l.account_code as code, sum(case when l.side = 'debit' then l.amount else -l.amount end) as bal
-         from journal_lines l join journal_entries e on e.id = l.entry_id
-        where e.branch_id = $1 and l.account_code in ('1110','1120','1130','1140','1150')
-        group by 1 having sum(case when l.side = 'debit' then l.amount else -l.amount end) < -0.01`,
-      [branchId]
-    );
-    neg.forEach((r) => items.push({ severity: "block", kind: "negative_cash", ref: r.code, why: `رصيد ${r.code} في الأستاذ ${n2(r.bal)}` }));
-    const { rows: ap } = await client.query(
-      `select ref, amount, requester_name, rule_id from approvals where branch_id = $1 and status = 'pending' order by created_at desc limit 20`,
-      [branchId]
-    );
-    ap.forEach((a) => items.push({ severity: "warn", kind: "approval_pending", ref: a.ref, why: `${a.rule_id} ${n2(a.amount)} — طلبه ${a.requester_name || "—"}` }));
-    const { rows: stale } = await client.query(
-      `select ref, opened_at from business_days where branch_id = $1 and status = 'open' and opened_at::date < current_date`,
-      [branchId]
-    );
-    stale.forEach((d) => items.push({ severity: "warn", kind: "day_stale", ref: d.ref, why: `فُتح ${d.opened_at.toISOString().slice(0, 10)} ولم يُقفل` }));
-    const { rows: lots } = await client.query(
-      `select l.ref, l.weight, l.karat from lots l join purchases p on p.id = l.purchase_id
-        where l.branch_id = $1 and p.payment_method = 'deferred' and p.invoice_pending = true order by l.date desc limit 20`,
-      [branchId]
-    );
-    lots.forEach((l) => items.push({ severity: "info", kind: "lot_no_invoice", ref: l.ref, why: `دفعة ${roundWeight(l.weight)} جم عيار ${l.karat} آجلة بلا فاتورة مورد` }));
-    return { count: items.length, items: cap(items, 40), note: "فروقات الجرد وأحكام المراجعة في شاشة المراجعة المحاسبية" };
+    const q = await buildServerReviewQueue(client, branchId);
+    return { count: q.length, items: cap(q.map((x) => ({ severity: x.severity, kind: x.kind, ref: x.ref, label: x.label, why: x.why, amount: x.amount, date: x.date })), 40),
+      note: "فروقات الجرد وأحكام المراجعة في شاشة المراجعة المحاسبية" };
   }
   if (name === "search_journal") {
     const q = String(input.text || "").trim();

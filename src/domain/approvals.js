@@ -48,7 +48,15 @@ async function approvalGate(client, auth, { kind, amount, payload = null, approv
     [branchId]
   );
   const ref = `APR-${String(nRows[0].n).padStart(5, "0")}`;
-  const selfApprove = auth.role === (rule.approver_role || "manager");
+  // ⚖ من يعتمد ماذا (migration 039): ما جعلته الإدارة لنفسها لا يعتمده الفرع
+  //   ولو كان مديرًا — يبقى معلّقًا حتى تقرّر الإدارة.
+  const { rows: rt } = await client.query(
+    "select s.approval_routing from branches b join stores s on s.id = b.store_id where b.id = $1",
+    [branchId]
+  );
+  const byHq = rt[0]?.approval_routing?.[kind] === "hq";
+  const approverKind = byHq ? "hq" : rule.approver_role || "manager";
+  const selfApprove = !byHq && auth.role === (rule.approver_role || "manager");
   const { rows: apRows } = await client.query(
     `insert into approvals
        (branch_id, rule_id, status, requested_by, ref, amount, payload, note,
@@ -59,7 +67,7 @@ async function approvalGate(client, auth, { kind, amount, payload = null, approv
     [
       branchId, kind, selfApprove ? "executed" : "pending", auth.userId, ref, amt,
       payload ? JSON.stringify(payload) : null, note,
-      auth.user?.name || null, auth.role || null, rule.approver_role || "manager", selfApprove,
+      auth.user?.name || null, auth.role || null, approverKind, selfApprove,
       selfApprove ? auth.userId : null, selfApprove ? new Date() : null,
       selfApprove ? auth.user?.name || null : null, selfApprove ? new Date() : null,
     ]
@@ -83,7 +91,7 @@ function shapeApproval(a, rule = null) {
     requesterRole: a.requester_role || null,
     requestedAt: a.created_at,
     approverKind: a.approver_kind || "manager",
-    approver: a.approver_name || null,
+    approver: a.approver_name || a.decided_by_hq || null,
     approverId: a.decided_by || null,
     decidedAt: a.decided_at || null,
     decisionNote: a.decision_note || "",
@@ -92,4 +100,13 @@ function shapeApproval(a, rule = null) {
   };
 }
 
-export { approvalGate, shapeApproval };
+/** من يعتمد ماذا في متجر الفرع (migration 039): { expense: "hq"|"branch", ... } */
+async function loadBranchApprovalRouting(client, branchId) {
+  const { rows } = await client.query(
+    "select s.approval_routing from branches b join stores s on s.id = b.store_id where b.id = $1",
+    [branchId]
+  );
+  return rows[0]?.approval_routing || {};
+}
+
+export { approvalGate, shapeApproval, loadBranchApprovalRouting };

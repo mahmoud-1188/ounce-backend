@@ -8,6 +8,7 @@ import { roundMoney } from "../domain/money.js";
 import { getOpenBusinessDay } from "../domain/saleOps.js";
 import { shapeApproval } from "../domain/approvals.js";
 import { logPermission } from "../domain/permissionLog.js";
+import { monthRange, recordedNetworkFees, settleBankFeePeriod, shapeAdjustment } from "../domain/bankFees.js";
 
 const router = Router();
 
@@ -117,6 +118,8 @@ router.post("/approvals/:id/decide", authenticate, requirePage("approvals"), req
       const ap = rows[0];
       if (!ap) return { error: "approval_not_found" };
       if (ap.status !== "pending") return { error: "approval_already_decided", status: ap.status };
+      // ما جعلته الإدارة لنفسها يُقرَّر في لوحة الإدارة لا في الفرع
+      if (ap.approver_kind === "hq") return { error: "approval_requires_hq" };
       const { rows: upd } = await client.query(
         `update approvals set status = $1, decided_by = $2, decided_at = now(), approver_name = $3, decision_note = $4
           where id = $5 returning *`,
@@ -130,7 +133,7 @@ router.post("/approvals/:id/decide", authenticate, requirePage("approvals"), req
       );
       return { approval: shapeApproval({ ...upd[0], rule_label: ap.rule_label }, { label: ap.rule_label }) };
     });
-    if (result.error) return res.status(result.error === "approval_not_found" ? 404 : 409).json(result);
+    if (result.error) return res.status(result.error === "approval_not_found" ? 404 : result.error === "approval_requires_hq" ? 403 : 409).json(result);
     res.json(result);
   } catch (err) {
     next(err);
@@ -294,29 +297,7 @@ router.post("/enroll/claim", async (req, res, next) => {
   }
 });
 
-// ══ ⑥ تسوية عمولة البنك — مرّةً للشهر ════════════════════════════════
-function monthRange(period) {
-  const [y, m] = String(period || "").split("-").map(Number);
-  if (!y || !m || m < 1 || m > 12) return null;
-  const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
-  const mm = String(m).padStart(2, "0");
-  return { from: `${y}-${mm}-01`, to: `${y}-${mm}-${String(last).padStart(2, "0")}` };
-}
-
-async function recordedNetworkFees(client, branchId, { from, to }) {
-  const { rows } = await client.query(
-    `select coalesce(sum(case when l.side = 'debit' then l.amount else -l.amount end), 0) as v
-       from journal_lines l join journal_entries e on e.id = l.entry_id
-      where e.branch_id = $1 and l.account_code = '6500'
-        and e.created_at >= $2::date and e.created_at < ($3::date + 1)
-        and e.op_type not in ('bank_fee_adjust','bank_fee_refund')
-        and e.reversed_of is null
-        and not exists (select 1 from journal_entries r where r.reversed_of = e.id)`,
-    [branchId, from, to]
-  );
-  return roundMoney(rows[0]?.v);
-}
-
+// ══ ⑥ تسوية عمولة البنك — مرّةً للشهر (domain/bankFees.js) ════════════
 router.get("/bank-fees", authenticate, requirePage("bankFees"), async (req, res, next) => {
   const period = String(req.query.period || new Date().toISOString().slice(0, 7));
   const range = monthRange(period);
@@ -328,10 +309,7 @@ router.get("/bank-fees", authenticate, requirePage("bankFees"), async (req, res,
         "select * from bank_fee_adjustments where branch_id = $1 order by period desc",
         [req.auth.branchId]
       );
-      return { period, recorded, adjustments: rows.map((a) => ({
-        id: a.id, ref: a.ref, period: a.period, recorded: Number(a.recorded), actual: Number(a.actual),
-        diff: Number(a.diff), note: a.note || "", by: a.created_by_name || "", date: a.created_at,
-      })) };
+      return { period, recorded, adjustments: rows.map(shapeAdjustment) };
     });
     res.json(result);
   } catch (err) {
@@ -341,57 +319,14 @@ router.get("/bank-fees", authenticate, requirePage("bankFees"), async (req, res,
 
 router.post("/bank-fees/settle", authenticate, requirePage("bankFees"), requireManager, async (req, res, next) => {
   const period = String(req.body?.period || "");
-  const range = monthRange(period);
   const actual = roundMoney(req.body?.actualFee);
   const note = String(req.body?.note || "").trim() || null;
-  if (!range) return res.status(400).json({ error: "invalid_period" });
+  if (!monthRange(period)) return res.status(400).json({ error: "invalid_period" });
   if (!(actual >= 0)) return res.status(400).json({ error: "invalid_amount" });
   try {
-    const result = await withBranch(req.auth.branchId, async (client) => {
-      const { rows: done } = await client.query(
-        "select 1 from bank_fee_adjustments where branch_id = $1 and period = $2",
-        [req.auth.branchId, period]
-      );
-      if (done.length) return { error: "period_already_settled" };
-      const recorded = await recordedNetworkFees(client, req.auth.branchId, range);
-      const diff = roundMoney(actual - recorded);
-      const day = await getOpenBusinessDay(client, req.auth.branchId);
-      if (diff > 0.005) {
-        const { rows: bal } = await client.query(
-          `select coalesce(sum(case when direction='in' then amount else -amount end), 0) as b
-             from cash_tx where branch_id = $1 and pool = 'safe' and method = 'network'`,
-          [req.auth.branchId]
-        );
-        if (diff > Number(bal[0].b) + 0.005) return { error: "insufficient_network_balance", available: roundMoney(bal[0].b) };
-      }
-      const ref = `BFA-${period}`;
-      const { rows } = await client.query(
-        `insert into bank_fee_adjustments
-           (branch_id, ref, period, recorded, actual, diff, note, created_by, created_by_name, business_day_id)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning *`,
-        [req.auth.branchId, ref, period, recorded, actual, diff, note, req.auth.userId, req.auth.user?.name || null, day?.id || null]
-      );
-      const rec = rows[0];
-      if (Math.abs(diff) > 0.005) {
-        const up = diff > 0;
-        const amt = Math.abs(diff);
-        const label = `تسوية عمولة البنك ${period} — ${up ? "زيادة" : "نقص"}`;
-        await client.query(
-          `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
-           values ($1,$2,'safe','network',$3,$4,'network_fee_adjust','bank_fee_adjustments',$5,$6,$7)`,
-          [req.auth.branchId, day?.id || null, up ? "out" : "in", amt, rec.id, label, req.auth.userId]
-        );
-        await postJournalEntry(client, {
-          branchId: req.auth.branchId, businessDayId: day?.id || null,
-          opType: up ? "bank_fee_adjust" : "bank_fee_refund", refTable: "bank_fee_adjustments", refId: rec.id,
-          description: `تسوية عمولة البنك ${period}: فعليّ ${actual} − مسجَّل ${recorded}`, createdBy: req.auth.userId,
-          lines: up
-            ? [{ account: "6500", side: "debit", amount: amt }, { account: "1120", side: "credit", amount: amt }]
-            : [{ account: "1120", side: "debit", amount: amt }, { account: "6500", side: "credit", amount: amt }],
-        });
-      }
-      return { adjustment: { id: rec.id, ref, period, recorded, actual, diff, note: note || "", by: req.auth.user?.name || "", date: rec.created_at } };
-    });
+    const result = await withBranch(req.auth.branchId, (client) =>
+      settleBankFeePeriod(client, req.auth.branchId, { period, actual, note, userId: req.auth.userId, userName: req.auth.user?.name || null })
+    );
     if (result.error) return res.status(409).json(result);
     res.status(201).json(result);
   } catch (err) {

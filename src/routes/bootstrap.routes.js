@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { shapeApproval } from "../domain/approvals.js";
+import { loadBranchApprovalRouting, shapeApproval } from "../domain/approvals.js";
 import { loadBranchNotices, loadBranchPricePolicy } from "../domain/pricePolicy.js";
 import { withBranch, withBranchParallel } from "../db.js";
 import { authenticate } from "../middleware/auth.js";
@@ -95,6 +95,7 @@ router.get("/bootstrap", async (req, res, next) => {
       reviewsRaw,
       pricePolicy,
       notices,
+      approvalRouting,
     ] = await withBranchParallel(branchId, [
       // ⚠ توسيع حقيقي: كان يُحمَّل عمود مُصغَّر لآخر يوم فقط، لكن WorkDayPage
       // في المرجع تعرض أيضًا سجل "الأيام السابقة" (ref، فتح/إقفال، مبيعات،
@@ -275,6 +276,7 @@ router.get("/bootstrap", async (req, res, next) => {
       // زيادة الإدارة على السعر وإعلاناتها (migration 038) — من متجر الفرع
       (client) => loadBranchPricePolicy(client, branchId),
       (client) => loadBranchNotices(client, branchId),
+      (client) => loadBranchApprovalRouting(client, branchId),
     ]);
 
     const linesByEntry = new Map();
@@ -366,6 +368,7 @@ router.get("/bootstrap", async (req, res, next) => {
       reviews: reviewsRaw.rows,
       pricePolicy,
       notices,
+      approvalRouting,
       currentUser: {
         id: req.auth.userId,
         name: req.auth.user.name,
