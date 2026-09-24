@@ -58,6 +58,65 @@ function subscriptionState(store) {
   return "active";
 }
 
+const PAY_METHODS = ["transfer", "cash", "card", "other"];
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+/** مبلغ ≥ 0 بخانتين، أو null إن كان غير صالح. */
+function toMoney(v) {
+  if (v === "" || v == null) return 0;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? round2(n) : null;
+}
+
+/**
+ * السعر الشهري = الأساسي + سعر الفرع × الفروع المحتسبة
+ * (الفروع العاملة، وفرعٌ واحد على الأقل — متجرٌ بلا فروعٍ بعد يُحتسب بفرع).
+ */
+function pricingOf(s) {
+  const base = Number(s.price_base) || 0;
+  const perBranch = Number(s.price_per_branch) || 0;
+  const billableBranches = Math.max(1, Number(s.branch_count) || 0);
+  return { base, perBranch, billableBranches, monthly: round2(base + perBranch * billableBranches) };
+}
+
+function shapePayment(p) {
+  return {
+    id: p.id, amount: Number(p.amount), months: p.months, method: p.method, note: p.note || "",
+    paidAt: p.paid_at, adminName: p.admin_name || null,
+    voidedAt: p.voided_at, voidReason: p.void_reason || null, voidedByName: p.voided_by_name || null,
+  };
+}
+
+/** يسجّل دفعة اشتراك داخل معاملة — ويكتب أثرها في سجل المنصة. */
+async function recordPayment(client, { storeId, adminId, amount, months = null, method = "transfer", note = null, paidAt = null, source }) {
+  const { rows } = await client.query(
+    `insert into subscription_payments (store_id, amount, months, method, note, paid_at, admin_id)
+     values ($1,$2,$3,$4,$5,coalesce($6::timestamptz, now()),$7) returning *`,
+    [storeId, amount, months, method, note, paidAt, adminId]
+  );
+  await logAction(client, {
+    adminId, action: "payment_recorded", storeId,
+    details: { amount, months, method, note, paidAt: rows[0].paid_at, source },
+  });
+  return rows[0];
+}
+
+/** يتحقّق من دفعةٍ واردة: { amount, method, note, paidAt } — amount 0/غائب = لا دفعة. */
+function parsePayment(p) {
+  if (!p) return { none: true };
+  const amount = toMoney(p.amount);
+  if (amount === null) return { error: "invalid_amount" };
+  if (!(amount > 0)) return { none: true };
+  const method = p.method || "transfer";
+  if (!PAY_METHODS.includes(method)) return { error: "invalid_payment_method" };
+  let paidAt = null;
+  if (p.paidAt) {
+    if (Number.isNaN(new Date(p.paidAt).getTime())) return { error: "invalid_paid_at" };
+    paidAt = new Date(p.paidAt).toISOString();
+  }
+  return { amount, method, note: String(p.note || "").trim().slice(0, 300) || null, paidAt };
+}
+
 function shapeStore(s) {
   return {
     id: s.id,
@@ -70,6 +129,9 @@ function shapeStore(s) {
     state: subscriptionState(s),
     createdAt: s.created_at,
     owner: s.owner || null,
+    pricing: pricingOf(s),
+    paidTotal: s.paid_total != null ? Number(s.paid_total) : null,
+    lastPaidAt: s.last_paid_at || null,
   };
 }
 
@@ -86,7 +148,9 @@ const STORE_LIST_SQL = `
             from store_users su
            where su.store_id = s.id and su.role = 'owner'
            order by su.created_at
-           limit 1) as owner
+           limit 1) as owner,
+         (select coalesce(sum(p.amount), 0) from subscription_payments p where p.store_id = s.id and p.voided_at is null) as paid_total,
+         (select max(p.paid_at) from subscription_payments p where p.store_id = s.id and p.voided_at is null) as last_paid_at
     from stores s`;
 
 // ═══════════════════════ الدخول (علنيّ) ═══════════════════════
@@ -258,17 +322,22 @@ router.post("/platform/stores", async (req, res, next) => {
   if (plan === "branch_only") maxBranches = 1;
   if (!ownerName || !ownerEmail) return res.status(400).json({ error: "owner_name_and_email_required" });
   if (ownerPassword.length < 8) return res.status(400).json({ error: "password_too_short" });
+  const priceBase = toMoney(b.priceBase);
+  const pricePerBranch = toMoney(b.pricePerBranch);
+  if (priceBase === null || pricePerBranch === null) return res.status(400).json({ error: "invalid_price" });
+  const pay = parsePayment(b.payment);
+  if (pay.error) return res.status(400).json({ error: pay.error });
 
   try {
     const passwordHash = await hashPassword(ownerPassword);
     const store = await inTx(async (client) => {
       const { rows } = await client.query(
-        `insert into stores (name, plan, max_branches, subscription_expires_at, status)
+        `insert into stores (name, plan, max_branches, subscription_expires_at, status, price_base, price_per_branch)
          values ($1, $2, $3,
                  case when $4::int = 0 then null else now() + make_interval(months => $4::int) end,
-                 'active')
+                 'active', $5, $6)
          returning *`,
-        [name, plan, maxBranches, months]
+        [name, plan, maxBranches, months, priceBase, pricePerBranch]
       );
       const s = rows[0];
       await client.query(
@@ -280,9 +349,14 @@ router.post("/platform/stores", async (req, res, next) => {
         adminId: req.platformAuth.adminId,
         action: "store_created",
         storeId: s.id,
-        details: { name, plan, maxBranches, months, expiresAt: s.subscription_expires_at, ownerEmail },
+        details: { name, plan, maxBranches, months, expiresAt: s.subscription_expires_at, ownerEmail, priceBase, pricePerBranch },
       });
-      return { ...s, branch_count: 0, owner: { name: ownerName, email: ownerEmail } };
+      let paid = 0;
+      if (!pay.none) {
+        const p = await recordPayment(client, { storeId: s.id, adminId: req.platformAuth.adminId, ...pay, months, source: "store_created" });
+        paid = Number(p.amount);
+      }
+      return { ...s, branch_count: 0, owner: { name: ownerName, email: ownerEmail }, paid_total: paid, last_paid_at: paid ? new Date() : null };
     });
     res.status(201).json({ store: shapeStore(store) });
   } catch (err) {
@@ -310,7 +384,15 @@ router.get("/platform/stores/:id", async (req, res, next) => {
            from store_users where store_id = $1 order by created_at`,
         [req.params.id]
       );
-      return { store: rows[0], branches, storeUsers };
+      const { rows: payments } = await c.query(
+        `select p.*, a.name as admin_name, v.name as voided_by_name
+           from subscription_payments p
+           left join platform_admins a on a.id = p.admin_id
+           left join platform_admins v on v.id = p.voided_by
+          where p.store_id = $1 order by p.paid_at desc, p.created_at desc limit 200`,
+        [req.params.id]
+      );
+      return { store: rows[0], branches, storeUsers, payments };
     });
     if (!data) return res.status(404).json({ error: "store_not_found" });
     res.json({
@@ -328,6 +410,7 @@ router.get("/platform/stores/:id", async (req, res, next) => {
       storeUsers: data.storeUsers.map((u) => ({
         id: u.id, name: u.name, email: u.email, role: u.role, active: u.active, createdAt: u.created_at,
       })),
+      payments: data.payments.map(shapePayment),
     });
   } catch (err) {
     if (err.code === "22P02") return res.status(404).json({ error: "store_not_found" });
@@ -360,7 +443,10 @@ router.patch("/platform/stores/:id", async (req, res, next) => {
         plan: b.plan !== undefined ? b.plan : cur.plan,
         maxBranches: b.maxBranches !== undefined ? toNonNegInt(b.maxBranches) : cur.max_branches,
         expiresAt: b.expiresAt !== undefined ? b.expiresAt : cur.subscription_expires_at,
+        priceBase: b.priceBase !== undefined ? toMoney(b.priceBase) : Number(cur.price_base),
+        pricePerBranch: b.pricePerBranch !== undefined ? toMoney(b.pricePerBranch) : Number(cur.price_per_branch),
       };
+      if (nv.priceBase === null || nv.pricePerBranch === null) return { status: 400, body: { error: "invalid_price" } };
       if (!nv.name) return { status: 400, body: { error: "store_name_required" } };
       if (!PLANS.includes(nv.plan)) return { status: 400, body: { error: "invalid_plan" } };
       if (!nv.maxBranches || nv.maxBranches < 1) return { status: 400, body: { error: "invalid_max_branches" } };
@@ -373,17 +459,20 @@ router.patch("/platform/stores/:id", async (req, res, next) => {
       }
 
       const { rows: upd } = await client.query(
-        `update stores set name = $1, plan = $2, max_branches = $3, subscription_expires_at = $4
+        `update stores set name = $1, plan = $2, max_branches = $3, subscription_expires_at = $4,
+                price_base = $6, price_per_branch = $7
           where id = $5 returning *`,
-        [nv.name, nv.plan, nv.maxBranches, nv.expiresAt, cur.id]
+        [nv.name, nv.plan, nv.maxBranches, nv.expiresAt, cur.id, nv.priceBase, nv.pricePerBranch]
       );
       await logAction(client, {
         adminId: req.platformAuth.adminId,
         action: "store_updated",
         storeId: cur.id,
         details: {
-          before: { name: cur.name, plan: cur.plan, maxBranches: cur.max_branches, expiresAt: cur.subscription_expires_at },
-          after: { name: upd[0].name, plan: upd[0].plan, maxBranches: upd[0].max_branches, expiresAt: upd[0].subscription_expires_at },
+          before: { name: cur.name, plan: cur.plan, maxBranches: cur.max_branches, expiresAt: cur.subscription_expires_at,
+            priceBase: Number(cur.price_base), pricePerBranch: Number(cur.price_per_branch) },
+          after: { name: upd[0].name, plan: upd[0].plan, maxBranches: upd[0].max_branches, expiresAt: upd[0].subscription_expires_at,
+            priceBase: Number(upd[0].price_base), pricePerBranch: Number(upd[0].price_per_branch) },
         },
       });
       return { status: 200, body: { store: shapeStore({ ...upd[0], branch_count: cur.branch_count }) } };
@@ -405,6 +494,9 @@ router.patch("/platform/stores/:id", async (req, res, next) => {
 router.post("/platform/stores/:id/renew", async (req, res, next) => {
   const months = toNonNegInt(req.body?.months);
   if (months === null) return res.status(400).json({ error: "invalid_months" });
+  // دفعة التجديد (اختيارية): { amount, method, note, paidAt } — تُقترح في اللوحة من السعر × الأشهر
+  const pay = parsePayment(req.body?.payment);
+  if (pay.error) return res.status(400).json({ error: pay.error });
   try {
     const result = await inTx(async (client) => {
       const { rows: curRows } = await client.query(
@@ -428,8 +520,9 @@ router.post("/platform/stores/:id/renew", async (req, res, next) => {
         adminId: req.platformAuth.adminId,
         action: "store_renewed",
         storeId: req.params.id,
-        details: { months, before: curRows[0].subscription_expires_at, after: rows[0].subscription_expires_at },
+        details: { months, before: curRows[0].subscription_expires_at, after: rows[0].subscription_expires_at, amount: pay.none ? null : pay.amount },
       });
+      if (!pay.none) await recordPayment(client, { storeId: req.params.id, adminId: req.platformAuth.adminId, ...pay, months, source: "store_renewed" });
       return rows[0];
     });
     if (!result) return res.status(404).json({ error: "store_not_found" });
@@ -470,6 +563,60 @@ router.post("/platform/stores/:id/status", async (req, res, next) => {
     res.json({ store: shapeStore(result) });
   } catch (err) {
     if (err.code === "22P02") return res.status(404).json({ error: "store_not_found" });
+    next(err);
+  }
+});
+
+/**
+ * POST /api/platform/stores/:id/payments  { amount, months?, method, note?, paidAt? }
+ * دفعةٌ منفردة (سداد متأخر، دفعة جزئية) — لا تغيّر تاريخ الانتهاء.
+ */
+router.post("/platform/stores/:id/payments", async (req, res, next) => {
+  const pay = parsePayment(req.body || {});
+  if (pay.error) return res.status(400).json({ error: pay.error });
+  if (pay.none) return res.status(400).json({ error: "invalid_amount" });
+  const months = req.body?.months != null && req.body.months !== "" ? toNonNegInt(req.body.months) : null;
+  if (req.body?.months != null && req.body.months !== "" && months === null) return res.status(400).json({ error: "invalid_months" });
+  try {
+    const result = await inTx(async (client) => {
+      const { rows } = await client.query("select id from stores where id = $1", [req.params.id]);
+      if (!rows[0]) return null;
+      return recordPayment(client, { storeId: req.params.id, adminId: req.platformAuth.adminId, ...pay, months, source: "manual" });
+    });
+    if (!result) return res.status(404).json({ error: "store_not_found" });
+    res.status(201).json({ payment: shapePayment(result) });
+  } catch (err) {
+    if (err.code === "22P02") return res.status(404).json({ error: "store_not_found" });
+    next(err);
+  }
+});
+
+/**
+ * POST /api/platform/payments/:id/void  { reason }
+ * لا حذف للمدفوعات — تُلغى بسببٍ مكتوب وتبقى ظاهرةً مشطوبة في السجل.
+ */
+router.post("/platform/payments/:id/void", async (req, res, next) => {
+  const reason = String(req.body?.reason || "").trim();
+  if (!reason) return res.status(400).json({ error: "void_reason_required" });
+  try {
+    const result = await inTx(async (client) => {
+      const { rows } = await client.query("select * from subscription_payments where id = $1 for update", [req.params.id]);
+      const p = rows[0];
+      if (!p) return { status: 404, body: { error: "payment_not_found" } };
+      if (p.voided_at) return { status: 409, body: { error: "payment_already_voided" } };
+      const { rows: upd } = await client.query(
+        "update subscription_payments set voided_at = now(), voided_by = $2, void_reason = $3 where id = $1 returning *",
+        [p.id, req.platformAuth.adminId, reason.slice(0, 300)]
+      );
+      await logAction(client, {
+        adminId: req.platformAuth.adminId, action: "payment_voided", storeId: p.store_id,
+        details: { amount: Number(p.amount), paidAt: p.paid_at, reason },
+      });
+      return { status: 200, body: { payment: shapePayment(upd[0]) } };
+    });
+    res.status(result.status).json(result.body);
+  } catch (err) {
+    if (err.code === "22P02") return res.status(404).json({ error: "payment_not_found" });
     next(err);
   }
 });
