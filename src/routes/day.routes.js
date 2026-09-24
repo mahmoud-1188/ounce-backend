@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { withBranch } from "../db.js";
-import { authenticate, requirePage, requireCanManageDay } from "../middleware/auth.js";
+import { authenticate, requirePage, requireCanManageDay, requireNotDenied } from "../middleware/auth.js";
 import { roundMoney } from "../domain/money.js";
 import { roundWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
@@ -47,7 +47,7 @@ async function findOpenCustody(client, branchId) {
 // الصندوق اليومي + عهدة الكسر) سطرا cash_tx بنفس فلسفة safe.routes.js —
 // لا قيد يومية (تحويل داخلي، حسابه "7300 تحويلات داخلية" يُلغي طرفاه
 // بعضهما، مطابقةً لبقية تحويلات هذا الملف).
-router.post("/day/open", requireCanManageDay, async (req, res, next) => {
+router.post("/day/open", requireCanManageDay, requireNotDenied("openDay"), async (req, res, next) => {
   const body = req.body || {};
   const tillFloat = roundMoney(body.tillFloat) || 0;
   const scrapFloat = roundMoney(body.scrapFloat) || 0;
@@ -141,7 +141,7 @@ router.post("/day/open", requireCanManageDay, async (req, res, next) => {
 });
 
 // ── إقفال يوم العمل — لقطة لحظية، لا يمنعها كسر معلَّق (تنبيهي فقط) ──
-router.post("/day/close", requireCanManageDay, async (req, res, next) => {
+router.post("/day/close", requireCanManageDay, requireNotDenied("closeDay"), async (req, res, next) => {
   const note = req.body?.note || null;
 
   try {

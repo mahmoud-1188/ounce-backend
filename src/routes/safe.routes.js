@@ -5,6 +5,7 @@ import {
   requirePage,
   requireCanManageDay,
   requireManager,
+  requireNotDenied,
 } from "../middleware/auth.js";
 import { roundMoney } from "../domain/money.js";
 import { fineWeight, roundWeight } from "../domain/weight.js";
@@ -46,7 +47,7 @@ async function openDay(client, branchId) {
 }
 
 // ── تحويل من الصندوق اليومي إلى الخزنة ──
-router.post("/safe/transfer-to-safe", async (req, res, next) => {
+router.post("/safe/transfer-to-safe", requireNotDenied("cashMove"), async (req, res, next) => {
   const amount = roundMoney(req.body?.amount);
   const method = req.body?.method === "network" ? "network" : "cash";
   const note = req.body?.note || null;
@@ -80,7 +81,7 @@ router.post("/safe/transfer-to-safe", async (req, res, next) => {
 });
 
 // ── تحويل من الخزنة إلى الصندوق اليومي ──
-router.post("/safe/transfer-to-daily", async (req, res, next) => {
+router.post("/safe/transfer-to-daily", requireNotDenied("cashMove"), async (req, res, next) => {
   const amount = roundMoney(req.body?.amount);
   const method = req.body?.method === "network" ? "network" : "cash";
   const note = req.body?.note || null;
@@ -112,7 +113,7 @@ router.post("/safe/transfer-to-daily", async (req, res, next) => {
 });
 
 // ── تمويل عهدة الكسر (من الصندوق اليومي أو الخزنة) — handleFundCustody ──
-router.post("/safe/fund-custody", async (req, res, next) => {
+router.post("/safe/fund-custody", requireNotDenied("cashMove"), async (req, res, next) => {
   const amount = roundMoney(req.body?.amount);
   const method = req.body?.method === "network" ? "network" : "cash";
   const source = req.body?.source === "safe" ? "safe" : "daily";
@@ -154,7 +155,7 @@ router.post("/safe/fund-custody", async (req, res, next) => {
 });
 
 // ── حركة نقد يدوية مباشرة في الخزنة (إيداع/سحب) — handleAddSafeTx ──
-router.post("/safe/cash", async (req, res, next) => {
+router.post("/safe/cash", requireNotDenied("safeMove"), async (req, res, next) => {
   const type = req.body?.type === "out" ? "out" : "in";
   const amount = roundMoney(req.body?.amount);
   const method = req.body?.method === "network" ? "network" : "cash";
@@ -189,7 +190,7 @@ router.post("/safe/cash", async (req, res, next) => {
 //    يُرحّل أي قيد لدفتر الوزن (بعكس handleSettleSupplier's المسار
 //    المطابق فعليًا لنفس الفعل، الذي يستدعي postWeight بشكل صحيح) — هنا
 //    نُرحّل دائمًا: دفتر وزن + سطر supplier_ledger (تخفيض).
-router.post("/safe/gold", requireCanManageDay, async (req, res, next) => {
+router.post("/safe/gold", requireCanManageDay, requireNotDenied("safeMove"), async (req, res, next) => {
   const body = req.body || {};
   const type = body.type === "out" ? "out" : "in";
   const kind = body.kind === "crafted" ? "crafted" : "raw";

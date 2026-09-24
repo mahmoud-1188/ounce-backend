@@ -1,6 +1,7 @@
 import { verifySession } from "../auth/jwt.js";
 import { withoutBranch } from "../db.js";
 import { currentAllowed } from "../auth/permissions.js";
+import { applyScreenPolicy, hqDeniedActions, screenEntry } from "../domain/hqPolicy.js";
 
 /**
  * Verifies the bearer JWT, loads the user's role from the database (not
@@ -65,7 +66,7 @@ async function authenticate(req, res, next) {
       client.query(
         `select u.*, r.allowed_tabs, r.allowed_more, r.deny_actions,
                 r.can_manage_day, r.can_break,
-                s.status as store_status, s.subscription_expires_at,
+                s.status as store_status, s.subscription_expires_at, s.hq_policy,
                 b.locked as branch_locked, b.lock_reason as branch_lock_reason,
                 b.locked_at as branch_locked_at, b.locked_by as branch_locked_by
            from users u
@@ -91,10 +92,14 @@ async function authenticate(req, res, next) {
     const lock = branchLockBody(user);
     if (lock) return res.status(423).json(lock);
 
+    // ⚠ سياسة الإدارة (migration 040) فوق الدور وفوق تخصيص المدير المحلي:
+    //   الشاشات تُمنع/تُمنح، والعمليات تُمنع — والفرض هنا لا في الواجهة وحدها.
+    const hqDeny = hqDeniedActions(user.hq_policy, user.branch_id, user.role);
     const role = {
       allowed_tabs: user.allowed_tabs,
       allowed_more: user.allowed_more,
-      deny_actions: user.deny_actions,
+      deny_actions: [...new Set([...(user.deny_actions || []), ...hqDeny])],
+      hq_deny_actions: hqDeny,
       can_manage_day: user.can_manage_day,
       can_break: user.can_break,
     };
@@ -105,7 +110,7 @@ async function authenticate(req, res, next) {
       role: user.role,
       user,
       roleConfig: role,
-      allowedPages: currentAllowed(user, role),
+      allowedPages: applyScreenPolicy(currentAllowed(user, role), screenEntry(user.hq_policy, user.branch_id, user.role)),
     };
     next();
   } catch (err) {
@@ -156,6 +161,9 @@ function requireAnyPage(...pageIds) {
  */
 function requireNotDenied(actionId) {
   return (req, res, next) => {
+    if (req.auth?.roleConfig?.hq_deny_actions?.includes(actionId)) {
+      return res.status(403).json({ error: "action_denied_by_hq", action: actionId });
+    }
     if (req.auth?.roleConfig?.deny_actions?.includes(actionId)) {
       return res.status(403).json({ error: "action_denied_for_role", action: actionId });
     }

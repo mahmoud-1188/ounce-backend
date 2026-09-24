@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { loadBranchApprovalRouting, shapeApproval } from "../domain/approvals.js";
 import { loadBranchNotices, loadBranchPricePolicy } from "../domain/pricePolicy.js";
+import { branchPolicyView } from "../domain/hqPolicy.js";
 import { withBranch, withBranchParallel } from "../db.js";
 import { authenticate } from "../middleware/auth.js";
 
@@ -369,6 +370,8 @@ router.get("/bootstrap", async (req, res, next) => {
       pricePolicy,
       notices,
       approvalRouting,
+      // سياسة الإدارة على الشاشات والعمليات (migration 040) — الخادم يفرضها، والواجهة تُخفي وتُنبّه
+      hqPolicy: branchPolicyView(req.auth.user.hq_policy, branchId),
       currentUser: {
         id: req.auth.userId,
         name: req.auth.user.name,

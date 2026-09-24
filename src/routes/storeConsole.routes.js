@@ -7,6 +7,7 @@ import { shapeApproval } from "../domain/approvals.js";
 import { monthRange, recordedNetworkFees, settleBankFeePeriod } from "../domain/bankFees.js";
 import { buildServerReviewQueue } from "../domain/reviewQueueServer.js";
 import { postManualAdjustment, reverseJournalEntry } from "../domain/journalOps.js";
+import { ACTION_GROUPS, BRANCH_SCREENS, HQ_ACTIONS, sanitizePolicy } from "../domain/hqPolicy.js";
 
 const router = Router();
 
@@ -405,6 +406,40 @@ router.post("/store/approvals/:id/decide", requireCanManageBranches, async (req,
     res.json(result);
   } catch (err) {
     notFoundOn22P02(err, res, next);
+  }
+});
+
+// ══ ⑦⑧ الشاشات والعمليات — ما تمنعه الإدارة أو تمنحه لكل دور ═══════════
+router.get("/store/hq-policy", async (req, res, next) => {
+  try {
+    const out = await withoutBranch(async (c) => ({
+      store: (await c.query("select hq_policy, hq_policy_at, hq_policy_by from stores where id = $1", [req.storeAuth.storeId])).rows[0] || {},
+      roles: (await c.query("select id, label from roles order by id")).rows,
+    }));
+    const branches = await storeBranches(req.storeAuth.storeId);
+    res.json({
+      policy: { byRole: out.store.hq_policy?.byRole || {}, byBranch: out.store.hq_policy?.byBranch || {} },
+      at: out.store.hq_policy_at || null, by: out.store.hq_policy_by || null,
+      roles: out.roles, branches: branches.map((b) => ({ id: b.id, name: b.name })),
+      screens: BRANCH_SCREENS, actions: HQ_ACTIONS, actionGroups: ACTION_GROUPS,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.put("/store/hq-policy", requireCanManageBranches, async (req, res, next) => {
+  try {
+    const branches = await storeBranches(req.storeAuth.storeId);
+    const { rows: roles } = await withoutBranch((c) => c.query("select id from roles"));
+    const policy = sanitizePolicy(req.body?.policy || {}, { roles: roles.map((r) => r.id), branchIds: branches.map((b) => b.id) });
+    const { rows } = await withoutBranch((c) =>
+      c.query("update stores set hq_policy = $1, hq_policy_at = now(), hq_policy_by = $2 where id = $3 returning hq_policy_at",
+        [JSON.stringify(policy), actorOf(req), req.storeAuth.storeId])
+    );
+    res.json({ policy, at: rows[0]?.hq_policy_at || null, by: actorOf(req) });
+  } catch (err) {
+    next(err);
   }
 });
 
