@@ -10,6 +10,7 @@ import {
 import { roundMoney } from "../domain/money.js";
 import { fineWeight, roundWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
+import { poolBalance, postPoolTransfer } from "../domain/cashPools.js";
 
 const router = Router();
 
@@ -27,13 +28,11 @@ const KARATS = [24, 22, 21, 18, 14];
  * 'daily'|'custody') — فالتحويل بين صندوقين هنا سطران في نفس الجدول
  * (خروج من صندوق، دخول لآخر)، لا كتابة لمصفوفتين منفصلتين.
  *
- * التحويلات الداخلية (transfer_to_safe/transfer_from_daily/...) لا تُرحَّل
- * ليومية أبدًا — لا في المرجع (لا استدعاء postJournal في أيٍّ من
- * handleTransferToSafe/handleTransferSafeToDaily/handleFundCustody) ولا في
- * chart.js (لا توجد هذي التصنيفات إطلاقًا في CATEGORY_TO_ACCOUNT — حساب
- * "7300 تحويلات داخلية" الوحيد المناسب لها بالتعليق "طرفاها يُلغيان
- * بعضهما"، أي لا قيد فعليًا مطلوبًا). سطرا cash_tx نفسهما (خروج+دخول)
- * كافيان كأثر محاسبي، تمامًا كفلسفة المرجع.
+ * التحويلات الداخلية (transfer_to_safe/transfer_to_daily/transfer_to_custody)
+ * تُرحَّل الآن قيدَ «تحويل بين الصناديق» (مدين الوجهة/دائن المصدر) — المرجع
+ * 5.2.0 أصلح الشيء نفسه (float_in/float_out): بلا قيد يبقى 1130 ممتلئًا
+ * و1110 ناقصًا في الأستاذ بعد كل توريد، فلا يطابق الأستاذُ الصناديقَ.
+ * والتحويل لا يتجاوز رصيد صندوقه المصدر.
  */
 router.use("/safe", authenticate, requirePage("cash"));
 
@@ -56,6 +55,8 @@ router.post("/safe/transfer-to-safe", requireNotDenied("cashMove"), async (req, 
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
       const businessDayId = await openDay(client, req.auth.branchId);
+      const available = await poolBalance(client, req.auth.branchId, "daily", method);
+      if (amount > available + 0.005) return { error: "insufficient_pool_balance", available };
       const { rows: outRows } = await client.query(
         `insert into cash_tx
            (branch_id, business_day_id, pool, method, direction, amount, category, note, created_by)
@@ -70,10 +71,15 @@ router.post("/safe/transfer-to-safe", requireNotDenied("cashMove"), async (req, 
          returning *`,
         [req.auth.branchId, businessDayId, method, amount, note || "تحويل من الصندوق اليومي", outRows[0].id, req.auth.userId]
       );
+      await postPoolTransfer(client, {
+        branchId: req.auth.branchId, businessDayId, from: "daily", to: "safe", method, amount,
+        outTxId: outRows[0].id, description: note || "توريد من الصندوق اليومي إلى الخزنة", createdBy: req.auth.userId,
+      });
       // ⚠ إضافة لخدمة الفرونت إند المُحوَّل: يحتاج سطري cash_tx فعليًا لتحديث
       // الحالة المحلية بلا إعادة تحميل bootstrap كاملة بعد كل عملية خزنة.
       return { ok: true, dailyTx: outRows[0], safeTx: inRows[0] };
     });
+    if (result.error) return res.status(409).json(result);
     res.status(201).json(result);
   } catch (err) {
     next(err);
@@ -90,6 +96,8 @@ router.post("/safe/transfer-to-daily", requireNotDenied("cashMove"), async (req,
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
       const businessDayId = await openDay(client, req.auth.branchId);
+      const available = await poolBalance(client, req.auth.branchId, "safe", method);
+      if (amount > available + 0.005) return { error: "insufficient_pool_balance", available };
       const { rows: outRows } = await client.query(
         `insert into cash_tx
            (branch_id, business_day_id, pool, method, direction, amount, category, note, created_by)
@@ -104,8 +112,13 @@ router.post("/safe/transfer-to-daily", requireNotDenied("cashMove"), async (req,
          returning *`,
         [req.auth.branchId, businessDayId, method, amount, note || "تحويل من الخزنة", outRows[0].id, req.auth.userId]
       );
+      await postPoolTransfer(client, {
+        branchId: req.auth.branchId, businessDayId, from: "safe", to: "daily", method, amount,
+        outTxId: outRows[0].id, description: note || "تحويل من الخزنة إلى الصندوق اليومي", createdBy: req.auth.userId,
+      });
       return { ok: true, safeTx: outRows[0], dailyTx: inRows[0] };
     });
+    if (result.error) return res.status(409).json(result);
     res.status(201).json(result);
   } catch (err) {
     next(err);
@@ -123,6 +136,8 @@ router.post("/safe/fund-custody", requireNotDenied("cashMove"), async (req, res,
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
       const businessDayId = await openDay(client, req.auth.branchId);
+      const available = await poolBalance(client, req.auth.branchId, source, method);
+      if (amount > available + 0.005) return { error: "insufficient_pool_balance", available };
       const { rows: outRows } = await client.query(
         `insert into cash_tx
            (branch_id, business_day_id, pool, method, direction, amount, category, note, created_by)
@@ -146,8 +161,13 @@ router.post("/safe/fund-custody", requireNotDenied("cashMove"), async (req, res,
           note || "تمويل عهدة الكسر", outRows[0].id, req.auth.userId,
         ]
       );
+      await postPoolTransfer(client, {
+        branchId: req.auth.branchId, businessDayId, from: source, to: "custody", method, amount,
+        outTxId: outRows[0].id, description: note || "تمويل عهدة الكسر", createdBy: req.auth.userId,
+      });
       return { ok: true, sourceTx: outRows[0], custodyTx: inRows[0], source };
     });
+    if (result.error) return res.status(409).json(result);
     res.status(201).json(result);
   } catch (err) {
     next(err);

@@ -5,6 +5,7 @@ import { roundMoney } from "../domain/money.js";
 import { roundWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
 import { closeBusinessDay } from "../domain/businessDay.js";
+import { postPoolTransfer } from "../domain/cashPools.js";
 
 const router = Router();
 
@@ -44,9 +45,8 @@ async function findOpenCustody(client, branchId) {
 // ── فتح يوم عمل جديد — يفتح عهدة صندوق يومي كأثر جانبي إن مرّرت أي عربون ──
 //
 // ⚠ يطابق handleOpenBusinessDay: التحويل من الخزنة لتمويل العربون (نقد
-// الصندوق اليومي + عهدة الكسر) سطرا cash_tx بنفس فلسفة safe.routes.js —
-// لا قيد يومية (تحويل داخلي، حسابه "7300 تحويلات داخلية" يُلغي طرفاه
-// بعضهما، مطابقةً لبقية تحويلات هذا الملف).
+// الصندوق اليومي + عهدة الكسر) سطرا cash_tx، ومعهما قيد «تحويل بين
+// الصناديق» (مدين الوجهة/دائن المصدر — migration 044) كي يطابق الأستاذ الصناديق.
 router.post("/day/open", requireCanManageDay, requireNotDenied("openDay"), async (req, res, next) => {
   const body = req.body || {};
   const tillFloat = roundMoney(body.tillFloat) || 0;
@@ -92,11 +92,15 @@ router.post("/day/open", requireCanManageDay, requireNotDenied("openDay"), async
       // ── عربون الصندوق اليومي: خزنة → صندوق يومي، ويفتح عهدة صندوق ──
       let custody = null;
       if (tillFloat > 0) {
-        await client.query(
+        const { rows: tillOut } = await client.query(
           `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, note, created_by)
-           values ($1,$2,'safe','cash','out',$3,'transfer_to_daily',$4,$5)`,
+           values ($1,$2,'safe','cash','out',$3,'transfer_to_daily',$4,$5) returning id`,
           [req.auth.branchId, day.id, tillFloat, `عربون افتتاح ${ref}`, req.auth.userId]
         );
+        await postPoolTransfer(client, {
+          branchId: req.auth.branchId, businessDayId: day.id, from: "safe", to: "daily", method: "cash",
+          amount: tillFloat, outTxId: tillOut[0].id, description: `عربون افتتاح ${ref}`, createdBy: req.auth.userId,
+        });
         await client.query(
           `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, note, created_by)
            values ($1,$2,'daily','cash','in',$3,'transfer_from_safe',$4,$5)`,
@@ -119,11 +123,15 @@ router.post("/day/open", requireCanManageDay, requireNotDenied("openDay"), async
 
       // ── عربون عهدة الكسر: خزنة → عهدة الكسر ──
       if (scrapFloat > 0) {
-        await client.query(
+        const { rows: scrapOut } = await client.query(
           `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, note, created_by)
-           values ($1,$2,'safe','cash','out',$3,'transfer_to_custody',$4,$5)`,
+           values ($1,$2,'safe','cash','out',$3,'transfer_to_custody',$4,$5) returning id`,
           [req.auth.branchId, day.id, scrapFloat, `عربون افتتاح ${ref}`, req.auth.userId]
         );
+        await postPoolTransfer(client, {
+          branchId: req.auth.branchId, businessDayId: day.id, from: "safe", to: "custody", method: "cash",
+          amount: scrapFloat, outTxId: scrapOut[0].id, description: `عربون عهدة الكسر ${ref}`, createdBy: req.auth.userId,
+        });
         await client.query(
           `insert into scrap_custody (branch_id, business_day_id, direction, amount, note, created_by)
            values ($1,$2,'in',$3,$4,$5)`,
@@ -183,11 +191,15 @@ router.post("/custody/open", requireCanManageDay, async (req, res, next) => {
         if (amount > (Number(safeRows[0]?.balance) || 0) + 0.01) {
           return { error: "insufficient_safe_cash", method, available: Number(safeRows[0]?.balance) || 0, requested: amount };
         }
-        await client.query(
+        const { rows: floatOut } = await client.query(
           `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, note, created_by)
-           values ($1,$2,'safe',$3,'out',$4,'transfer_to_daily',$5,$6)`,
+           values ($1,$2,'safe',$3,'out',$4,'transfer_to_daily',$5,$6) returning id`,
           [req.auth.branchId, day.id, method, amount, note || "فتح عهدة الصندوق اليومي", req.auth.userId]
         );
+        await postPoolTransfer(client, {
+          branchId: req.auth.branchId, businessDayId: day.id, from: "safe", to: "daily", method,
+          amount, outTxId: floatOut[0].id, description: note || "فتح عهدة الصندوق اليومي", createdBy: req.auth.userId,
+        });
         await client.query(
           `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, note, created_by)
            values ($1,$2,'daily',$3,'in',$4,'transfer_from_safe',$5,$6)`,

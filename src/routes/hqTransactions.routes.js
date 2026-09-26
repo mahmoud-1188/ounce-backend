@@ -250,7 +250,7 @@ router.post("/store/hq-transactions", requireCanSendCoding, async (req, res, nex
 /**
  * POST /api/store/hq-transactions/cash  { toBranchId, fromBranchId?, amount, note? }
  * تحويل نقد من خزنة المصدر (الفرع الرئيسي افتراضًا) إلى خزنة فرع — يُرحَّل
- * طرف الإرسال فورًا (1160/1110)، وطرف الاستلام حين يؤكّده الفرع (1110/1160).
+ * طرف الإرسال فورًا (1170/1110)، وطرف الاستلام حين يؤكّده الفرع (1110/1170).
  */
 router.post("/store/hq-transactions/cash", requireCanManageBranches, async (req, res, next) => {
   const { toBranchId, note } = req.body || {};

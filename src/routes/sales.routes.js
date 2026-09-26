@@ -135,10 +135,43 @@ router.post("/sales", async (req, res, next) => {
       const taxAmount = taxApplicable ? extractInclusiveTax(total, taxRate) : 0;
       const netAmount = Math.round((total - taxAmount) * 100) / 100;
 
+      // ── الحجز: قطعةٌ محجوزة تُباع لصاحب حجزها وحده، وعربونه يُخصم من الفاتورة ──
+      // (المرجع 5.2.0: «عربون الحجز يُخصم الآن من فاتورته» — وكان 2210 لا يُطفأ أبدًا)
+      // المصدر: حجز القطعة نفسها تلقائيًّا، أو حجزٌ يختاره البائع (reservationId) لهذا العميل.
+      const itemIds = [...new Set(resolvedLines.map((l) => l.itemId).filter(Boolean))];
+      const { rows: rsvRows } = await client.query(
+        `select r.*, exists (select 1 from items i where i.reserved_for = r.id and i.id = any($1::uuid[])) as item_in_sale
+           from reservations r
+          where r.branch_id = $2 and r.status = 'open'
+            and (r.id in (select reserved_for from items where id = any($1::uuid[]) and reserved_for is not null) or r.id = $3)
+          for update of r`,
+        [itemIds, req.auth.branchId, body.reservationId || null]
+      );
+      if (body.reservationId && !rsvRows.some((r) => r.id === body.reservationId)) return { error: "reservation_not_open" };
+      for (const r of rsvRows) {
+        if (!customerId || r.customer_id !== customerId) return { error: "item_reserved_for_other", ref: r.ref };
+      }
+      let depositLeftToApply = total;
+      const rsvUse = rsvRows.map((r) => {
+        const left = Math.max(0, Math.round((Number(r.deposit || 0) - Number(r.deposit_used || 0)) * 100) / 100);
+        const use = Math.min(left, depositLeftToApply);
+        depositLeftToApply = Math.round((depositLeftToApply - use) * 100) / 100;
+        return { r, use, done: r.item_in_sale || use >= left - 0.005 };
+      });
+      const depositApplied = Math.round(rsvUse.reduce((a, x) => a + x.use, 0) * 100) / 100;
+      // ما يدفعه العميل الآن = الإجمالي − العربون المقبوض سلفًا
+      const payable = Math.round((total - depositApplied) * 100) / 100;
+      if (paymentMethod === "split" && depositApplied > 0) {
+        // العربون يُخصم من النقد أولًا ثم من الشبكة
+        const fromCash = Math.min(cashPart, depositApplied);
+        cashPart = Math.round((cashPart - fromCash) * 100) / 100;
+        networkPart = Math.round((networkPart - (depositApplied - fromCash)) * 100) / 100;
+      }
+
       if (paymentMethod === "split") {
         const sumParts = Math.round((cashPart + networkPart) * 100) / 100;
-        if (sumParts !== total) {
-          return { error: "split_amounts_do_not_match_total", total, sumParts };
+        if (sumParts !== payable) {
+          return { error: "split_amounts_do_not_match_total", total: payable, sumParts };
         }
       }
 
@@ -232,19 +265,19 @@ router.post("/sales", async (req, res, next) => {
       let fee = 0;
       const feePct = cardNetwork ? Number(settings.card_fees?.[cardNetwork]) || 0 : 0;
 
-      if (paymentMethod === "cash") {
+      if (paymentMethod === "cash" && payable > 0) {
         await client.query(
           `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
            values ($1,$2,'daily','cash','in',$3,'sales_revenue','sales',$4,$5,$6)`,
-          [req.auth.branchId, businessDay.id, total, sale.id, `بيع ${sale.ref}`, req.auth.userId]
+          [req.auth.branchId, businessDay.id, payable, sale.id, `بيع ${sale.ref}`, req.auth.userId]
         );
-      } else if (paymentMethod === "card") {
+      } else if (paymentMethod === "card" && payable > 0) {
         await client.query(
           `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
            values ($1,$2,'daily','network','in',$3,'sales_revenue','sales',$4,$5,$6)`,
-          [req.auth.branchId, businessDay.id, total, sale.id, `بيع ${sale.ref}`, req.auth.userId]
+          [req.auth.branchId, businessDay.id, payable, sale.id, `بيع ${sale.ref}`, req.auth.userId]
         );
-        fee = Math.round(total * (feePct / 100) * 100) / 100;
+        fee = Math.round(payable * (feePct / 100) * 100) / 100;
         if (fee > 0) {
           await client.query(
             `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
@@ -286,7 +319,7 @@ router.post("/sales", async (req, res, next) => {
       // مقاصة كاملة). راجع قرارك الصريح أعلى migration 007.
       let tradeInDiff = 0;
       if (paymentMethod === "trade_in") {
-        tradeInDiff = Math.round((total - tradeInValue) * 100) / 100;
+        tradeInDiff = Math.round((payable - tradeInValue) * 100) / 100;
         if (tradeInDiff > 0.005) {
           await client.query(
             `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
@@ -312,12 +345,14 @@ router.post("/sales", async (req, res, next) => {
       }
 
       const debitLines = [];
+      // العربون المقبوض سلفًا يُطفئ 2210 بدل أن يُقبض مرّةً ثانية
+      if (depositApplied > 0) debitLines.push({ account: "2210", side: "debit", amount: depositApplied });
       if (paymentMethod === "cash") {
-        debitLines.push({ account: "1130", side: "debit", amount: total });
+        if (payable > 0) debitLines.push({ account: "1130", side: "debit", amount: payable });
       } else if (paymentMethod === "card") {
-        debitLines.push({ account: "1140", side: "debit", amount: total });
+        if (payable > 0) debitLines.push({ account: "1140", side: "debit", amount: payable });
       } else if (paymentMethod === "credit") {
-        debitLines.push({ account: "1310", side: "debit", amount: total });
+        if (payable > 0) debitLines.push({ account: "1310", side: "debit", amount: payable });
       } else if (paymentMethod === "split") {
         if (cashPart > 0) debitLines.push({ account: "1130", side: "debit", amount: cashPart });
         if (networkPart > 0) debitLines.push({ account: "1140", side: "debit", amount: networkPart });
@@ -332,6 +367,22 @@ router.post("/sales", async (req, res, next) => {
         } else if (tradeInDiff < -0.005) {
           creditLines.push({ account: "1130", side: "credit", amount: Math.abs(tradeInDiff) });
         }
+      }
+
+      for (const { r, use, done } of rsvUse) {
+        await client.query(
+          `update reservations set deposit_used = deposit_used + $2,
+                  status = case when $3 then 'completed' else status end,
+                  completed_at = case when $3 then now() else completed_at end,
+                  sale_id = case when $3 then $4::uuid else sale_id end,
+                  remaining = case when $3 then 0 else remaining end
+            where id = $1`,
+          [r.id, use, done, sale.id]
+        );
+        if (done) await client.query("update items set reserved_for = null where reserved_for = $1", [r.id]);
+      }
+      if (rsvUse.length) {
+        await client.query("update sales set reservation_id = $1, deposit_applied = $2 where id = $3", [rsvUse[0].r.id, depositApplied, sale.id]);
       }
 
       const journalEntryId = await postJournalEntry(client, {
@@ -373,7 +424,7 @@ router.post("/sales", async (req, res, next) => {
       );
 
       return {
-        sale: { id: sale.id, ref: sale.ref, total, taxAmount, netAmount, paymentMethod },
+        sale: { id: sale.id, ref: sale.ref, total, taxAmount, netAmount, paymentMethod, depositApplied, payable },
         journalEntryId,
         feeJournalEntryId,
         ...(paymentMethod === "trade_in"

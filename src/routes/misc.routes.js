@@ -214,7 +214,9 @@ router.post("/reservations/:id/cancel", async (req, res, next) => {
       );
 
       let cashResult = null;
-      if (refund && Number(reservation.deposit) > 0) {
+      // ما بقي من العربون بعد ما خُصم في فواتير (deposit_used — migration 044)
+      const depositLeft = Math.max(0, roundMoney(Number(reservation.deposit) - Number(reservation.deposit_used || 0)));
+      if (refund && depositLeft > 0) {
         const { rows: custRows } = await client.query(
           "select name from customers where id = $1", [reservation.customer_id]
         );
@@ -222,7 +224,7 @@ router.post("/reservations/:id/cancel", async (req, res, next) => {
         cashResult = await moveCash(client, {
           branchId: req.auth.branchId, businessDayId, direction: "out",
           sourceId: reservation.method === "network" ? "daily_network" : "daily_cash",
-          amount: Number(reservation.deposit), category: "customer_deposit_refund",
+          amount: depositLeft, category: "customer_deposit_refund",
           note: `إرجاع عربون — ${custRows[0]?.name || ""}`.trim(),
           refTable: "reservations", refId: reservation.id, createdBy: req.auth.userId,
         });
@@ -355,7 +357,13 @@ router.post(
         // unit_id لكل قطعة) — فالإرجاع يُعيد أي N وحدة مباعة من نفس
         // الصنف لغير مباعة، لا وحدة بعينها. القيد نفسه (المبلغ/الوزن)
         // صحيح تمامًا بصرف النظر عن أي وحدة فعليًا أُعيدت.
-        const refund = roundMoney(returnedLines.reduce((a, l) => a + Number(l.unit_price) * Number(l.quantity), 0));
+        // ⚠ المبلغ وضريبته من الفاتورة نفسها (computeReturnAmounts) — كان القيد
+        //   يُحمّل 4190 المبلغ شاملًا الضريبة فلا تُردّ 2220، والردّ على الآجل بلا قيدٍ أصلًا.
+        const amounts = computeReturnAmounts(sale, allLines, returnedLines);
+        const refund = amounts.gross;
+        if (!(refund > 0)) return { error: "zero_amount" };
+        // ⚠ الآجل يُخصم من الدَّين لا يُردّ نقدًا — كمسار المرتجع الكامل
+        if (refundSource !== "credit" && sale.payment_method === "credit") return { error: "credit_sale_requires_credit_refund" };
         // ⚖ الردّ الكبير يُعتمد (قاعدة refund)
         const gateQ = await approvalGate(client, req.auth, {
           kind: "refund", amount: refund, approvalId: body.approvalId || null,
@@ -443,15 +451,24 @@ router.post(
           );
           receiptRec = rcRows[0];
         } else {
-          cashResult = await moveCash(client, {
-            branchId: req.auth.branchId, businessDayId, direction: "out",
-            sourceId: refundSource, amount: refund, category: "sales_return",
-            note: `مرتجع فاتورة ${sale.ref || ""}`.trim(),
-            refTable: "returns", refId: returnRec.id, createdBy: req.auth.userId,
-          });
+          const { pool, method } = CASH_ACCOUNTS[refundSource];
+          cashResult = {
+            cashTx: await insertCashTx(client, {
+              branchId: req.auth.branchId, businessDayId, pool, method, direction: "out",
+              amount: refund, category: "sales_return", refTable: "returns", refId: returnRec.id,
+              note: `مرتجع فاتورة ${sale.ref || ""}`.trim(), createdBy: req.auth.userId,
+            }),
+          };
         }
+        // القيد: مدين 4190 بالصافي و2220 بالضريبة، ودائن الصندوق أو ذمة العميل (1310)
+        const journalEntryId = await postJournalEntry(client, {
+          branchId: req.auth.branchId, businessDayId, opType: "sale_return",
+          refTable: "returns", refId: returnRec.id,
+          description: `مرتجع مبيعات — ${sale.ref || ""}`.trim(), createdBy: req.auth.userId,
+          lines: returnJournalLines(amounts, refundSource === "credit" ? "1310" : CASH_ACCOUNTS[refundSource].account),
+        });
 
-        return { return: returnRec, receipt: receiptRec, cashTx: cashResult?.cashTx || null };
+        return { return: { ...returnRec, journalEntryId }, receipt: receiptRec, cashTx: cashResult?.cashTx || null, amounts: { net: amounts.net, tax: amounts.tax, gross: amounts.gross } };
       });
       if (result.error) {
         const status = result.error === "sale_not_found" ? 404 : 409;

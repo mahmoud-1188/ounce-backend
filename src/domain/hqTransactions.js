@@ -110,7 +110,7 @@ async function openDayId(client, branchId) {
 
 /**
  * طرف الإرسال في تحويل نقدٍ من الإدارة: يخرج من خزنة المصدر نقدًا إلى
- * «نقدٌ في الطريق» (1160) — المرجع: deductFromSource + postJournal("branch_cash_out").
+ * «تحويلات نقدية بين الفروع» (1170) — المرجع: deductFromSource + postJournal("branch_cash_out").
  * يُستدعى داخل withBranch(fromBranchId).
  */
 async function postCashFromHqSend(client, { fromBranchId, txnId, amount, toName, note, actorName }) {
@@ -124,7 +124,7 @@ async function postCashFromHqSend(client, { fromBranchId, txnId, amount, toName,
   await postJournalEntry(client, {
     branchId: fromBranchId, businessDayId: day, opType: "branch_cash_out", refTable: "hq_transactions", refId: txnId,
     description: `${label} — من الإدارة (${actorName})`, createdBy: null,
-    lines: [{ account: "1160", side: "debit", amount }, { account: "1110", side: "credit", amount }],
+    lines: [{ account: "1170", side: "debit", amount }, { account: "1110", side: "credit", amount }],
   });
 }
 
@@ -141,7 +141,7 @@ async function postCashFromHqReceipt(client, { branchId, txn, userId, userName }
   await postJournalEntry(client, {
     branchId, businessDayId: day, opType: "branch_cash_in", refTable: "hq_transactions", refId: txn.id,
     description: `${label}${userName ? ` — استلمه ${userName}` : ""}`, createdBy: userId,
-    lines: [{ account: "1110", side: "debit", amount }, { account: "1160", side: "credit", amount }],
+    lines: [{ account: "1110", side: "debit", amount }, { account: "1170", side: "credit", amount }],
   });
 }
 

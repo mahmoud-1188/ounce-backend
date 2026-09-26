@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { poolBalance } from "../domain/cashPools.js";
 import { withBranch } from "../db.js";
 import { authenticate, requirePage, requireNotDenied, requireManager } from "../middleware/auth.js";
 import { roundMoney } from "../domain/money.js";
@@ -495,6 +496,9 @@ router.post("/taskir-offices/:officeId/settle", requireManager, async (req, res,
         const poolMethod = fundingToPoolMethod(source) || (source === "safe_cash" ? { pool: "safe", method: "cash" } : { pool: "safe", method: "network" });
         const priceAtSettle = Number(body.priceAtSettle) || 0;
         const fine = priceAtSettle > 0 ? roundWeight(amount / priceAtSettle) : 0;
+        // ⚠ سداد المكتب لا يُنزل صندوقه تحت الصفر (المرجع 5.2.0)
+        const available = await poolBalance(client, req.auth.branchId, poolMethod.pool, poolMethod.method);
+        if (amount > available + 0.005) return { error: "insufficient_pool_balance", available, requested: amount };
         await client.query(
           `insert into taskir_office_tx
              (branch_id, office_id, business_day_id, direction, kind, amount, weight, karat,

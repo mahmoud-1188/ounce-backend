@@ -4,6 +4,7 @@ import { authenticate, requireAnyPage, requirePage, requireNotDenied } from "../
 import { roundMoney } from "../domain/money.js";
 import { fineWeight, roundWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
+import { poolBalance } from "../domain/cashPools.js";
 
 const router = Router();
 
@@ -215,6 +216,9 @@ router.post("/purchases", async (req, res, next) => {
       if (paymentMethod === "safe_cash" || paymentMethod === "safe_network") {
         const method = paymentMethod === "safe_cash" ? "cash" : "network";
         const creditAccount = paymentMethod === "safe_cash" ? "1110" : "1120";
+        // ⚠ الشراء لا يُنزل الخزنة تحت الصفر (المرجع 5.2.0 — كان يمرّ بلا سؤال)
+        const available = await poolBalance(client, req.auth.branchId, "safe", method);
+        if (grandTotal > available + 0.005) return { error: "insufficient_safe_balance", method, available, requested: grandTotal };
         await client.query(
           `insert into cash_tx
              (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
@@ -265,6 +269,8 @@ router.post("/purchases", async (req, res, next) => {
           ]
         );
         if (payFeesNow && workmanshipTotalSum > 0) {
+          const safeCash = await poolBalance(client, req.auth.branchId, "safe", "cash");
+          if (workmanshipTotalSum > safeCash + 0.005) return { error: "insufficient_safe_balance", method: "cash", available: safeCash, requested: workmanshipTotalSum };
           await client.query(
             `insert into cash_tx
                (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
@@ -352,6 +358,8 @@ router.post("/purchases", async (req, res, next) => {
         // يتحرك (cash: null في purchase_scrap_pay بـchart.js) — دفتر
         // الوزن وحده يكفي هنا، تمامًا كفلسفة استقلال الدفترين.
         if (workmanshipTotalSum > 0) {
+          const safeCash = await poolBalance(client, req.auth.branchId, "safe", "cash");
+          if (workmanshipTotalSum > safeCash + 0.005) return { error: "insufficient_safe_balance", method: "cash", available: safeCash, requested: workmanshipTotalSum };
           // الأجور تُدفع نقدًا دائمًا في هذا المسار (لا toggle هنا خلافًا
           // للآجل) — ملاحظة chart.js صريحة بهذا.
           await client.query(

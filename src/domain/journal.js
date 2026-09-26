@@ -55,6 +55,19 @@ async function postJournalEntry(
     }
   }
 
+  // ⚠ لا قيد على حسابٍ له فروع (المرجع 5.2.0: isPostingAccount) — 1400 و2300 و2400
+  //   و6700 آباءٌ بلا وسم المجموعة؛ قيدٌ عليها يختفي من كشوف أبنائها ومن القوائم.
+  const codes = [...new Set(filtered.map((l) => l.account))];
+  const { rows: bad } = await client.query(
+    `select a.code from accounts a
+      where a.code = any($1::text[])
+        and (a.is_group or exists (select 1 from accounts c where c.parent_code = a.code))`,
+    [codes]
+  );
+  if (bad.length) {
+    throw new Error(`journal_entry_on_parent_account:${opType}:${bad.map((r) => r.code).join(",")}`);
+  }
+
   const { rows } = await client.query(
     `insert into journal_entries (branch_id, business_day_id, op_type, ref_table, ref_id, description, created_by)
      values ($1, $2, $3, $4, $5, $6, $7) returning id`,
