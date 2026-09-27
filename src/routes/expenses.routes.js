@@ -126,13 +126,14 @@ router.post("/expenses", async (req, res, next) => {
       const { rows: expRows } = await client.query(
         `insert into expenses
            (branch_id, ref, name, name_id, amount, business_day_id, category, note, recurring,
-            funding_source, employee_id, period_month, created_by)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            funding_source, employee_id, period_month, created_by, installments)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
          returning *`,
         [
           req.auth.branchId, ref, name, nameId, amount, businessDayId, category,
           body.note || null, !!body.recurring, fundingSource, isPayroll ? body.employeeId : null,
           isPayroll ? body.periodMonth || null : null, req.auth.userId,
+          category === "advance" ? Math.min(60, Math.max(1, Math.round(Number(body.installments) || 1))) : 1,
         ]
       );
       const expense = expRows[0];

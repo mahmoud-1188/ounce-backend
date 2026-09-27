@@ -90,5 +90,73 @@ router.get("/payroll/runs/:runId/wps", authenticate, requirePage("payroll"), req
   }
 });
 
+/**
+ * سلف الموظفين بالأقساط وتقييم الأداء (migration 060):
+ *   GET  /hr/loans                      — السلف المفتوحة: المبلغ والمسدَّد والقسط والمتبقّي
+ *   GET  /hr/evaluations?period=YYYY-MM
+ *   POST /hr/evaluations { userId, period, score 1..5, criteria:{attendance, sales, conduct, skill}, note }
+ */
+router.get("/hr/loans", authenticate, requirePage("payroll"), async (req, res, next) => {
+  try {
+    const rows = await withBranch(req.auth.branchId, async (c) => (await c.query(
+      `select e.id, e.ref, e.amount, e.installments, e.repaid, e.created_at, e.settled, u.name as employee_name, e.employee_id
+         from expenses e join users u on u.id = e.employee_id
+        where e.branch_id = $1 and e.category = 'advance' and (e.settled = false or e.created_at > now() - interval '120 days')
+        order by e.settled, e.created_at desc limit 300`, [req.auth.branchId])).rows);
+    res.json({
+      loans: rows.map((r) => {
+        const amount = Number(r.amount), repaid = Number(r.repaid), n = Number(r.installments) || 1;
+        const left = Math.round((amount - repaid) * 100) / 100;
+        return {
+          id: r.id, ref: r.ref, employeeId: r.employee_id, employeeName: r.employee_name, amount, repaid, installments: n,
+          installment: n <= 1 ? left : Math.min(left, Math.round((amount / n) * 100) / 100), left, settled: r.settled, createdAt: r.created_at,
+        };
+      }),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const CRIT = ["attendance", "sales", "conduct", "skill"];
+router.get("/hr/evaluations", authenticate, requirePage("payroll"), async (req, res, next) => {
+  const period = /^\d{4}-\d{2}$/.test(String(req.query.period || "")) ? String(req.query.period) : null;
+  try {
+    const rows = await withBranch(req.auth.branchId, async (c) => (await c.query(
+      `select v.*, u.name as employee_name, b.name as by_name from hr_evaluations v join users u on u.id = v.user_id
+         left join users b on b.id = v.created_by
+        where v.branch_id = $1 and ($2::text is null or v.period = $2) order by v.period desc, u.name limit 500`,
+      [req.auth.branchId, period])).rows);
+    res.json({ evaluations: rows.map((v) => ({ id: v.id, userId: v.user_id, employeeName: v.employee_name, period: v.period, score: v.score, criteria: v.criteria || {}, note: v.note || "", by: v.by_name || "", createdAt: v.created_at })) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/hr/evaluations", authenticate, requirePage("payroll"), requireManager, async (req, res, next) => {
+  const b = req.body || {};
+  const score = Math.round(Number(b.score));
+  if (!b.userId) return res.status(400).json({ error: "employee_required" });
+  if (!/^\d{4}-\d{2}$/.test(String(b.period || ""))) return res.status(400).json({ error: "invalid_period" });
+  if (!(score >= 1 && score <= 5)) return res.status(400).json({ error: "invalid_score" });
+  const criteria = {};
+  for (const k of CRIT) { const v = Math.round(Number(b.criteria?.[k])); if (v >= 1 && v <= 5) criteria[k] = v; }
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows: u } = await c.query("select id from users where id = $1 and branch_id = $2", [b.userId, req.auth.branchId]);
+      if (!u[0]) return { error: "employee_not_found" };
+      const { rows } = await c.query(
+        `insert into hr_evaluations (branch_id, user_id, period, score, criteria, note, created_by) values ($1,$2,$3,$4,$5,$6,$7)
+         on conflict (branch_id, user_id, period) do update set score = excluded.score, criteria = excluded.criteria, note = excluded.note, created_by = excluded.created_by, created_at = now()
+         returning id`, [req.auth.branchId, b.userId, b.period, score, JSON.stringify(criteria), String(b.note || "").slice(0, 500) || null, req.auth.userId]);
+      return { id: rows[0].id };
+    });
+    if (out.error) return res.status(400).json(out);
+    res.json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
 export { hrDocAlerts };
 export default router;

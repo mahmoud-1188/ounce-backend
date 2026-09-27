@@ -332,10 +332,16 @@ async function buildPayrollSlips(client, branchId, period) {
   const gosiByNationality = Object.fromEntries(gosiRates.map((r) => [r.nationality, r]));
 
   const { rows: openAdvances } = await client.query(
-    `select id, employee_id, amount from expenses
+    `select id, employee_id, amount, installments, repaid from expenses
       where branch_id = $1 and category = 'advance' and settled = false`,
     [branchId]
   );
+  // ⚠ السلفة المقسّطة (migration 060): يُخصم قسطٌ واحد كل مسيّر — والقسط الأخير يُكمل الباقي بلا كسور
+  const advanceDue = (a) => {
+    const left = roundMoney(Number(a.amount) - Number(a.repaid || 0));
+    const n = Number(a.installments) || 1;
+    return n <= 1 ? left : Math.min(left, roundMoney(Number(a.amount) / n));
+  };
 
   const { rows: attendanceRows } = await client.query(
     `select user_id, count(*)::int as absent_days from attendance
@@ -392,9 +398,10 @@ async function buildPayrollSlips(client, branchId, period) {
     const gosiEmployee = roundMoney(gosiSubject * Number(rates.employee_pct));
     const gosiEmployer = roundMoney(gosiSubject * Number(rates.employer_pct));
 
-    const advances = roundMoney(
-      openAdvances.filter((a) => a.employee_id === emp.id).reduce((s, a) => s + Number(a.amount), 0)
-    );
+    const advanceParts = openAdvances.filter((a) => a.employee_id === emp.id)
+      .map((a) => ({ id: a.id, amount: advanceDue(a), left: roundMoney(Number(a.amount) - Number(a.repaid || 0)) }))
+      .filter((p) => p.amount > 0);
+    const advances = roundMoney(advanceParts.reduce((s, p) => s + p.amount, 0));
     const absentDays = absentByUser[emp.id] || 0;
     const unpaidLeaveDays = unpaidLeaveByUser[emp.id] || 0;
     const dayRate = roundMoney(gross / 30);
@@ -423,7 +430,8 @@ async function buildPayrollSlips(client, branchId, period) {
       basic, housing, transport, other, gross, commission,
       gosiEmployee, gosiEmployer, advances, absentDays, unpaidLeaveDays, absenceDeduction,
       deductions, net, eosAccrual, employerCost,
-      advanceIds: openAdvances.filter((a) => a.employee_id === emp.id).map((a) => a.id),
+      advanceIds: advanceParts.map((p) => p.id),
+      advanceParts,
     };
   });
 }
@@ -545,11 +553,14 @@ router.post("/payroll/runs", requireManager, async (req, res, next) => {
 
       // ⚠ السلف المستردّة تُوسَم كي لا تُخصم ثانيةً الشهر القادم — يطابق
       // تعليق handleAccruePayroll المرجعي حرفيًا.
-      const settledIds = slips.flatMap((s) => s.advanceIds);
-      if (settledIds.length) {
+      //   المقسّطة تُزاد بقسطها وتُوسَم مسدّدة حين يكتمل المبلغ.
+      for (const p of slips.flatMap((s) => s.advanceParts || [])) {
         await client.query(
-          `update expenses set settled = true, settled_period = $1 where id = any($2::uuid[])`,
-          [period, settledIds]
+          `update expenses set repaid = repaid + $2::numeric,
+                  settled = (repaid + $2::numeric >= amount - 0.005),
+                  settled_period = case when repaid + $2::numeric >= amount - 0.005 then $1 else settled_period end
+            where id = $3`,
+          [period, p.amount, p.id]
         );
       }
 
