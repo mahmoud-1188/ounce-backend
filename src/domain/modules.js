@@ -11,6 +11,9 @@ const MODULES = {
   zatca: { label: "رمز QR الضريبي على الفاتورة", cfg: {} },
   thermalReceipt: { label: "إيصال حراري 80مم", cfg: {} },
   bilingualInvoice: { label: "فاتورة بلغتين", cfg: {} },
+  customOrders: { label: "الطلبات الخاصة والتصنيع", cfg: {} },
+  purchaseOrders: { label: "أوامر الشراء", cfg: {} },
+  aml: { label: "مكافحة غسل الأموال — هوية العميل", cfg: { cashThreshold: 50000 } },
   gemstones: { label: "الألماس والأحجار الكريمة", cfg: {} },
   watches: { label: "الساعات", cfg: { warrantyMonths: 24 } },
 };
@@ -37,6 +40,7 @@ function sanitizeModules(input = {}) {
       }
       cfg.mins = mins;
     }
+    if (id === "aml") cfg.cashThreshold = Math.max(0, Number(cfg.cashThreshold) || 0);
     if (id === "loyalty") {
       cfg.sarPerPoint = Math.max(1, Number(cfg.sarPerPoint) || 100);
       cfg.pointValue = Math.max(0, Number(cfg.pointValue) || 0);

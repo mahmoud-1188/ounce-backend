@@ -45,7 +45,7 @@ router.get("/hr/staff", async (req, res, next) => {
       const { rows } = await client.query(
         `select u.id, u.name, u.ref, u.role, u.active, u.basic_salary, u.housing,
                 u.transport, u.other_allowance, u.nationality, u.hire_date,
-                u.left_at, u.leave_reason, u.eos_paid,
+                u.left_at, u.leave_reason, u.eos_paid, u.hr_profile,
                 c.basis as commission_basis, c.rate as commission_rate,
                 c.target as commission_target, c.per_invoice as commission_per_invoice
            from users u

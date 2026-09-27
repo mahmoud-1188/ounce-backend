@@ -28,7 +28,7 @@ const BRANCH_SCREENS = [
   ["priceFix", "التثبيت ذهب ↔ نقد"], ["generalLedger", "الأستاذ العام"], ["masterReport", "التقارير الموحّدة"], ["anyStatement", "كشف حساب — أي شيء"],
   ["fullStatements", "القوائم المالية الكاملة"], ["exchange", "التبادل مع الأنظمة"], ["customerReport", "تقرير العملاء"], ["docCycle", "الدورة المستندية"],
   ["reportsHub", "مركز التقارير"], ["accountantReview", "المراجعة المحاسبية"], ["approvals", "الاعتمادات"], ["documents", "الأرشيف"],
-  ["bankFees", "تسوية عمولات البنك"], ["pieceInquiry", "استعلام القطع"], ["combinedBook", "الدفتر الثالث"], ["ifrs", "المعايير الدولية"], ["modules", "الوحدات الاختيارية"], ["reorder", "حدود إعادة الطلب"], ["branchTransfers", "التحويل بين الفروع"], ["giftCards", "بطاقات الهدايا والولاء"], ["showcase", "الاستعراض للزبون"], ["dashboard", "لوحة التحكم"], ["aiAccountant", "المساعد المحاسبي"],
+  ["bankFees", "تسوية عمولات البنك"], ["pieceInquiry", "استعلام القطع"], ["combinedBook", "الدفتر الثالث"], ["ifrs", "المعايير الدولية"], ["modules", "الوحدات الاختيارية"], ["reorder", "حدود إعادة الطلب"], ["branchTransfers", "التحويل بين الفروع"], ["giftCards", "بطاقات الهدايا والولاء"], ["amlRegister", "سجلّ مكافحة غسل الأموال"], ["purchaseOrders", "أوامر الشراء"], ["customOrders", "الطلبات الخاصة"], ["showcase", "الاستعراض للزبون"], ["dashboard", "لوحة التحكم"], ["aiAccountant", "المساعد المحاسبي"],
 ].map(([id, label]) => ({ id, label }));
 
 // ⚠ العمليات المفروضة فعلًا في معالجات الخادم فقط — منعٌ لا يُفرض كذبة

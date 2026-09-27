@@ -9,6 +9,7 @@ import { buildServerReviewQueue } from "../domain/reviewQueueServer.js";
 import { postManualAdjustment, reverseJournalEntry } from "../domain/journalOps.js";
 import { ACTION_GROUPS, BRANCH_SCREENS, HQ_ACTIONS, sanitizePolicy } from "../domain/hqPolicy.js";
 import { loadProvision, saveProvision } from "../domain/branchProvision.js";
+import { hrDocAlerts } from "./hrProfile.routes.js";
 
 const router = Router();
 
@@ -118,9 +119,11 @@ router.get("/store/alerts", async (req, res, next) => {
             from approvals a left join approval_rules r on r.id = a.rule_id
            where a.branch_id = $1 and a.status = 'approved' and a.executed_at is null and a.decided_at < now() - interval '2 hours'
            order by a.decided_at`);
-        return { wrapped: { last, stale, neg, aps, ar, mtd, dead, bal, negGold, idle } };
+        const hrDocs = (await hrDocAlerts(c, b.id, 30)).filter((a) => a.daysLeft <= 30);
+        return { wrapped: { last, stale, neg, aps, ar, mtd, dead, bal, negGold, idle, hrDocs } };
       });
-      const { last, stale, neg, aps, ar, mtd, dead, bal, negGold, idle } = r.wrapped;
+      const { last, stale, neg, aps, ar, mtd, dead, bal, negGold, idle, hrDocs } = r.wrapped;
+      hrDocs.forEach((a) => push(a.daysLeft < 0 ? "warn" : "info", "hr_doc", `${a.doc} ${a.name} ${a.daysLeft < 0 ? `انتهت منذ ${-a.daysLeft} يومًا` : `تنتهي خلال ${a.daysLeft} يومًا`} (${a.date})`, "ops"));
       if (Math.abs(Number(bal.diff)) >= 0.01) push("block", "unbalanced_book", `دفتره غير متوازن بفرق ${roundMoney(bal.diff)}`, "books");
       negGold.forEach((g) => push("block", "negative_gold", `ذهبٌ سالب في ${g.name || g.code}: ${roundWeight(g.fine)} جم 24`, "books"));
       idle.forEach((a) => {

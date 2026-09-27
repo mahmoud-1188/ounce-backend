@@ -4,7 +4,7 @@ import { withBranch } from "../db.js";
 import { postJournalEntry } from "../domain/journal.js";
 import { getOpenBusinessDay } from "../domain/saleOps.js";
 import { roundMoney } from "../domain/money.js";
-import { ACCOUNTANT_AI_SYSTEM, ACCOUNTANT_AI_TOOLS, runAccountantTool, shapeProposal } from "../domain/accountantTools.js";
+import { ACCOUNTANT_AI_SYSTEM, ACCOUNTANT_AI_TOOLS, maskPII, runAccountantTool, shapeProposal } from "../domain/accountantTools.js";
 
 const router = Router();
 
@@ -134,6 +134,7 @@ router.post("/ai/accountant", authenticate, requirePage("aiAccountant"), async (
   const question = convo[convo.length - 1].content;
   const trace = [];
   const drafts = [];
+  let clarify = null, openScreen = null;
   try {
     for (let round = 0; round < 6; round++) {
       const reply = await callModel({ apiKey, messages: convo, system: ACCOUNTANT_AI_SYSTEM, tools: ACCOUNTANT_AI_TOOLS });
@@ -141,7 +142,7 @@ router.post("/ai/accountant", authenticate, requirePage("aiAccountant"), async (
       convo.push({ role: "assistant", content });
       const uses = content.filter((b) => b.type === "tool_use");
       if (reply.stop_reason !== "tool_use" || !uses.length) {
-        return res.json({ text: content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim(), trace, drafts });
+        return res.json({ text: content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim(), trace, drafts, clarify, open: openScreen });
       }
       const results = [];
       for (const u of uses) {
@@ -163,7 +164,9 @@ router.post("/ai/accountant", authenticate, requirePage("aiAccountant"), async (
         }
         trace.push({ name: u.name, input: u.input || {}, ok: !out?.error });
         if (u.name === "propose_journal_entry" && out?.draft) drafts.push(out.draft);
-        results.push({ type: "tool_result", tool_use_id: u.id, content: JSON.stringify(out).slice(0, 12000) });
+        if (out?.clarify) clarify = out.clarify;
+        if (out?.open) openScreen = out.open;
+        results.push({ type: "tool_result", tool_use_id: u.id, content: JSON.stringify(maskPII(out)).slice(0, 12000) });
       }
       convo.push({ role: "user", content: results });
     }

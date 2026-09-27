@@ -35,6 +35,13 @@ const ACCOUNTANT_AI_SYSTEM = `أنت «المساعد المحاسبي» داخ�
 
 صلاحياتك: القراءة والاستعلام والتحليل والمراجعة والتوصية فقط. لا ترحّل، لا تعدّل، لا تحذف. إن احتاج الأمر قيدًا فاستعمل أداة «اقتراح قيد» التي تُنشئ مسودّةً يعتمدها المحاسب بنفسه — وقل له صراحةً إنها مسودّة تنتظر اعتماده.
 
+الأدوات الإضافية:
+- «لماذا تغيّرت المبيعات/الربح؟» أو «قارن بالشهر الماضي» ← variance_analysis. ابدأ بفرق المبيعات ثم جسر الحجم والسعر (مجموعهما = الفرق — لا تحسبه بنفسك)، ثم مزيج العيارات، ثم بنود الدخل.
+- «هل الدفاتر مطابقة؟» ← control_recon. قل كم مطابقًا وكم فرقًا، ثم لكل فرق سببه وإجراءه كما في النتيجة — لا تخترع سببًا.
+- كل جمعٍ أو نسبةٍ تعرضها ← calculate.
+- سؤالٌ غامض فعلًا ← ask_clarification وحدها بخياراتٍ من 2 إلى 4. «افتح/ودّني» شاشة ← open_screen ثم جملةٌ قصيرة.
+- البيانات الشخصية (الهويات والجوالات والآيبان) مقنَّعةٌ عمدًا — لا تطلب كشفها.
+
 الأسلوب: جوابٌ مباشر ثم التفصيل. جداول قصيرة حين تفيد. لا مقدّمات ولا اعتذارات. حين تجد خللًا (قيد مختلّ، رصيد سالب، فاتورة بلا قيد، اعتماد معلّق) قله أوّلًا وباسم المستند ورقمه.`;
 
 const period = { from: { type: "string", description: "YYYY-MM-DD" }, to: { type: "string", description: "YYYY-MM-DD" } };
@@ -50,6 +57,11 @@ const ACCOUNTANT_AI_TOOLS = [
   { name: "review_queue", description: "ما يحتاج نظر المحاسب: مستندات بلا قيد، أرصدة نقد سالبة، اعتمادات معلّقة، يوم مفتوح من يوم سابق، شراء آجل بلا فاتورة", input_schema: { type: "object", properties: {} } },
   { name: "search_journal", description: "بحث في اليومية بنصٍّ أو مرجع", input_schema: { type: "object", properties: { text: { type: "string" }, limit: { type: "integer" } }, required: ["text"] } },
   { name: "supplier_statement", description: "كشف حساب مورد (ذهبٌ صافٍ بالجرام وأجورٌ بالعملة) للمدّة برصيدٍ جارٍ", input_schema: { type: "object", properties: { name: { type: "string" }, ...period }, required: ["name"] } },
+  { name: "calculate", description: "حسابٌ دقيق بالهللة: add · subtract · multiply · divide · percent (a من b ٪) · change (نسبة التغيّر من a إلى b). كل جمعٍ أو فرقٍ أو نسبةٍ تعرضها تمرّ بها", input_schema: { type: "object", properties: { operation: { type: "string", enum: ["add", "subtract", "multiply", "divide", "percent", "change"] }, values: { type: "array", items: { type: "number" } } }, required: ["operation", "values"] } },
+  { name: "variance_analysis", description: "لماذا تغيّرت المبيعات أو الربح بين مدّتين؟ يفكّك فرق المبيعات إلى أثر الحجم (جرامات) والسعر (ريال/جرام) ومزيج العيارات، ويقارن بنود قائمة الدخل. compare_from/compare_to اختياريان (الافتراضي: المدّة نفسها قبلها)", input_schema: { type: "object", properties: { ...period, compare_from: { type: "string" }, compare_to: { type: "string" } } } },
+  { name: "control_recon", description: "مطابقة الدفتر بسجلّه الفرعيّ الآن: كل حسابٍ نقديّ (1110–1150) ↔ رصيد صندوقه في حركات النقد، والمخزون المشغول بالجرام (دفتر الوزن 1210) ↔ القطع المكوّدة المتاحة. كل فرقٍ بسببه المرجّح وإجرائه — تشخيصٌ لا ترحيل", input_schema: { type: "object", properties: { area: { type: "string", enum: ["all", "inventory", "cash"] } } } },
+  { name: "ask_clarification", description: "سؤالٌ توضيحيّ واحد حين يكون السؤال غامضًا فعلًا — بخياراتٍ من 2 إلى 4 يضغط المستخدم أحدها. لا تستدعِ معه أداةً أخرى", input_schema: { type: "object", properties: { question: { type: "string" }, options: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 4 } }, required: ["question", "options"] } },
+  { name: "open_screen", description: "افتح للمستخدم شاشةً في البرنامج («افتح/ودّني») — screen: generalLedger · trialBalance · journal · fullStatements · supplierLedger · salesHistory · cash · inventory · reportsHub · accountantReview", input_schema: { type: "object", properties: { screen: { type: "string" } }, required: ["screen"] } },
   { name: "propose_journal_entry", description: "اقتراح قيد تسوية كمسودّة يعتمدها المحاسب بنفسه — لا يُرحَّل شيء", input_schema: { type: "object", properties: { lines: { type: "array", items: { type: "object", properties: { account: { type: "string" }, debit: { type: "number" }, credit: { type: "number" } }, required: ["account"] } }, note: { type: "string" } }, required: ["lines", "note"] } },
 ];
 
@@ -104,6 +116,8 @@ function incomeFrom(balRows, accts) {
 
 async function runAccountantTool(client, branchId, name, input = {}, ctx = {}) {
   const { from, to } = rangeOf(input);
+  const accMap = name === "control_recon" ? await accountsMap(client) : null;
+  const accts0 = (code) => accMap?.get(code)?.name || code;
   if (name === "trial_balance") {
     const accts = await accountsMap(client);
     const rows = (await balances(client, branchId, from, to))
@@ -246,6 +260,102 @@ async function runAccountantTool(client, branchId, name, input = {}, ctx = {}) {
     return { supplier: sup.name, from, to, opening: { gram24: og, fees: of }, closing: { gram24: g, fees: f }, rows: cap(out, 60),
       note: "الموجب = التزامٌ علينا للمورد (ذهبٌ صافٍ بالجرام وأجورٌ بالعملة)" };
   }
+  if (name === "calculate") {
+    const v = (Array.isArray(input.values) ? input.values : []).map(Number).filter(Number.isFinite);
+    const op = input.operation;
+    const H = (x) => Math.round(x * 100);
+    let result = null;
+    if (op === "add") result = v.reduce((a, x) => a + H(x), 0) / 100;
+    else if (op === "subtract" && v.length) result = v.slice(1).reduce((a, x) => a - H(x), H(v[0])) / 100;
+    else if (op === "multiply" && v.length) result = n2(v.reduce((a, x) => a * x, 1));
+    else if (op === "divide" && v.length === 2 && v[1] !== 0) result = Math.round((v[0] / v[1]) * 10000) / 10000;
+    else if (op === "percent" && v.length === 2 && v[1] !== 0) result = Math.round((v[0] / v[1]) * 10000) / 100;
+    else if (op === "change" && v.length === 2 && v[0] !== 0) result = Math.round(((v[1] - v[0]) / Math.abs(v[0])) * 10000) / 100;
+    return result == null ? { error: "عمليةٌ غير صالحة أو قسمةٌ على صفر" } : { operation: op, values: v, result };
+  }
+  if (name === "variance_analysis") {
+    const days = Math.max(1, Math.round((new Date(to) - new Date(from)) / 86400000) + 1);
+    const shift = (d, n) => { const x = new Date(d); x.setDate(x.getDate() - n); return x.toISOString().slice(0, 10); };
+    const cf = isDate(input.compare_from) ? input.compare_from : shift(from, days);
+    const ct = isDate(input.compare_to) ? input.compare_to : shift(to, days);
+    const salesBy = async (a, b) => (await client.query(
+      `select sl.karat, coalesce(sum(sl.weight_snapshot * sl.quantity), 0)::float8 as grams, coalesce(sum(sl.unit_price * sl.quantity), 0)::float8 as amount
+         from sale_lines sl join sales s on s.id = sl.sale_id
+        where s.branch_id = $1 and s.date >= $2::date and s.date < ($3::date + 1) group by 1`, [branchId, a, b])).rows;
+    const cur = await salesBy(from, to), prev = await salesBy(cf, ct);
+    const tot = (rows) => ({ grams: roundWeight(rows.reduce((x, r) => x + r.grams, 0)), amount: n2(rows.reduce((x, r) => x + r.amount, 0)) });
+    const A = tot(cur), B = tot(prev);
+    const pA = A.grams > 0 ? A.amount / A.grams : 0, pB = B.grams > 0 ? B.amount / B.grams : 0;
+    // جسر المبيعات: أثر الحجم بسعر المقارن + أثر السعر بحجم الحالي — ومجموعهما = الفرق
+    const volume = n2((A.grams - B.grams) * pB), price = n2(A.amount - B.amount - volume);
+    const mix = [...new Set([...cur, ...prev].map((r) => r.karat))].map((k) => {
+      const a = cur.find((r) => r.karat === k) || { grams: 0, amount: 0 }, b = prev.find((r) => r.karat === k) || { grams: 0, amount: 0 };
+      return { karat: k, grams: roundWeight(a.grams), gramsCompare: roundWeight(b.grams), share: A.grams ? Math.round((a.grams / A.grams) * 1000) / 10 : 0, shareCompare: B.grams ? Math.round((b.grams / B.grams) * 1000) / 10 : 0 };
+    });
+    const accts = await accountsMap(client);
+    const iA = incomeFrom(await balances(client, branchId, from, to), accts), iB = incomeFrom(await balances(client, branchId, cf, ct), accts);
+    const line = (k, label) => ({ item: label, current: iA[k], compare: iB[k], change: n2(iA[k] - iB[k]) });
+    return {
+      period: { from, to }, compare: { from: cf, to: ct },
+      sales: { current: A, compare: B, change: n2(A.amount - B.amount), pricePerGram: { current: n2(pA), compare: n2(pB) }, bridge: { volume, price, check: n2(volume + price) }, mix },
+      income: [line("netRevenue", "صافي الإيراد"), line("cogs", "تكلفة المبيعات"), line("grossProfit", "مجمل الربح"), line("opexTotal", "المصروفات"), line("netProfit", "صافي الربح")],
+      note: "الحجم بسعر المقارن + السعر بحجم الحالي = فرق المبيعات بالضبط",
+    };
+  }
+  if (name === "control_recon") {
+    const area = input.area || "all";
+    const out = { cash: [], inventory: [] };
+    if (area !== "inventory") {
+      const MAP = { 1110: ["safe", "cash"], 1120: ["safe", "network"], 1130: ["daily", "cash"], 1140: ["daily", "network"], 1150: ["custody", null] };
+      for (const [code, [pool, method]] of Object.entries(MAP)) {
+        const { rows: [j] } = await client.query(
+          `select coalesce(sum(case when l.side = 'debit' then l.amount else -l.amount end), 0)::float8 as v
+             from journal_lines l join journal_entries e on e.id = l.entry_id where e.branch_id = $1 and l.account_code = $2`, [branchId, code]);
+        const { rows: [c] } = await client.query(
+          `select coalesce(sum(case when direction = 'in' then amount else -amount end), 0)::float8 as v
+             from cash_tx where branch_id = $1 and pool = $2 and ($3::text is null or method = $3)`, [branchId, pool, method]);
+        const diff = n2(j.v - c.v);
+        let refs = [];
+        if (Math.abs(diff) >= 0.01) {
+          const { rows: un } = await client.query(
+            `select t.ref_table, t.ref_id::text, t.category, t.amount::float8, t.direction, t.created_at from cash_tx t
+              where t.branch_id = $1 and t.pool = $2 and ($3::text is null or t.method = $3)
+                and not exists (select 1 from journal_entries e where e.branch_id = $1 and e.ref_id = t.ref_id)
+              order by t.created_at desc limit 5`, [branchId, pool, method]);
+          refs = un.map((u) => ({ source: u.ref_table || u.category, amount: n2(u.amount), direction: u.direction, at: u.created_at.toISOString().slice(0, 10) }));
+        }
+        out.cash.push({ account: code, name: accts0(code), ledger: n2(j.v), subledger: n2(c.v), difference: diff, ok: Math.abs(diff) < 0.01,
+          root_cause: Math.abs(diff) < 0.01 ? null : refs.length ? "missing_post — حركات صندوقٍ بلا قيد" : "unknown — قيدٌ يدويّ أو رصيدٌ افتتاحيّ",
+          action: Math.abs(diff) < 0.01 ? null : refs.length ? "raise-ticket" : "adjust", refs });
+      }
+    }
+    if (area !== "cash") {
+      const { rows: led } = await client.query(
+        `select karat, coalesce(sum(case when to_account = '1210' then weight else 0 end) - sum(case when from_account = '1210' then weight else 0 end), 0)::float8 as w
+           from gold_ledger_entries where branch_id = $1 and ('1210' in (to_account, from_account)) group by karat`, [branchId]);
+      const { rows: units } = await client.query(
+        `select i.karat, coalesce(sum(i.weight), 0)::float8 as w from item_units u join items i on i.id = u.item_id
+          where i.branch_id = $1 and not u.sold and not u.issued group by i.karat`, [branchId]);
+      for (const k of [...new Set([...led, ...units].map((r) => r.karat))]) {
+        const a = roundWeight(led.find((r) => r.karat === k)?.w || 0), b = roundWeight(units.find((r) => r.karat === k)?.w || 0);
+        const diff = roundWeight(a - b);
+        out.inventory.push({ karat: k, ledgerGrams: a, codedGrams: b, difference: diff, ok: Math.abs(diff) < 0.001,
+          root_cause: Math.abs(diff) < 0.001 ? null : diff > 0 ? "timing — وزنٌ دخل الدفتر ولم يُكوَّد بعد (دفعة مفتوحة) أو خرج بلا حركة وزن" : "missing_post — قطعٌ مكوّدة بلا حركة وزنٍ مقابلة (أرصدة قديمة)",
+          action: Math.abs(diff) < 0.001 ? null : "monitor" });
+      }
+    }
+    const all = [...out.cash, ...out.inventory];
+    return { ...out, matched: all.filter((x) => x.ok).length, differences: all.filter((x) => !x.ok).length, note: "تشخيصٌ لا ترحيل — التسوية مسودّة propose_journal_entry بطلب المستخدم" };
+  }
+  if (name === "ask_clarification") {
+    const options = (Array.isArray(input.options) ? input.options : []).map((o) => String(o).slice(0, 80)).slice(0, 4);
+    return { clarify: { question: String(input.question || "").slice(0, 200), options } };
+  }
+  if (name === "open_screen") {
+    const ALLOWED = ["generalLedger", "trialBalance", "journal", "fullStatements", "supplierLedger", "salesHistory", "cash", "inventory", "reportsHub", "accountantReview", "financials", "combinedBook", "ifrs"];
+    const screen = String(input.screen || "");
+    return ALLOWED.includes(screen) ? { open: { screen } } : { error: "شاشةٌ غير معروفة", allowed: ALLOWED };
+  }
   if (name === "propose_journal_entry") {
     const accts = await accountsMap(client);
     const lines = (Array.isArray(input.lines) ? input.lines : []).map((l) => ({ account: String(l.account || ""), debit: n2(l.debit), credit: n2(l.credit) }))
@@ -274,4 +384,18 @@ function shapeProposal(p) {
   };
 }
 
-export { ACCOUNTANT_AI_SYSTEM, ACCOUNTANT_AI_TOOLS, runAccountantTool, shapeProposal, incomeFrom };
+/// إخفاء البيانات الشخصية قبل أن تغادر إلى مزوّد الذكاء (المرجع 5.2.0: redactForExport):
+/// أرقام الهوية والجوال والآيبان والبريد تُقنَّع — الأسماء والمبالغ تبقى لأن السؤال عنها
+function maskPII(obj) {
+  const mask = (s) => String(s)
+    .replace(/SA\d{22}/gi, (m) => `SA••••${m.slice(-4)}`)
+    .replace(/[\w.+-]+@[\w-]+\.[\w.]+/g, "•••@•••")
+    .replace(/(?<![\d.])(?:\+?966|0)?5\d{8}(?![\d.])/g, (m) => `05••••${m.slice(-3)}`)
+    .replace(/(?<![\d.])[12]\d{9}(?![\d.])/g, (m) => `${m[0]}•••••${m.slice(-3)}`);
+  if (typeof obj === "string") return mask(obj);
+  if (Array.isArray(obj)) return obj.map(maskPII);
+  if (obj && typeof obj === "object") return Object.fromEntries(Object.entries(obj).map(([k, v]) => [k, maskPII(v)]));
+  return obj;
+}
+
+export { ACCOUNTANT_AI_SYSTEM, ACCOUNTANT_AI_TOOLS, runAccountantTool, shapeProposal, incomeFrom, maskPII };

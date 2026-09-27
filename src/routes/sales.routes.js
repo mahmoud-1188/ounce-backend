@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { loadModules, modCfg, modOn } from "../domain/modules.js";
 import { PURITY } from "../domain/weight.js";
+import { validIdNumber } from "./customers.routes.js";
 import { withBranch } from "../db.js";
 import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.js";
 import { extractInclusiveTax } from "../domain/money.js";
@@ -190,7 +191,17 @@ router.post("/sales", async (req, res, next) => {
         giftApplied = Math.round(Math.min(Number(body.giftAmount), Number(giftCard.balance), total - depositApplied) * 100) / 100;
         if (!(giftApplied > 0)) return { error: "gift_card_empty" };
       }
-      const prepaid = Math.round((depositApplied + giftApplied) * 100) / 100;
+      // ── طلبٌ خاص (وحدة customOrders — migration 059): تسليمه بهذه الفاتورة، وعربونه يُخصم منها (2210) ──
+      let customOrder = null, orderDeposit = 0;
+      if (body.customOrderId) {
+        const { rows: co } = await client.query("select * from custom_orders where id = $1 and branch_id = $2 for update", [body.customOrderId, req.auth.branchId]);
+        customOrder = co[0];
+        if (!customOrder || ["delivered", "cancelled"].includes(customOrder.stage)) return { error: "custom_order_not_open" };
+        if (customerId && customOrder.customer_id !== customerId) return { error: "custom_order_other_customer" };
+        const leftDep = Math.round((Number(customOrder.deposit) - Number(customOrder.deposit_used)) * 100) / 100;
+        orderDeposit = Math.round(Math.min(leftDep, total - depositApplied - giftApplied) * 100) / 100;
+      }
+      const prepaid = Math.round((depositApplied + giftApplied + orderDeposit) * 100) / 100;
       // ما يدفعه العميل الآن = الإجمالي − العربون المقبوض سلفًا − رصيد البطاقة
       const payable = Math.round((total - prepaid) * 100) / 100;
       if (paymentMethod === "split" && prepaid > 0) {
@@ -198,6 +209,25 @@ router.post("/sales", async (req, res, next) => {
         const fromCash = Math.min(cashPart, prepaid);
         cashPart = Math.round((cashPart - fromCash) * 100) / 100;
         networkPart = Math.round((networkPart - (prepaid - fromCash)) * 100) / 100;
+      }
+
+      // ⚖ مكافحة غسل الأموال (وحدة aml): دفعٌ نقدي يبلغ الحدّ يحتاج عميلًا بهويته، أو اسم المشتري وهويته
+      let kyc = null;
+      {
+        const mods = await loadModules(client, req.auth.branchId);
+        const th = Number(modCfg(mods, "aml").cashThreshold) || 0;
+        const cashDue = paymentMethod === "cash" ? payable : paymentMethod === "split" ? cashPart : 0;
+        if (modOn(mods, "aml") && th > 0 && cashDue >= th) {
+          let idNo = String(body.kycIdNumber || "").trim().toUpperCase(), who = String(body.kycName || "").trim();
+          if (customerId) {
+            const { rows: cr } = await client.query("select name, id_number from customers where id = $1 and branch_id = $2", [customerId, req.auth.branchId]);
+            if (cr[0]?.id_number) { idNo = cr[0].id_number; who = cr[0].name; }
+            else if (!who && cr[0]) who = cr[0].name;
+          }
+          if (!validIdNumber(idNo) || !who) return { error: "aml_id_required", threshold: th, cash: cashDue };
+          kyc = { idNumber: idNo, name: who, cash: cashDue, at: new Date().toISOString() };
+          if (customerId && body.kycIdNumber) await client.query("update customers set id_number = coalesce(id_number, $2) where id = $1", [customerId, idNo]);
+        }
       }
 
       if (paymentMethod === "split") {
@@ -380,6 +410,7 @@ router.post("/sales", async (req, res, next) => {
       // العربون المقبوض سلفًا يُطفئ 2210 بدل أن يُقبض مرّةً ثانية
       if (depositApplied > 0) debitLines.push({ account: "2210", side: "debit", amount: depositApplied });
       if (giftApplied > 0) debitLines.push({ account: "2260", side: "debit", amount: giftApplied });
+      if (orderDeposit > 0) debitLines.push({ account: "2210", side: "debit", amount: orderDeposit });
       if (paymentMethod === "cash") {
         if (payable > 0) debitLines.push({ account: "1130", side: "debit", amount: payable });
       } else if (paymentMethod === "card") {
@@ -418,6 +449,13 @@ router.post("/sales", async (req, res, next) => {
         await client.query("update sales set reservation_id = $1, deposit_applied = $2 where id = $3", [rsvUse[0].r.id, depositApplied, sale.id]);
       }
 
+      if (kyc) await client.query("update sales set kyc = $1 where id = $2", [JSON.stringify(kyc), sale.id]);
+      if (customOrder) {
+        await client.query(
+          `update custom_orders set stage = 'delivered', sale_id = $2, deposit_used = deposit_used + $3, stage_log = stage_log || $4::jsonb where id = $1`,
+          [customOrder.id, sale.id, orderDeposit, JSON.stringify([{ stage: "delivered", at: new Date().toISOString(), by: req.auth.user?.name || "", sale: sale.ref }])]);
+        await client.query("update sales set custom_order_id = $1, deposit_applied = deposit_applied + $2 where id = $3", [customOrder.id, orderDeposit, sale.id]);
+      }
       if (giftCard) {
         const left = Math.round((Number(giftCard.balance) - giftApplied) * 100) / 100;
         await client.query("update gift_cards set balance = $2::numeric, status = case when $2::numeric <= 0 then 'used' else status end where id = $1", [giftCard.id, left]);
@@ -478,7 +516,7 @@ router.post("/sales", async (req, res, next) => {
       );
 
       return {
-        sale: { id: sale.id, ref: sale.ref, total, taxAmount, netAmount, paymentMethod, depositApplied, giftApplied, payable, pointsEarned },
+        sale: { id: sale.id, ref: sale.ref, total, taxAmount, netAmount, paymentMethod, depositApplied: Math.round((depositApplied + orderDeposit) * 100) / 100, giftApplied, payable, pointsEarned },
         journalEntryId,
         feeJournalEntryId,
         ...(paymentMethod === "trade_in"
