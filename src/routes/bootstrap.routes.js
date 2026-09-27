@@ -53,9 +53,33 @@ router.use("/bootstrap", authenticate);
  * تجمعها كلها (على عكس مسارات الكتابة الأخرى التي تبقى على withBranch
  * العادي عمدًا).
  */
+async function hiddenBootstrap(req) {
+  const branchId = req.auth.branchId;
+  const [branch, lock, settings, categories, items, units] = await withBranchParallel(branchId, [
+    (c) => c.query("select id, ref, name from branches where id = $1", [branchId]),
+    (c) => c.query("select locked, locked_by, locked_at from stocktake_locks where branch_id = $1", [branchId]),
+    (c) => c.query("select tax_enabled, tax_rate, workday_mode from branch_settings where branch_id = $1", [branchId]),
+    (c) => c.query("select * from categories where branch_id = $1 or branch_id is null order by sort_order, name", [branchId]),
+    (c) => c.query(
+      `select id, branch_id, ref, lot_id, category_id, karat, weight, stones_weight, from_scrap, photo_url, date_added, reserved_for
+         from items where branch_id = $1 order by date_added desc`, [branchId]),
+    (c) => c.query("select u.* from item_units u join items i on i.id = u.item_id where i.branch_id = $1", [branchId]),
+  ]);
+  return {
+    hidden: true,
+    branch: branch.rows[0] || null,
+    stocktakeLock: lock.rows[0] || null,
+    settings: settings.rows[0] || { tax_enabled: true, tax_rate: 0.15, workday_mode: "off" },
+    categories: categories.rows, items: items.rows, itemUnits: units.rows,
+    currentUser: { id: "hidden-mode", name: req.auth.user.name, role: "hidden", branchId, allowedPages: req.auth.allowedPages, roleConfig: req.auth.roleConfig },
+  };
+}
+
 router.get("/bootstrap", async (req, res, next) => {
   try {
     const branchId = req.auth.branchId;
+    // ⚠ الوضع الخفي (migration 047): الجهاز يرى المخزون والجرد وحدهما — لا نقد ولا دفاتر ولا تكلفة.
+    if (req.auth.hidden) return res.json(await hiddenBootstrap(req));
 
     const [
       branch,

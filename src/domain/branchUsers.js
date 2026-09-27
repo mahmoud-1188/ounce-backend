@@ -15,6 +15,7 @@
 // كل دالة هنا تُستدعى داخل withBranch(branchId, fn) من المستدعي (لا
 // تفتح معاملتها الخاصة) — لتبقى قابلة للتركيب مع أي معاملة أعلى مستقبلًا.
 
+import { isHiddenPin } from "./hiddenMode.js";
 import { hashPin, verifyPin } from "../auth/hashPin.js";
 import { diffPages, logPermission } from "./permissionLog.js";
 import { normalizeName } from "../auth/normalizeName.js";
@@ -66,8 +67,8 @@ async function loadBranchUsersWithRoles(client, branchId) {
 /** POST — يُطابق add() + valid guard في AccessSettingsPage.jsx حرفيًّا. */
 async function createBranchUser(client, branchId, { name, pin, role, salary }, actor = {}) {
   const roleId = role || "employee";
-  const { rows: roleRows } = await client.query("select 1 from roles where id = $1", [roleId]);
-  if (!roleRows[0]) return { error: "invalid_role" };
+  const { rows: roleRows } = await client.query("select id from roles where id = $1", [roleId]);
+  if (!roleRows[0] || roleRows[0].id === "hidden") return { error: "invalid_role" };
 
   const existing = await loadBranchUsersWithRoles(client, branchId);
 
@@ -80,6 +81,8 @@ async function createBranchUser(client, branchId, { name, pin, role, salary }, a
   for (const u of existing) {
     if (await verifyPin(pin, u.pin_hash)) return { error: "pin_taken" };
   }
+  // رقم الوضع الخفي لا يكون رقم موظّف (migration 047)
+  if (await isHiddenPin(client, branchId, pin)) return { error: "pin_taken" };
 
   const pinHash = await hashPin(pin);
   const ref = await generateUniqueEmployeeRef(client);
@@ -198,6 +201,7 @@ async function resetBranchUserPin(client, branchId, userId, pin, actor = {}) {
     [branchId, userId]
   );
   for (const o of others) if (await verifyPin(String(pin), o.pin_hash)) return { error: "pin_taken" };
+  if (await isHiddenPin(client, branchId, pin)) return { error: "pin_taken" };
   await client.query("update users set pin_hash = $1 where id = $2", [await hashPin(String(pin)), userId]);
   await logPermission(client, branchId, { targetId: u.id, targetName: u.name, kind: "pin", actor });
   return { ok: true, user: { id: u.id, name: u.name } };

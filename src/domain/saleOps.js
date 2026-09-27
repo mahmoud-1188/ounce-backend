@@ -76,7 +76,7 @@ async function reserveSaleLines(client, branchId, lines, { excludeUnitIds = [] }
       `select id from item_units
         where item_id = $1 and sold = false and issued = false
           and not (id = any($3::uuid[]))
-        order by code limit $2`,
+        order by held desc, code limit $2`,
       [item.id, line.quantity, excludeUnitIds]
     );
     if (unsoldRows.length < line.quantity) {
@@ -87,7 +87,8 @@ async function reserveSaleLines(client, branchId, lines, { excludeUnitIds = [] }
         requested: line.quantity,
       };
     }
-    await client.query(`update item_units set sold = true where id = any($1::uuid[])`, [unsoldRows.map((r) => r.id)]);
+    // القطعة المعلّقة من الوضع الخفي تُباع أولًا — البيع يُكمِلها (migration 047)، ويبقى أثرها (held_ref)
+    await client.query(`update item_units set sold = true, held = false where id = any($1::uuid[])`, [unsoldRows.map((r) => r.id)]);
 
     subtotal += Number(line.unitPrice) * Number(line.quantity);
     const lineWeight = Number(item.weight) * Number(line.quantity);

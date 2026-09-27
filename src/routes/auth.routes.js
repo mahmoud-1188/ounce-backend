@@ -1,7 +1,8 @@
 import { Router } from "express";
 import { withoutBranch } from "../db.js";
 import { verifyPin } from "../auth/hashPin.js";
-import { signSession } from "../auth/jwt.js";
+import { isHiddenPin } from "../domain/hiddenMode.js";
+import { signHiddenSession, signSession } from "../auth/jwt.js";
 import { authenticate, branchLockBody, storeBlockReason } from "../middleware/auth.js";
 
 const router = Router();
@@ -110,6 +111,23 @@ router.post("/auth/login", async (req, res, next) => {
     }
     const ok = await verifyPin(pin, user.pin_hash);
     if (!ok) {
+      // الوضع الخفي (migration 047): رقمه يُقبل على شاشة الدخول بعد أن يفشل رقم الموظّف —
+      //   فيُفتح الجهاز على المخزون والجرد وحدهما. الاشتراك وقفل الفرع يسريان عليه كذلك.
+      if (await withoutBranch((c) => isHiddenPin(c, branchId, pin))) {
+        const storeBlockH = storeBlockReason(user);
+        if (storeBlockH) return res.status(403).json({ error: storeBlockH });
+        const lockH = branchLockBody(user);
+        if (lockH) return res.status(423).json(lockH);
+        await withoutBranch((c) => c.query(
+          `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'login',null,'session',null,$2)`,
+          [branchId, JSON.stringify({ hidden: true, note: "دخول الوضع الخفي (مخزون وجرد فقط)" })]
+        ));
+        return res.json({
+          token: signHiddenSession(branchId),
+          hidden: true,
+          user: { id: "hidden-mode", name: "مخزون وجرد", role: "hidden", branchId },
+        });
+      }
       return res.status(401).json({ error: "invalid_credentials" });
     }
     // ⚠ بعد التحقق من الرقم السري لا قبله: من لا يعرف الرقم لا يعرف حالة
@@ -143,10 +161,34 @@ router.post("/auth/login", async (req, res, next) => {
  * بيانات المستخدم بنفس شكل استجابة /auth/login تمامًا — الفرونت إند
  * يستخدمه عند الإقلاع لإعادة بناء الجلسة تلقائيًا بلا طلب PIN من جديد.
  */
+/**
+ * POST /api/auth/hidden-exit { pin } — الخروج من الوضع الخفي برقم مديرٍ وحده
+ * (المرجع: handleHiddenExit). يرجّع جلسة ذلك المدير كالدخول تمامًا.
+ */
+router.post("/auth/hidden-exit", authenticate, async (req, res, next) => {
+  if (!req.auth.hidden) return res.status(400).json({ error: "not_hidden_session" });
+  const pin = String(req.body?.pin || "");
+  try {
+    const { rows } = await withoutBranch((c) => c.query(
+      "select * from users where branch_id = $1 and role = 'manager' and active = true", [req.auth.branchId]
+    ));
+    let manager = null;
+    for (const u of rows) if (await verifyPin(pin, u.pin_hash)) { manager = u; break; }
+    if (!manager) return res.status(401).json({ error: "manager_pin_required" });
+    await withoutBranch((c) => c.query(
+      `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'logout',$2,'session',null,$3)`,
+      [req.auth.branchId, manager.id, JSON.stringify({ hidden: true, note: `خروج من الوضع الخفي بيد ${manager.name}` })]
+    ));
+    res.json({ token: signSession(manager), user: { id: manager.id, name: manager.name, role: manager.role, branchId: manager.branch_id } });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get("/auth/me", authenticate, (req, res) => {
   res.json({
     user: {
-      id: req.auth.userId,
+      id: req.auth.hidden ? "hidden-mode" : req.auth.userId,
       name: req.auth.user.name,
       role: req.auth.role,
       branchId: req.auth.branchId,

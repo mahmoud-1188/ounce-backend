@@ -33,6 +33,59 @@ function storeBlockReason(row) {
   return null;
 }
 
+/**
+ * جلسة الوضع الخفي (migration 047): لا مستخدم — الفرع ودور «hidden» وحدهما،
+ * بصلاحيات الدور (المخزون والجرد). الاشتراك وقفل الفرع يسريان كالعادة.
+ */
+// ما يصل إليه الوضع الخفي وحده — القائمة بالسماح: كل مسارٍ غيرها ممنوع (المرجع: allowActions)
+const HIDDEN_ALLOWED = [
+  /^GET \/api\/(bootstrap|auth\/me)$/,
+  /^POST \/api\/(piece-inquiry|hidden\/hold|auth\/hidden-exit|stocktake\/apply|settings\/stocktake-lock)$/,
+];
+
+async function authenticateHidden(payload, req, res, next) {
+  const key = `${req.method} ${(req.originalUrl || "").split("?")[0]}`;
+  if (!HIDDEN_ALLOWED.some((re) => re.test(key))) return res.status(403).json({ error: "hidden_mode_forbidden" });
+  try {
+    const { rows } = await withoutBranch((client) =>
+      client.query(
+        `select b.id as branch_id, s.status as store_status, s.subscription_expires_at,
+                b.locked as branch_locked, b.lock_reason as branch_lock_reason,
+                b.locked_at as branch_locked_at, b.locked_by as branch_locked_by,
+                r.allowed_tabs, r.allowed_more, r.deny_actions, coalesce(bs.hidden_mode_enabled, true) as hidden_on
+           from branches b
+           join roles r on r.id = 'hidden'
+           left join stores s on s.id = b.store_id
+           left join branch_settings bs on bs.branch_id = b.id
+          where b.id = $1 and b.deleted_at is null`,
+        [payload.branchId]
+      )
+    );
+    const row = rows[0];
+    if (!row || !row.hidden_on) return res.status(401).json({ error: "user_not_found_or_inactive" });
+    const storeBlock = storeBlockReason(row);
+    if (storeBlock) return res.status(403).json({ error: storeBlock });
+    const lock = branchLockBody(row);
+    if (lock) return res.status(423).json(lock);
+    const role = {
+      allowed_tabs: row.allowed_tabs, allowed_more: row.allowed_more, deny_actions: row.deny_actions || [],
+      hq_deny_actions: [], can_manage_day: false, can_break: false,
+    };
+    req.auth = {
+      userId: null,
+      branchId: row.branch_id,
+      role: "hidden",
+      hidden: true,
+      user: { id: null, name: "مخزون وجرد", role: "hidden", branch_id: row.branch_id, allowed_pages: null },
+      roleConfig: role,
+      allowedPages: currentAllowed({ allowed_pages: null }, role),
+    };
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function authenticate(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
@@ -51,6 +104,7 @@ async function authenticate(req, res, next) {
   // storeAuth.js): بلاه كان payload.branchId المفقود سيجعل
   // الاستعلام أدناه يفشل بصمت "مستخدم غير موجود" بدل رفض
   // صريح لسبب الفشل الحقيقي (نوع توكن خاطئ).
+  if (payload.scope === "hidden") return authenticateHidden(payload, req, res, next);
   if (payload.scope && payload.scope !== "branch") {
     return res.status(401).json({ error: "wrong_token_scope" });
   }

@@ -64,8 +64,16 @@ function signPlatformSession(admin) {
   );
 }
 
+/**
+ * جلسة الوضع الخفي (migration 047): لا مستخدم خلفها — الجهاز فُتح برقم
+ * الوضع الخفي، فيرى المخزون والجرد وحدهما. scope: "hidden".
+ */
+function signHiddenSession(branchId) {
+  return jwt.sign({ scope: "hidden", sub: null, branchId, role: "hidden" }, SECRET, { expiresIn: EXPIRES_IN });
+}
+
 function verifySession(token) {
   return jwt.verify(token, SECRET);
 }
 
-export { signSession, signStoreSession, signPlatformSession, verifySession };
+export { signSession, signStoreSession, signPlatformSession, signHiddenSession, verifySession };

@@ -32,7 +32,7 @@ const KARATS = [24, 22, 21, 18, 14];
  *    ووزن كل منهما منفصل في الفورم بلا أي تحقق رابط بينهما في المرجع) —
  *    فيُرحَّلان كسطرين منفصلين في دفتر الوزن، لا سطر واحد مدمج.
  */
-router.post("/purchases", async (req, res, next) => {
+async function handleCreatePurchase(req, res, next) {
   const body = req.body || {};
   const { supplierId, paymentMethod, officeId, notes } = body;
   const lines = Array.isArray(body.lines) ? body.lines : [];
@@ -408,7 +408,9 @@ router.post("/purchases", async (req, res, next) => {
     }
     next(err);
   }
-});
+}
+
+router.post("/purchases", handleCreatePurchase);
 
 /**
  * POST /api/suppliers  { name, phone?, isOfficial? }
@@ -552,3 +554,4 @@ router.get("/suppliers/statements", authenticate, requireAnyPage("suppliers", "s
 });
 
 export default router;
+export { handleCreatePurchase };

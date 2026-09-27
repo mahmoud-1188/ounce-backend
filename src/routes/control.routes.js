@@ -1,3 +1,4 @@
+import { isHiddenPin } from "../domain/hiddenMode.js";
 import { Router } from "express";
 import { provisionLocked } from "../domain/branchProvision.js";
 import crypto from "crypto";
@@ -291,6 +292,7 @@ router.post("/enroll/claim", async (req, res, next) => {
         [branchId, inv.user_id]
       );
       for (const o of others) if (await verifyPin(String(pin), o.pin_hash)) return { error: "pin_taken" };
+      if (await isHiddenPin(client, branchId, pin)) return { error: "pin_taken" };
       await client.query("update users set pin_hash = $1 where id = $2", [await hashPin(String(pin)), inv.user_id]);
       await client.query("update enroll_invites set used_at = now() where id = $1", [inv.id]);
       await logPermission(client, branchId, {
