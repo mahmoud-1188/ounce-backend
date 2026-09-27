@@ -304,7 +304,7 @@ router.get("/store/users", requireStoreOwner, async (req, res, next) => {
   try {
     const { rows } = await withoutBranch((client) =>
       client.query(
-        `select id, name, email, role, allowed_pages, can_manage_branches, can_send_coding, active, created_at
+        `select id, name, email, role, allowed_pages, can_manage_branches, can_send_coding, active, created_at, hq_role
            from store_users
           where store_id = $1
           order by created_at`,
@@ -322,6 +322,7 @@ router.get("/store/users", requireStoreOwner, async (req, res, next) => {
         canSendCoding: u.can_send_coding,
         active: u.active,
         createdAt: u.created_at,
+        hqRole: u.hq_role || null,
       }))
     );
   } catch (err) {
