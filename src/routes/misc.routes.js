@@ -376,14 +376,15 @@ router.post(
           // ⚠ quantity numeric يصل نصًّا "1.000" — LIMIT يحتاج عددًا صحيحًا.
           const qty = Math.round(Number(l.quantity) || 0);
           const { rows: soldUnits } = await client.query(
-            `select id from item_units where item_id = $1 and sold = true order by code limit $2`,
-            [l.item_id, qty]
+            `select id from item_units where item_id = $1 and sold = true
+              order by (sale_id is not distinct from $3) desc, code limit $2`,
+            [l.item_id, qty, sale.id]
           );
           if (soldUnits.length < qty) {
             return { error: "unit_mismatch", itemId: l.item_id, available: soldUnits.length, requested: qty };
           }
           await client.query(
-            `update item_units set sold = false where id = any($1::uuid[])`,
+            `update item_units set sold = false, sale_id = null where id = any($1::uuid[])`,
             [soldUnits.map((r) => r.id)]
           );
         }

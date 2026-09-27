@@ -3,6 +3,7 @@ import { withBranch } from "../db.js";
 import { authenticate, requirePage, requireManager, requireAnyPage } from "../middleware/auth.js";
 import { roundMoney } from "../domain/money.js";
 import { postJournalEntry } from "../domain/journal.js";
+import { approvalGate } from "../domain/approvals.js";
 
 const router = Router();
 
@@ -482,6 +483,13 @@ router.post("/payroll/runs", requireManager, async (req, res, next) => {
       const netPayable = roundMoney(slips.reduce((a, s) => a + s.net, 0));
       const employerCost = roundMoney(slips.reduce((a, s) => a + s.employerCost, 0));
       const absent = roundMoney(slips.reduce((a, s) => a + s.absenceDeduction, 0));
+      // ⚖ المسيّر يُعتمد قبل الترحيل (payroll_run) — بتكلفته على المنشأة
+      const gate = await approvalGate(client, req.auth, {
+        kind: "payroll_run", amount: employerCost, approvalId: req.body?.approvalId || null,
+        note: `رواتب ${period}`, payload: { period },
+      });
+      if (gate.error) return gate;
+      if (gate.pending) return { approvalPending: gate.pending };
 
       const lines = [];
       const push = (account, side, amount) => { if (amount > 0) lines.push({ account, side, amount }); };
@@ -554,8 +562,10 @@ router.post("/payroll/runs", requireManager, async (req, res, next) => {
       return { run, netPayable, employerCost, staffCount: slips.length };
     });
 
+    if (result.approvalPending) return res.status(202).json(result);
     if (result.error === "already_accrued") return res.status(409).json({ error: "already_accrued" });
     if (result.error === "no_staff") return res.status(400).json({ error: "no_staff" });
+    if (result.error) return res.status(409).json(result);
     res.status(201).json(result);
   } catch (err) {
     next(err);

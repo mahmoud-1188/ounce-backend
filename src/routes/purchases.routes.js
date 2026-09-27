@@ -495,7 +495,7 @@ router.get("/suppliers/statements", authenticate, requireAnyPage("suppliers", "s
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
       const b = req.auth.branchId;
-      const [lots, taskir, safeGold, fees, ledger, taskirFees] = await Promise.all([
+      const [lots, taskir, safeGold, fees, ledger, taskirFees, openings] = await Promise.all([
         client.query(
           `select l.*, p.payment_method, p.office_id, p.invoice_pending, p.pay_fees_now, p.notes as purchase_notes
              from lots l left join purchases p on p.id = l.purchase_id
@@ -527,8 +527,16 @@ router.get("/suppliers/statements", authenticate, requireAnyPage("suppliers", "s
             where branch_id = $1 and ref_table = 'taskir_entries' and direction = 'decrease'`,
           [b]
         ),
+        client.query(
+          `select id, supplier_id as "supplierId", kind, side, karat, weight::float8 as weight,
+                  fine_weight::float8 as "fineWeight", amount::float8 as amount, coalesce(note, '') as note,
+                  created_at as date, (voided_at is not null) as voided
+             from supplier_openings where branch_id = $1 order by created_at`,
+          [b]
+        ),
       ]);
       return {
+        supplierOpenings: openings.rows,
         lots: lots.rows,
         taskirEntries: taskir.rows,
         safeGoldTx: safeGold.rows,

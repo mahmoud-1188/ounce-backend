@@ -54,7 +54,7 @@ async function approvalGate(client, auth, { kind, amount, payload = null, approv
     "select s.approval_routing from branches b join stores s on s.id = b.store_id where b.id = $1",
     [branchId]
   );
-  const byHq = rt[0]?.approval_routing?.[kind] === "hq";
+  const byHq = routesToHq(rt[0]?.approval_routing, kind, amt);
   const approverKind = byHq ? "hq" : rule.approver_role || "manager";
   const selfApprove = !byHq && auth.role === (rule.approver_role || "manager");
   const { rows: apRows } = await client.query(
@@ -100,6 +100,20 @@ function shapeApproval(a, rule = null) {
   };
 }
 
+/**
+ * مصفوفة الاعتماد بالمبلغ: الإدارة تعتمد الكل ("hq")، أو ما بلغ حدًّا
+ * ("hq_above" مع hqAbove[kind])، وما دونه لمدير الفرع.
+ */
+function routesToHq(routing, kind, amount) {
+  const r = routing?.[kind];
+  if (r === "hq") return true;
+  if (r === "hq_above") {
+    const lim = Number(routing?.hqAbove?.[kind]);
+    return Number.isFinite(lim) && lim >= 0 && Number(amount) >= lim;
+  }
+  return false;
+}
+
 /** من يعتمد ماذا في متجر الفرع (migration 039): { expense: "hq"|"branch", ... } */
 async function loadBranchApprovalRouting(client, branchId) {
   const { rows } = await client.query(
@@ -109,4 +123,4 @@ async function loadBranchApprovalRouting(client, branchId) {
   return rows[0]?.approval_routing || {};
 }
 
-export { approvalGate, shapeApproval, loadBranchApprovalRouting };
+export { approvalGate, shapeApproval, loadBranchApprovalRouting, routesToHq };

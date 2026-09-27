@@ -102,6 +102,7 @@ async function reserveSaleLines(client, branchId, lines, { excludeUnitIds = [] }
       weightSnapshot: item.weight,
       costPerGramSnapshot: item.cost_per_gram,
       workmanshipSnapshot: item.workmanship,
+      unitIds: unsoldRows.map((r) => r.id),
     });
   }
   return { resolvedLines, subtotal, weightByKarat };
@@ -111,6 +112,10 @@ async function reserveSaleLines(client, branchId, lines, { excludeUnitIds = [] }
 async function insertSaleLines(client, saleId, resolvedLines) {
   for (let i = 0; i < resolvedLines.length; i++) {
     const l = resolvedLines[i];
+    // الوحدة تحمل فاتورتها (migration 045) — لاستعلام القطع والمرتجع بالوحدة نفسها
+    if (l.unitIds?.length) {
+      await client.query("update item_units set sale_id = $1 where id = any($2::uuid[])", [saleId, l.unitIds]);
+    }
     await client.query(
       `insert into sale_lines
          (sale_id, item_id, category, karat, quantity, unit_price,
@@ -220,18 +225,20 @@ async function restockReturnedLines(client, returnedLines, restock) {
     // ⚠ sale_lines.quantity من نوع numeric(12,3) فيصل نصًّا "1.000" —
     // وLIMIT يرفضه (22P02) فكان كل مرتجع يفشل بخطأ خادم. عددٌ صحيح هنا.
     const qty = Math.round(Number(l.quantity) || 0);
+    // وحدات هذه الفاتورة أولًا (sale_id)، ثم أيّ مباعةٍ من الصنف للقديم قبل 045
     const { rows: soldUnits } = await client.query(
-      `select id from item_units where item_id = $1 and sold = true order by code limit $2`,
-      [l.item_id, qty]
+      `select id from item_units where item_id = $1 and sold = true
+        order by (sale_id is not distinct from $3) desc, code limit $2`,
+      [l.item_id, qty, l.sale_id || null]
     );
     if (soldUnits.length < qty) {
       return { error: "unit_mismatch", itemId: l.item_id, available: soldUnits.length, requested: qty };
     }
     const ids = soldUnits.map((r) => r.id);
     if (restock === "damaged") {
-      await client.query(`update item_units set sold = false, issued = true where id = any($1::uuid[])`, [ids]);
+      await client.query(`update item_units set sold = false, issued = true, sale_id = null where id = any($1::uuid[])`, [ids]);
     } else {
-      await client.query(`update item_units set sold = false where id = any($1::uuid[])`, [ids]);
+      await client.query(`update item_units set sold = false, sale_id = null where id = any($1::uuid[])`, [ids]);
     }
     unitIds.push(...ids);
   }

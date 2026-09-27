@@ -47,6 +47,40 @@ async function branchOfStore(storeId, branchId) {
 // ⚠ معرّفٌ غير صالح (uuid) يرمي 22P02 — نُعيده «غير موجود» لا 500
 const notFoundOn22P02 = (err, res, next) => (err && err.code === "22P02" ? res.status(404).json({ error: "not_found" }) : next(err));
 
+/**
+ * مطابقة النقد في الطريق (المرجع 5.2.0): رصيد 1170 مجموعًا على فروع المتجر
+ * (المُرسِل مدين، والمستلم دائن) يجب أن يساوي تحويلات cash_from_hq المعلّقة.
+ */
+async function cashTransitRecon(storeId, branches = null) {
+  const list = branches || (await storeBranches(storeId));
+  let ledger = 0;
+  for (const b of list) {
+    const [row] = await withBranch(b.id, async (c) => (await c.query(
+      `select coalesce(sum(case when l.side = 'debit' then l.amount else -l.amount end), 0) as v
+         from journal_lines l join journal_entries e on e.id = l.entry_id where e.branch_id = $1 and l.account_code = '1170'`, [b.id])).rows);
+    ledger += Number(row.v) || 0;
+  }
+  const pendingRows = await withoutBranch(async (c) => (await c.query(
+    `select t.id, upper(left(t.id::text, 8)) as ref, t.amount, t.created_at, t.note, b.name as to_name, fb.name as from_name
+       from hq_transactions t join branches b on b.id = t.branch_id left join branches fb on fb.id = t.from_branch_id
+      where b.store_id = $1 and t.flow = 'cash_from_hq' and t.status = 'pending' order by t.created_at`, [storeId])).rows);
+  const pending = roundMoney(pendingRows.reduce((a, r) => a + Number(r.amount || 0), 0));
+  ledger = roundMoney(ledger);
+  const diff = roundMoney(ledger - pending);
+  return {
+    ledger, pending, diff, ok: Math.abs(diff) < 0.01,
+    items: pendingRows.map((r) => ({ id: r.id, ref: r.ref, amount: Number(r.amount), at: r.created_at, to: r.to_name, from: r.from_name || null, note: r.note || "" })),
+  };
+}
+
+router.get("/store/cash-transit", async (req, res, next) => {
+  try {
+    res.json(await cashTransitRecon(req.storeAuth.storeId));
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ══ ① يحتاج انتباهك الآن ═══════════════════════════════════════════════
 router.get("/store/alerts", async (req, res, next) => {
   try {
@@ -70,9 +104,29 @@ router.get("/store/alerts", async (req, res, next) => {
         const [mtd] = await q("select coalesce(sum(total), 0) as t from sales where branch_id = $1 and date >= date_trunc('month', now())");
         const [dead] = await q(`select count(*)::int as n, coalesce(sum(i.weight), 0) as w from item_units u join items i on i.id = u.item_id
            where i.branch_id = $1 and not u.sold and not u.issued and i.date_added < now() - interval '120 days'`);
-        return { wrapped: { last, stale, neg, aps, ar, mtd, dead } };
+        // دفتر الفرع متوازن؟ مجموع (مدين − دائن) لكل القيود صفرٌ بالضرورة — غيره قيدٌ مكسور
+        const [bal] = await q(`select coalesce(sum(case when l.side = 'debit' then l.amount else -l.amount end), 0) as diff
+            from journal_lines l join journal_entries e on e.id = l.entry_id where e.branch_id = $1`);
+        // ذهبٌ سالب في حساب أصل (1xxx): خرج منه أكثر مما دخله — بيعٌ بلا تكويد أو قيدٌ على الحساب الخطأ
+        const negGold = await q(`select acc as code, a.name, sum(f) as fine from (
+              select to_account as acc, fine_weight as f from gold_ledger_entries where branch_id = $1 and to_account like '1%'
+              union all
+              select from_account, -fine_weight from gold_ledger_entries where branch_id = $1 and from_account like '1%'
+            ) x left join accounts a on a.code = x.acc group by 1, 2 having sum(f) < -0.001`);
+        // اعتُمد ولم يُنفَّذ منذ ساعتين — الفرع لم يُكمل العملية
+        const idle = await q(`select a.ref, a.amount, a.decided_at, coalesce(r.label, a.rule_id) as label
+            from approvals a left join approval_rules r on r.id = a.rule_id
+           where a.branch_id = $1 and a.status = 'approved' and a.executed_at is null and a.decided_at < now() - interval '2 hours'
+           order by a.decided_at`);
+        return { wrapped: { last, stale, neg, aps, ar, mtd, dead, bal, negGold, idle } };
       });
-      const { last, stale, neg, aps, ar, mtd, dead } = r.wrapped;
+      const { last, stale, neg, aps, ar, mtd, dead, bal, negGold, idle } = r.wrapped;
+      if (Math.abs(Number(bal.diff)) >= 0.01) push("block", "unbalanced_book", `دفتره غير متوازن بفرق ${roundMoney(bal.diff)}`, "books");
+      negGold.forEach((g) => push("block", "negative_gold", `ذهبٌ سالب في ${g.name || g.code}: ${roundWeight(g.fine)} جم 24`, "books"));
+      idle.forEach((a) => {
+        const h = Math.round((Date.now() - new Date(a.decided_at).getTime()) / 3600000);
+        push("warn", "approved_not_executed", `اعتُمد ${a.label} ${roundMoney(a.amount)} (${a.ref}) ولم يُنفَّذ منذ ${h} ساعة`, "approvals");
+      });
       neg.forEach((a) => push("block", "negative_cash", `${a.name || a.code} سالب ${roundMoney(a.bal)}`, "accounts"));
       if (stale) push("warn", "day_stale", `يوم عملٍ مفتوح منذ ${stale.opened_at.toISOString().slice(0, 10)} (${stale.ref})`, "ops");
       const dayAgo = Date.now() - 86400000;
@@ -87,6 +141,12 @@ router.get("/store/alerts", async (req, res, next) => {
         const days = Math.floor((Date.now() - new Date(last.at).getTime()) / 86400000);
         if (days >= 3) push("info", "silent", `لا حركة منذ ${days} يومًا`, "ops");
       }
+    }
+    // تحويلات النقد: ما في الطريق دفتريًّا (1170 في كل الفروع) = ما أُرسل ولم يُستلم؟
+    const transit = await cashTransitRecon(req.storeAuth.storeId, branches);
+    if (!transit.ok) {
+      alerts.push({ branchId: null, name: "تحويلات النقد", level: "block", kind: "cash_transit",
+        label: `لا تتطابق بين الإدارة والفروع بفرق ${transit.diff} (في الدفاتر ${transit.ledger} · بانتظار الاستلام ${transit.pending})`, page: "hqDocs" });
     }
     const order = { block: 0, warn: 1, info: 2 };
     alerts.sort((a, b) => order[a.level] - order[b.level]);
@@ -317,7 +377,7 @@ router.patch("/store/branches/:branchId/target", requireCanManageBranches, async
 });
 
 // ══ ⑥ من يعتمد ماذا + صندوق الاعتمادات ═════════════════════════════════
-const ROUTABLE = ["expense", "refund", "supplier_settle"];
+const ROUTABLE = ["expense", "refund", "supplier_settle", "asset_purchase", "asset_disposal", "payroll_run"];
 
 router.get("/store/approval-routing", async (req, res, next) => {
   try {
@@ -327,7 +387,8 @@ router.get("/store/approval-routing", async (req, res, next) => {
     }));
     res.json({ rules: ROUTABLE.map((id) => {
       const r = rules.find((x) => x.id === id) || { id, label: id, threshold: 0 };
-      return { id, label: r.label, threshold: Number(r.threshold) || 0, approver: routing[id] === "hq" ? "hq" : "branch" };
+      const approver = routing[id] === "hq" ? "hq" : routing[id] === "hq_above" ? "hq_above" : "branch";
+      return { id, label: r.label, threshold: Number(r.threshold) || 0, approver, hqAbove: Number(routing.hqAbove?.[id]) || 0 };
     }) });
   } catch (err) {
     next(err);
@@ -336,8 +397,15 @@ router.get("/store/approval-routing", async (req, res, next) => {
 
 router.put("/store/approval-routing", requireCanManageBranches, async (req, res, next) => {
   const body = req.body?.routing || {};
-  const routing = {};
-  for (const id of ROUTABLE) routing[id] = body[id] === "hq" ? "hq" : "branch";
+  const routing = { hqAbove: {} };
+  for (const id of ROUTABLE) {
+    routing[id] = ["hq", "hq_above"].includes(body[id]) ? body[id] : "branch";
+    if (routing[id] === "hq_above") {
+      const lim = Number(body.hqAbove?.[id]);
+      if (!(lim > 0)) return res.status(400).json({ error: "invalid_hq_above", kind: id });
+      routing.hqAbove[id] = Math.round(lim * 100) / 100;
+    }
+  }
   try {
     await withoutBranch((c) => c.query("update stores set approval_routing = $1 where id = $2", [JSON.stringify(routing), req.storeAuth.storeId]));
     res.json({ routing });

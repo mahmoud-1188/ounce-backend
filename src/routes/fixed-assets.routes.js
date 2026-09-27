@@ -3,6 +3,7 @@ import { withBranch } from "../db.js";
 import { authenticate, requirePage, requireManager } from "../middleware/auth.js";
 import { roundMoney } from "../domain/money.js";
 import { postJournalEntry } from "../domain/journal.js";
+import { approvalGate } from "../domain/approvals.js";
 
 const router = Router();
 
@@ -121,6 +122,13 @@ router.post("/fixed-assets", requireManager, async (req, res, next) => {
 
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
+      // ⚖ شراء الأصل يُعتمد (المرجع 5.2.0: asset_purchase) — المدير يعتمد نفسه ما لم تجعله الإدارة لها
+      const gate = await approvalGate(client, req.auth, {
+        kind: "asset_purchase", amount: cost, approvalId: body.approvalId || null, note: name,
+        payload: { ...body, approvalId: undefined },
+      });
+      if (gate.error) return gate;
+      if (gate.pending) return { approvalPending: gate.pending };
       const { rows: clsRows } = await client.query(
         `select id, account_code from asset_classes where id = $1`,
         [classId]
@@ -197,7 +205,9 @@ router.post("/fixed-assets", requireManager, async (req, res, next) => {
       return { asset, journalEntryId };
     });
 
+    if (result.approvalPending) return res.status(202).json(result);
     if (result.error === "invalid_class") return res.status(400).json({ error: "invalid_class" });
+    if (result.error) return res.status(409).json(result);
     res.status(201).json(result);
   } catch (err) {
     next(err);
@@ -345,6 +355,13 @@ router.post("/fixed-assets/:id/dispose", requireManager, async (req, res, next) 
       const asset = assetRows[0];
       if (!asset) return { error: "not_found" };
       if (asset.disposed_at) return { error: "already_disposed" };
+      // ⚖ الاستبعاد يُعتمد دائمًا (asset_disposal) — بقيمة الأصل
+      const gate = await approvalGate(client, req.auth, {
+        kind: "asset_disposal", amount: Number(asset.cost) || 0, approvalId: body.approvalId || null,
+        note: `${asset.ref || ""} ${asset.name || ""}`.trim(), payload: { ...body, assetId: asset.id, approvalId: undefined },
+      });
+      if (gate.error) return gate;
+      if (gate.pending) return { approvalPending: gate.pending };
 
       const { rows: sumRows } = await client.query(
         `select coalesce(sum(amount), 0)::numeric as accum from depreciation_schedule where asset_id = $1`,
@@ -407,8 +424,9 @@ router.post("/fixed-assets/:id/dispose", requireManager, async (req, res, next) 
       return { asset: updated[0], journalEntryId, gain };
     });
 
+    if (result.approvalPending) return res.status(202).json(result);
     if (result.error === "not_found") return res.status(404).json({ error: "not_found" });
-    if (result.error === "already_disposed") return res.status(409).json({ error: "already_disposed" });
+    if (result.error) return res.status(409).json(result);
     res.status(200).json(result);
   } catch (err) {
     next(err);

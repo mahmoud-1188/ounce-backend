@@ -99,6 +99,7 @@ router.get("/bootstrap", async (req, res, next) => {
       notices,
       approvalRouting,
       provision,
+      supplierOpenings,
     ] = await withBranchParallel(branchId, [
       // ⚠ توسيع حقيقي: كان يُحمَّل عمود مُصغَّر لآخر يوم فقط، لكن WorkDayPage
       // في المرجع تعرض أيضًا سجل "الأيام السابقة" (ref، فتح/إقفال، مبيعات،
@@ -282,6 +283,15 @@ router.get("/bootstrap", async (req, res, next) => {
       (client) => loadBranchApprovalRouting(client, branchId),
       // تجهيز الإدارة للفرع (migration 042): الهوية، والإعدادات المُدارة وقفلها
       (client) => loadProvision(client, branchId),
+      // أرصدة الموردين الافتتاحية (migration 046) — أوّل سطرٍ في كشف كل مورد
+      (client) =>
+        client.query(
+          `select id, supplier_id as "supplierId", kind, side, karat, weight::float8 as weight,
+                  fine_weight::float8 as "fineWeight", amount::float8 as amount, coalesce(note, '') as note,
+                  created_at as date, (voided_at is not null) as voided
+             from supplier_openings where branch_id = $1 order by created_at`,
+          [branchId]
+        ),
     ]);
 
     const linesByEntry = new Map();
@@ -374,6 +384,7 @@ router.get("/bootstrap", async (req, res, next) => {
       pricePolicy,
       notices,
       approvalRouting,
+      supplierOpenings: supplierOpenings.rows,
       // سياسة الإدارة على الشاشات والعمليات (migration 040) — الخادم يفرضها، والواجهة تُخفي وتُنبّه
       hqPolicy: branchPolicyView(req.auth.user.hq_policy, branchId),
       branchProvision: provision ? { profile: provision.profile, local: provision.local, locked: provision.locked, at: provision.at, by: provision.by } : null,

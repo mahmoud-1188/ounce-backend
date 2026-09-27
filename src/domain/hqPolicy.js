@@ -28,7 +28,7 @@ const BRANCH_SCREENS = [
   ["priceFix", "التثبيت ذهب ↔ نقد"], ["generalLedger", "الأستاذ العام"], ["masterReport", "التقارير الموحّدة"], ["anyStatement", "كشف حساب — أي شيء"],
   ["fullStatements", "القوائم المالية الكاملة"], ["exchange", "التبادل مع الأنظمة"], ["customerReport", "تقرير العملاء"], ["docCycle", "الدورة المستندية"],
   ["reportsHub", "مركز التقارير"], ["accountantReview", "المراجعة المحاسبية"], ["approvals", "الاعتمادات"], ["documents", "الأرشيف"],
-  ["bankFees", "تسوية عمولات البنك"], ["showcase", "الاستعراض للزبون"], ["dashboard", "لوحة التحكم"], ["aiAccountant", "المساعد المحاسبي"],
+  ["bankFees", "تسوية عمولات البنك"], ["pieceInquiry", "استعلام القطع"], ["showcase", "الاستعراض للزبون"], ["dashboard", "لوحة التحكم"], ["aiAccountant", "المساعد المحاسبي"],
 ].map(([id, label]) => ({ id, label }));
 
 // ⚠ العمليات المفروضة فعلًا في معالجات الخادم فقط — منعٌ لا يُفرض كذبة
