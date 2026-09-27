@@ -39,6 +39,22 @@ const PURITY = { 24: 1, 22: 22 / 24, 21: 21 / 24, 18: 18 / 24, 14: 14 / 24 };
  * قيمة NaN كانت تُقرأ محليًا من حقل لا وجود له في قاعدة البيانات) — هذا
  * بالضبط ما يمنع ازدواج الأجرة عند التكويد على دفعات من نفس lot.
  */
+/** خصائص الحجر والساعة (migration 054) — نصوصٌ قصيرة وأرقام، وما سواها يُسقط */
+function cleanAttrs(a) {
+  if (!a || typeof a !== "object") return null;
+  const txt = (v, n = 60) => (v == null ? "" : String(v).trim().slice(0, n));
+  const out = {};
+  if (a.gem && typeof a.gem === "object") {
+    const g = { carat: Number(a.gem.carat) || 0, clarity: txt(a.gem.clarity, 20), color: txt(a.gem.color, 20), cut: txt(a.gem.cut, 30), lab: txt(a.gem.lab, 30), certNo: txt(a.gem.certNo, 40) };
+    if (g.carat > 0 || g.certNo || g.clarity || g.color) out.gem = g;
+  }
+  if (a.watch && typeof a.watch === "object") {
+    const w = { brand: txt(a.watch.brand, 40), model: txt(a.watch.model, 40), serial: txt(a.watch.serial, 40), warrantyMonths: Math.max(0, Math.round(Number(a.watch.warrantyMonths) || 0)) };
+    if (w.brand || w.serial) out.watch = w;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 router.post("/lots/:id/items", async (req, res, next) => {
   const body = req.body || {};
   const rows = Array.isArray(body.rows) ? body.rows : [];
@@ -131,20 +147,21 @@ router.post("/lots/:id/items", async (req, res, next) => {
         const totalWorkmanship = (Number(row.workmanshipPerUnit) || 0) + allocatedWorkmanship;
         const costPerGram = row.costPerGram != null ? Number(row.costPerGram) : Number(lot.cost_per_gram) || null;
         const ref = `ITM-${String(nextRefNum++).padStart(6, "0")}`;
+        const attrs = cleanAttrs(row.attrs);
 
         const { rows: itemRows } = await client.query(
           `insert into items
              (branch_id, ref, lot_id, category_id, karat, weight, stones_weight,
               cost_per_gram, workmanship, lot_workmanship_share, from_scrap,
-              business_day_id, created_by)
-           values ($1,$2,$3,$4,$5,$6,$7, $8,$9,$10,false, $11,$12)
+              business_day_id, created_by, attrs)
+           values ($1,$2,$3,$4,$5,$6,$7, $8,$9,$10,false, $11,$12, $13)
            returning id, ref, karat, weight, stones_weight, cost_per_gram,
-                     workmanship, lot_workmanship_share, date_added`,
+                     workmanship, lot_workmanship_share, date_added, attrs`,
           [
             req.auth.branchId, ref, lot.id, row.categoryId, karat,
             Number(row.weight), Number(row.stonesWeight) || 0,
             costPerGram, totalWorkmanship, allocatedWorkmanship,
-            businessDayId, req.auth.userId,
+            businessDayId, req.auth.userId, attrs ? JSON.stringify(attrs) : null,
           ]
         );
         const newItem = itemRows[0];
@@ -171,6 +188,7 @@ router.post("/lots/:id/items", async (req, res, next) => {
           costPerGram: newItem.cost_per_gram != null ? Number(newItem.cost_per_gram) : null,
           workmanship: Number(newItem.workmanship) || 0,
           lotWorkmanshipShare: Number(newItem.lot_workmanship_share) || 0,
+          attrs: newItem.attrs || null,
           fromScrap: false,
           dateAdded: newItem.date_added,
           units: units.map((u) => ({ id: u.id, code: u.code, printed: !!u.printed, sold: !!u.sold })),

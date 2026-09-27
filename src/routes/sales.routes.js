@@ -1,4 +1,6 @@
 import { Router } from "express";
+import { loadModules, modCfg, modOn } from "../domain/modules.js";
+import { PURITY } from "../domain/weight.js";
 import { withBranch } from "../db.js";
 import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.js";
 import { extractInclusiveTax } from "../domain/money.js";
@@ -130,6 +132,21 @@ router.post("/sales", async (req, res, next) => {
       if (reserved.error) return reserved;
       const { resolvedLines, subtotal, weightByKarat } = reserved;
 
+      // ⚖ حدّ الخصم لكل دور (وحدة discountLimit — المرجع: discountLimitError): ما فوقه يبيعه المدير
+      if (req.auth.role !== "manager") {
+        const mods = await loadModules(client, req.auth.branchId);
+        if (modOn(mods, "discountLimit")) {
+          const max = Number(modCfg(mods, "discountLimit").maxPct?.[req.auth.role]) || 0;
+          const p24 = Number(body.price24Snapshot) || 0;
+          for (const l of resolvedLines) {
+            const ref = p24 * (PURITY[l.karat] || Number(l.karat) / 24) * Number(l.weightSnapshot) + Number(l.workmanshipSnapshot || 0);
+            if (!(ref > 0)) continue;
+            const pct = (1 - Number(l.unitPrice) / ref) * 100;
+            if (pct > max + 0.05) return { error: "discount_over_limit", pct: Math.round(pct * 10) / 10, max, itemId: l.itemId };
+          }
+        }
+      }
+
       const total = Math.round(subtotal * 100) / 100;
       const taxRate = taxApplicable ? Number(settings.tax_rate) : 0;
       const taxAmount = taxApplicable ? extractInclusiveTax(total, taxRate) : 0;
@@ -159,13 +176,28 @@ router.post("/sales", async (req, res, next) => {
         return { r, use, done: r.item_in_sale || use >= left - 0.005 };
       });
       const depositApplied = Math.round(rsvUse.reduce((a, x) => a + x.use, 0) * 100) / 100;
-      // ما يدفعه العميل الآن = الإجمالي − العربون المقبوض سلفًا
-      const payable = Math.round((total - depositApplied) * 100) / 100;
-      if (paymentMethod === "split" && depositApplied > 0) {
-        // العربون يُخصم من النقد أولًا ثم من الشبكة
-        const fromCash = Math.min(cashPart, depositApplied);
+      // ── بطاقة هدية (وحدة giftCards — migration 052): رصيدها يُدفع به جزءٌ من الفاتورة، مدين 2260 ──
+      let giftCard = null;
+      let giftApplied = 0;
+      if (body.giftCardCode && Number(body.giftAmount) > 0) {
+        const mods = await loadModules(client, req.auth.branchId);
+        if (!modOn(mods, "giftCards")) return { error: "module_off", module: "giftCards" };
+        if (paymentMethod === "credit" || paymentMethod === "trade_in") return { error: "gift_card_payment_method" };
+        const { rows: gc } = await client.query(
+          "select * from gift_cards where branch_id = $1 and upper(code) = upper($2) for update", [req.auth.branchId, String(body.giftCardCode).trim()]);
+        giftCard = gc[0];
+        if (!giftCard || giftCard.status !== "active") return { error: "gift_card_not_found" };
+        giftApplied = Math.round(Math.min(Number(body.giftAmount), Number(giftCard.balance), total - depositApplied) * 100) / 100;
+        if (!(giftApplied > 0)) return { error: "gift_card_empty" };
+      }
+      const prepaid = Math.round((depositApplied + giftApplied) * 100) / 100;
+      // ما يدفعه العميل الآن = الإجمالي − العربون المقبوض سلفًا − رصيد البطاقة
+      const payable = Math.round((total - prepaid) * 100) / 100;
+      if (paymentMethod === "split" && prepaid > 0) {
+        // المدفوع سلفًا يُخصم من النقد أولًا ثم من الشبكة
+        const fromCash = Math.min(cashPart, prepaid);
         cashPart = Math.round((cashPart - fromCash) * 100) / 100;
-        networkPart = Math.round((networkPart - (depositApplied - fromCash)) * 100) / 100;
+        networkPart = Math.round((networkPart - (prepaid - fromCash)) * 100) / 100;
       }
 
       if (paymentMethod === "split") {
@@ -347,6 +379,7 @@ router.post("/sales", async (req, res, next) => {
       const debitLines = [];
       // العربون المقبوض سلفًا يُطفئ 2210 بدل أن يُقبض مرّةً ثانية
       if (depositApplied > 0) debitLines.push({ account: "2210", side: "debit", amount: depositApplied });
+      if (giftApplied > 0) debitLines.push({ account: "2260", side: "debit", amount: giftApplied });
       if (paymentMethod === "cash") {
         if (payable > 0) debitLines.push({ account: "1130", side: "debit", amount: payable });
       } else if (paymentMethod === "card") {
@@ -383,6 +416,27 @@ router.post("/sales", async (req, res, next) => {
       }
       if (rsvUse.length) {
         await client.query("update sales set reservation_id = $1, deposit_applied = $2 where id = $3", [rsvUse[0].r.id, depositApplied, sale.id]);
+      }
+
+      if (giftCard) {
+        const left = Math.round((Number(giftCard.balance) - giftApplied) * 100) / 100;
+        await client.query("update gift_cards set balance = $2::numeric, status = case when $2::numeric <= 0 then 'used' else status end where id = $1", [giftCard.id, left]);
+        await client.query("insert into gift_card_tx (card_id, kind, amount, sale_id, created_by) values ($1,'redeem',$2,$3,$4)", [giftCard.id, giftApplied, sale.id, req.auth.userId]);
+        await client.query("update sales set gift_card_id = $1, gift_applied = $2 where id = $3", [giftCard.id, giftApplied, sale.id]);
+      }
+
+      // ── نقاط الولاء (وحدة loyalty): نقطةٌ لكل «sarPerPoint» مدفوعة نقدًا أو شبكة لعميلٍ مسجَّل ──
+      let pointsEarned = 0;
+      if (customerId && paymentMethod !== "credit") {
+        const mods = await loadModules(client, req.auth.branchId);
+        if (modOn(mods, "loyalty")) {
+          const cfgL = modCfg(mods, "loyalty");
+          pointsEarned = Math.floor(Math.max(0, payable) / (Number(cfgL.sarPerPoint) || 100));
+          if (pointsEarned > 0) {
+            await client.query("insert into loyalty_ledger (branch_id, customer_id, points, sale_id, note, created_by) values ($1,$2,$3,$4,$5,$6)",
+              [req.auth.branchId, customerId, pointsEarned, sale.id, `فاتورة ${sale.ref}`, req.auth.userId]);
+          }
+        }
       }
 
       const journalEntryId = await postJournalEntry(client, {
@@ -424,7 +478,7 @@ router.post("/sales", async (req, res, next) => {
       );
 
       return {
-        sale: { id: sale.id, ref: sale.ref, total, taxAmount, netAmount, paymentMethod, depositApplied, payable },
+        sale: { id: sale.id, ref: sale.ref, total, taxAmount, netAmount, paymentMethod, depositApplied, giftApplied, payable, pointsEarned },
         journalEntryId,
         feeJournalEntryId,
         ...(paymentMethod === "trade_in"

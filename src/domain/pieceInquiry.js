@@ -18,7 +18,7 @@ async function buildPieceInquiry(client, branchId, codes, { showCost = false } =
   const { rows } = await client.query(
     `select u.id as unit_id, u.code, u.epc, u.sold, u.issued, u.issued_at, u.printed, u.sale_id, u.held, u.held_at, u.held_by, u.held_ref, u.held_note,
             i.id as item_id, i.ref as item_ref, i.karat, i.weight, i.stones_weight, i.cost_per_gram, i.workmanship,
-            i.from_scrap, i.photo_url, i.date_added, i.reserved_for, i.lot_id,
+            i.from_scrap, i.photo_url, i.attrs, i.date_added, i.reserved_for, i.lot_id,
             c.name as category, cu.name as coded_by,
             (select count(*)::int from item_units x where x.item_id = i.id) as units_total,
             (select count(*)::int from item_units x where x.item_id = i.id and not x.sold and not x.issued) as units_available,
@@ -60,7 +60,7 @@ async function buildPieceInquiry(client, branchId, codes, { showCost = false } =
       asked: a, found: true, code: r.code, itemId: r.item_id, unitId: r.unit_id, status,
       held: r.held ? { at: r.held_at, by: r.held_by || "", ref: r.held_ref || "", note: r.held_note || "" } : null,
       category: r.category || "", ref: r.item_ref, karat: r.karat, weight: roundWeight(weight),
-      fine: fineWeight(weight, r.karat), stonesWeight: roundWeight(Number(r.stones_weight) || 0),
+      fine: fineWeight(weight, r.karat), stonesWeight: roundWeight(Number(r.stones_weight) || 0), gem: r.attrs?.gem || null, watch: r.attrs?.watch || null,
       workmanship: roundMoney(r.workmanship), photo: r.photo_url || null,
       ...(showCost ? { costPerGram: Number(r.cost_per_gram) || 0, cost } : {}),
       codedBy: r.coded_by || "", codedAt: r.date_added, fromScrap: !!r.from_scrap, printed: !!r.printed,
