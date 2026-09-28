@@ -1,5 +1,5 @@
 -- ============================================================
--- Ounce (أونصة) — PostgreSQL / Supabase schema
+-- Awnsah (أونصة) — PostgreSQL / Supabase schema
 -- Generated from the verified frontend reference: keys.js, chart.js,
 -- erp.js, money.js, data-model-spec.md.
 -- Run this in the Supabase SQL Editor on a fresh project.

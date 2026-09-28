@@ -22,7 +22,7 @@ const BRANCH_SCREENS = [
   ["backup", "النسخ الاحتياطي"], ["purchases", "المشتريات"], ["trustAccounts", "الحسابات الجارية"], ["customers", "العملاء"],
   ["reservations", "الحجوزات"], ["safeAudit", "جرد الخزنة"], ["suppliers", "الموردين"], ["taskirat", "تسكيرات"], ["partners", "حسابات الشركاء"],
   ["access", "صلاحيات الوصول"], ["taxReport", "تقرير الضرائب"], ["settings", "الإعدادات"], ["openingCompare", "مقارنة بالافتتاحي"],
-  ["financials", "القوائم المالية والزكاة"], ["repairs", "إصلاحات"], ["aiAssistant", "أوقية (المساعد)"], ["navCustomize", "تخصيص القائمة"],
+  ["financials", "القوائم المالية والزكاة"], ["repairs", "إصلاحات"], ["aiAssistant", "أونصة (المساعد)"], ["navCustomize", "تخصيص القائمة"],
   ["openingBalance", "الرصيد الافتتاحي"], ["fixedAssets", "الأصول الثابتة"], ["payroll", "الرواتب"], ["attendanceHr", "الحضور والإجازات"],
   ["hqReports", "تقرير الفروع"], ["hqDocs", "معاملات الإدارة"], ["codingReport", "تقرير التكويد"], ["queryBuilder", "مُنشئ الاستعلام"],
   ["priceFix", "التثبيت ذهب ↔ نقد"], ["generalLedger", "الأستاذ العام"], ["masterReport", "التقارير الموحّدة"], ["anyStatement", "كشف حساب — أي شيء"],

@@ -1,5 +1,5 @@
 -- ============================================================
--- Ounce (أونصة) — seed data
+-- Awnsah (أونصة) — seed data
 -- Chart of accounts transcribed verbatim from src/core/chart.js
 -- (CHART_OF_ACCOUNTS). Run this once, right after schema.sql,
 -- against the same database.
