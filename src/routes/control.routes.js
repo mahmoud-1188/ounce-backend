@@ -10,6 +10,7 @@ import { roundMoney } from "../domain/money.js";
 import { getOpenBusinessDay } from "../domain/saleOps.js";
 import { shapeApproval } from "../domain/approvals.js";
 import { logPermission } from "../domain/permissionLog.js";
+import { ENROLL_TTL_MIN, codeHash, issueEnrollCode } from "../domain/enroll.js";
 import { monthRange, recordedNetworkFees, settleBankFeePeriod, shapeAdjustment } from "../domain/bankFees.js";
 
 const router = Router();
@@ -228,9 +229,6 @@ router.get("/permission-log", authenticate, requirePage("access"), async (req, r
 // ══ ⑤ ربط جهاز الموظّف بـQR ══════════════════════════════════════════
 // الرمز قصير (يسعه QR) ومن أبجدية كبيرة؛ يُخزَّن مُجزَّأً فقط، صالحٌ
 // ENROLL_TTL_MIN دقيقة ولمرةٍ واحدة. لا يحمل رقمًا سريًّا — الموظّف يضعه.
-const ENROLL_TTL_MIN = 30;
-const ENROLL_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const codeHash = (code) => crypto.createHash("sha256").update(String(code).trim().toUpperCase()).digest("hex");
 
 router.post("/users/:id/enroll-invite", authenticate, requirePage("access"), requireManager, async (req, res, next) => {
   try {
@@ -243,25 +241,10 @@ router.post("/users/:id/enroll-invite", authenticate, requirePage("access"), req
       if (!u) return { error: "not_found" };
       // ⚠ دور المدير تُصدره الإدارة وحدها: لولا ذلك لربط أي مديرٍ مديرًا آخر
       if (u.role === "manager" && u.id !== req.auth.userId) return { error: "manager_enroll_requires_hq" };
-      const bytes = crypto.randomBytes(10);
-      let body = "";
-      for (const x of bytes) body += ENROLL_ALPHABET[x % ENROLL_ALPHABET.length];
-      const code = `OQE1${body}`;
-      const expiresAt = new Date(Date.now() + ENROLL_TTL_MIN * 60 * 1000);
-      await client.query(
-        "update enroll_invites set used_at = now() where user_id = $1 and used_at is null",
-        [u.id]
-      );
-      await client.query(
-        `insert into enroll_invites (branch_id, user_id, code_hash, expires_at, created_by)
-         values ($1,$2,$3,$4,$5)`,
-        [req.auth.branchId, u.id, codeHash(code), expiresAt, req.auth.userId]
-      );
-      await logPermission(client, req.auth.branchId, {
-        targetId: u.id, targetName: u.name, kind: "enroll",
+      return issueEnrollCode(client, {
+        branchId: req.auth.branchId, user: u, createdBy: req.auth.userId,
         actor: { id: req.auth.userId, name: req.auth.user?.name, kind: "branch" },
       });
-      return { code, expiresAt, ttlMin: ENROLL_TTL_MIN, user: { id: u.id, name: u.name, role: u.role } };
     });
     if (result.error) return res.status(result.error === "not_found" ? 404 : 403).json(result);
     res.status(201).json(result);

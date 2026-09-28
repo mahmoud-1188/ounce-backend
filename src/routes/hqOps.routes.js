@@ -2,6 +2,7 @@ import { Router } from "express";
 import { withBranch, withoutBranch } from "../db.js";
 import { authenticateStore, requireCanManageBranches, requireStoreOwner } from "../middleware/storeAuth.js";
 import { closeMonth, fiscalStatus } from "../domain/periodClose.js";
+import { issueEnrollCode } from "../domain/enroll.js";
 
 const router = Router();
 
@@ -13,6 +14,7 @@ const router = Router();
  *   POST /store/branches/:branchId/remote-stocktake { counts:[{itemId, countedQty}], note }
  *   GET  /store/branches/:branchId/remote-stocktakes
  *   GET  /store/ops-log                              — ما فعلته الإدارة في كل الفروع (من سجلّ تدقيقها)
+ *   POST /store/branches/:branchId/users/:id/enroll-invite — رمز ربط جهاز لأي موظف (ومنهم المدير: الإدارة وحدها تربط جهاز المدير)
  *   PATCH /store/users/:id/hq-role { hqRole }       — الدور الوظيفي في الهيكل الإداري (تسعة أدوار المرجع)
  */
 router.use("/store", authenticateStore);
@@ -119,6 +121,27 @@ router.get("/store/ops-log", async (req, res, next) => {
     }
     all.sort((x, y) => String(y.date).localeCompare(String(x.date)));
     res.json({ log: all.slice(0, 200) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/store/branches/:branchId/users/:id/enroll-invite", requireCanManageBranches, async (req, res, next) => {
+  try {
+    const b = await inStore(req.storeAuth.storeId, req.params.branchId);
+    if (!b) return res.status(404).json({ error: "branch_not_found" });
+    const r = await withBranch(req.params.branchId, async (c) => {
+      const { rows } = await c.query("select id, name, role from users where id = $1 and branch_id = $2 and active = true", [req.params.id, req.params.branchId]);
+      if (!rows[0]) return { error: "not_found" };
+      const out = await issueEnrollCode(c, { branchId: req.params.branchId, user: rows[0], createdBy: null,
+        actor: { name: `الإدارة — ${req.storeAuth.name || ""}`.trim(), kind: "store" } });
+      await c.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'create',null,'enroll_invites',null,$2)`,
+        [req.params.branchId, JSON.stringify({ kind: "enroll_invite", by: req.storeAuth.name || "الإدارة", byKind: "store", user: rows[0].name })]);
+      return { ...out, branchRef: b.ref, branchName: b.name };
+    });
+    if (r.error) return res.status(404).json(r);
+    res.status(201).json(r);
   } catch (err) {
     next(err);
   }
