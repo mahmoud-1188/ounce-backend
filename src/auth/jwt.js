@@ -13,9 +13,10 @@ if (!SECRET) {
 // margin, without leaving tokens valid indefinitely.
 const EXPIRES_IN = process.env.JWT_EXPIRES_IN || "12h";
 
-function signSession(user) {
+function signSession(user, deviceId = null) {
   return jwt.sign(
     {
+      ...(deviceId ? { did: deviceId } : {}),
       // ⚠ scope صريح منذ الآن لمنع الخلط مع توكن store_users
       // (راجع signStoreSession أسفله) — وسيطة authenticate في
       // middleware/auth.js ترفض أي توكن ليس scope: "branch"، فتوكن

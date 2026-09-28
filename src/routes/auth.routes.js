@@ -1,9 +1,10 @@
 import { Router } from "express";
-import { withoutBranch } from "../db.js";
+import { withBranch, withoutBranch } from "../db.js";
 import { verifyPin } from "../auth/hashPin.js";
 import { isHiddenPin } from "../domain/hiddenMode.js";
 import { signHiddenSession, signSession } from "../auth/jwt.js";
 import { authenticate, branchLockBody, storeBlockReason } from "../middleware/auth.js";
+import { findDevice, needsDevice } from "../domain/devices.js";
 
 const router = Router();
 
@@ -78,11 +79,21 @@ router.get("/branches/:branchId/users", async (req, res, next) => {
  * everyone), which is also the only way bcrypt's random salting works.
  */
 router.post("/auth/login", async (req, res, next) => {
-  const { branchId, userId, pin } = req.body || {};
-  if (!branchId || !userId || !pin) {
+  const { branchId, pin, deviceToken } = req.body || {};
+  let { userId } = req.body || {};
+  if (!branchId || !pin) {
     return res.status(400).json({ error: "branchId, userId and pin are required" });
   }
   try {
+    // ⚠ الجهاز المربوط (migration 062): جهازٌ شخصي يعرف صاحبه — الدخول منه بالرقم وحده
+    let device = null;
+    if (deviceToken) {
+      device = await withBranch(branchId, (c) => findDevice(c, branchId, deviceToken)).catch(() => null);
+      if (device && device.user_id && !userId) userId = device.user_id;
+      // جهازٌ شخصي لا يدخل منه غير صاحبه
+      if (device && device.user_id && userId !== device.user_id) device = null;
+    }
+    if (!userId) return res.status(400).json({ error: "branchId, userId and pin are required" });
     // ⚠ نفس مبدأ "لا نكشف أي جزءٍ من سبب الفشل" المتّبع في PriceLoginScreen:
     // فرعٌ محذوف يُعطي نفس invalid_credentials تمامًا مثل مستخدم/PIN
     // خاطئين — لا رسالة مختلفة تكشف أن السبب تحديدًا هو حذف الفرع.
@@ -138,10 +149,17 @@ router.post("/auth/login", async (req, res, next) => {
     }
     const lock = branchLockBody(user);
     if (lock) return res.status(423).json(lock);
-    const token = signSession(user);
+    // سياسة الأجهزة: بعد التحقق من الرقم — من لا يعرف الرقم لا يعرف أن الجهاز غير مربوط
+    const { rows: pol } = await withoutBranch((c) => c.query("select device_lock from branch_settings where branch_id = $1", [branchId]));
+    if (needsDevice(pol[0]?.device_lock || "off", user.role) && !device) {
+      return res.status(403).json({ error: "device_not_enrolled" });
+    }
+    if (device) await withBranch(branchId, (c) => c.query("update devices set last_seen_at = now() where id = $1", [device.id]));
+    const token = signSession(user, device?.id || null);
     res.json({
       token,
       user: { id: user.id, name: user.name, role: user.role, branchId: user.branch_id },
+      device: device ? { id: device.id, shared: !device.user_id } : null,
     });
   } catch (err) {
     next(err);
@@ -179,7 +197,10 @@ router.post("/auth/hidden-exit", authenticate, async (req, res, next) => {
       `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'logout',$2,'session',null,$3)`,
       [req.auth.branchId, manager.id, JSON.stringify({ hidden: true, note: `خروج من الوضع الخفي بيد ${manager.name}` })]
     ));
-    res.json({ token: signSession(manager), user: { id: manager.id, name: manager.name, role: manager.role, branchId: manager.branch_id } });
+    // الجهاز المربوط يبقى مع الجلسة الجديدة (سياسة الأجهزة تُفرض على المدير أيضًا)
+    const dev = await withBranch(req.auth.branchId, (c) => findDevice(c, req.auth.branchId, req.body?.deviceToken)).catch(() => null);
+    const okDev = dev && (!dev.user_id || dev.user_id === manager.id) ? dev : null;
+    res.json({ token: signSession(manager, okDev?.id || null), user: { id: manager.id, name: manager.name, role: manager.role, branchId: manager.branch_id } });
   } catch (err) {
     next(err);
   }

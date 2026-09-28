@@ -11,6 +11,8 @@ import { getOpenBusinessDay } from "../domain/saleOps.js";
 import { shapeApproval } from "../domain/approvals.js";
 import { logPermission } from "../domain/permissionLog.js";
 import { ENROLL_TTL_MIN, codeHash, issueEnrollCode } from "../domain/enroll.js";
+import { branchDevices, createDevice, deviceLabel, revokeDevice } from "../domain/devices.js";
+import { signSession } from "../auth/jwt.js";
 import { monthRange, recordedNetworkFees, settleBankFeePeriod, shapeAdjustment } from "../domain/bankFees.js";
 
 const router = Router();
@@ -257,18 +259,27 @@ router.post("/users/:id/enroll-invite", authenticate, requirePage("access"), req
 router.post("/enroll/claim", async (req, res, next) => {
   const { branchId, code, pin } = req.body || {};
   if (!branchId || !code) return res.status(400).json({ error: "code_required" });
-  if (!/^\d{4,6}$/.test(String(pin || ""))) return res.status(400).json({ error: "pin_must_be_4_to_6_digits" });
+  const shared = String(code).trim().toUpperCase().startsWith("OQD1");
+  if (!shared && !/^\d{4,6}$/.test(String(pin || ""))) return res.status(400).json({ error: "pin_must_be_4_to_6_digits" });
   try {
     const result = await withBranch(branchId, async (client) => {
       const { rows } = await client.query(
-        `select i.*, u.name, u.active from enroll_invites i join users u on u.id = i.user_id
+        `select i.*, u.name, u.active, u.role, u.branch_id as user_branch from enroll_invites i left join users u on u.id = i.user_id
           where i.branch_id = $1 and i.code_hash = $2 for update of i`,
         [branchId, codeHash(code)]
       );
       const inv = rows[0];
-      if (!inv || !inv.active) return { error: "invalid_enroll_code" };
+      if (!inv || (inv.kind !== "shared" && !inv.active)) return { error: "invalid_enroll_code" };
       if (inv.used_at) return { error: "enroll_code_used" };
       if (new Date(inv.expires_at).getTime() < Date.now()) return { error: "enroll_code_expired" };
+      const ua = req.headers["user-agent"] || "";
+      // ── جهاز الفرع المشترك: لا موظّف ولا رقم — مفتاح جهازٍ للفرع وحده ──
+      if (inv.kind === "shared") {
+        const dev = await createDevice(client, { branchId, userId: null, label: `جهاز الفرع · ${deviceLabel(ua)}`, userAgent: ua, createdBy: "رمز ربط" });
+        await client.query("update enroll_invites set used_at = now() where id = $1", [inv.id]);
+        await logPermission(client, branchId, { targetName: "جهاز الفرع", kind: "enroll", after: { device: dev.deviceId, shared: true }, actor: { name: "جهاز الفرع", kind: "self" } });
+        return { ok: true, shared: true, deviceToken: dev.deviceToken, deviceId: dev.deviceId };
+      }
       // الرقم لا يتكرّر في الفرع (نفس حارس إضافة المستخدم)
       const { rows: others } = await client.query(
         "select id, pin_hash from users where branch_id = $1 and active = true and id <> $2",
@@ -278,11 +289,14 @@ router.post("/enroll/claim", async (req, res, next) => {
       if (await isHiddenPin(client, branchId, pin)) return { error: "pin_taken" };
       await client.query("update users set pin_hash = $1 where id = $2", [await hashPin(String(pin)), inv.user_id]);
       await client.query("update enroll_invites set used_at = now() where id = $1", [inv.id]);
+      const dev = await createDevice(client, { branchId, userId: inv.user_id, label: deviceLabel(ua), userAgent: ua, createdBy: "رمز ربط" });
       await logPermission(client, branchId, {
         targetId: inv.user_id, targetName: inv.name, kind: "enroll",
-        after: { claimed: true }, actor: { id: inv.user_id, name: inv.name, kind: "self" },
+        after: { claimed: true, device: dev.deviceId }, actor: { id: inv.user_id, name: inv.name, kind: "self" },
       });
-      return { ok: true, user: { id: inv.user_id, name: inv.name } };
+      // الربط يُدخل الموظّف مباشرةً — لا رجوع لشاشة الدخول ليكتب رقمه مرّةً ثانية
+      const token = signSession({ id: inv.user_id, branch_id: branchId, role: inv.role, name: inv.name }, dev.deviceId);
+      return { ok: true, user: { id: inv.user_id, name: inv.name, role: inv.role, branchId }, token, deviceToken: dev.deviceToken, deviceId: dev.deviceId };
     });
     if (result.error) return res.status(result.error === "pin_taken" ? 409 : 400).json(result);
     res.json(result);
@@ -291,6 +305,29 @@ router.post("/enroll/claim", async (req, res, next) => {
     if (err && err.code === "22P02") return res.status(400).json({ error: "invalid_enroll_code" });
     next(err);
   }
+});
+
+/// أجهزة الدخول في الفرع (migration 062) — المدير يرى ويُلغي ويربط «جهاز الفرع» المشترك؛ السياسة تضبطها الإدارة
+router.get("/devices", authenticate, requirePage("access"), async (req, res, next) => {
+  try { res.json(await withBranch(req.auth.branchId, (c) => branchDevices(c, req.auth.branchId))); } catch (err) { next(err); }
+});
+router.post("/devices/:id/revoke", authenticate, requirePage("access"), requireManager, async (req, res, next) => {
+  try {
+    const r = await withBranch(req.auth.branchId, async (c) => {
+      const out = await revokeDevice(c, req.auth.branchId, req.params.id, req.auth.user?.name || "مدير الفرع");
+      if (!out.error) await logPermission(c, req.auth.branchId, { kind: "device_revoke", after: { device: req.params.id }, actor: { id: req.auth.userId, name: req.auth.user?.name, kind: "branch" } });
+      return out;
+    });
+    if (r.error) return res.status(404).json(r);
+    res.json(r);
+  } catch (err) { next(err); }
+});
+router.post("/devices/shared-invite", authenticate, requirePage("access"), requireManager, async (req, res, next) => {
+  try {
+    const r = await withBranch(req.auth.branchId, (c) => issueEnrollCode(c, { branchId: req.auth.branchId, user: null, createdBy: req.auth.userId,
+      actor: { id: req.auth.userId, name: req.auth.user?.name, kind: "branch" } }));
+    res.status(201).json(r);
+  } catch (err) { next(err); }
 });
 
 // ══ ⑥ تسوية عمولة البنك — مرّةً للشهر (domain/bankFees.js) ════════════

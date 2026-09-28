@@ -122,13 +122,17 @@ async function authenticate(req, res, next) {
                 r.can_manage_day, r.can_break,
                 s.status as store_status, s.subscription_expires_at, s.hq_policy,
                 b.locked as branch_locked, b.lock_reason as branch_lock_reason,
-                b.locked_at as branch_locked_at, b.locked_by as branch_locked_by
+                b.locked_at as branch_locked_at, b.locked_by as branch_locked_by,
+                coalesce(bs.device_lock, 'off') as device_lock,
+                (select d.revoked_at is null and (d.user_id is null or d.user_id = u.id)
+                   from devices d where d.id = $3 and d.branch_id = u.branch_id) as device_ok
            from users u
            join branches b on b.id = u.branch_id
            join roles r on r.id = u.role
            left join stores s on s.id = b.store_id
+           left join branch_settings bs on bs.branch_id = b.id
           where u.id = $1 and u.branch_id = $2 and u.active = true and b.deleted_at is null`,
-        [payload.sub, payload.branchId]
+        [payload.sub, payload.branchId, payload.did || null]
       )
     );
     const user = rows[0];
@@ -145,6 +149,12 @@ async function authenticate(req, res, next) {
     }
     const lock = branchLockBody(user);
     if (lock) return res.status(423).json(lock);
+
+    // ⚠ الأجهزة المربوطة (migration 062): جهازٌ أُلغي يُخرج صاحبه من أول طلب، والسياسة تُفرض هنا لا عند الدخول وحده
+    if (payload.did && user.device_ok !== true) return res.status(401).json({ error: "device_revoked" });
+    if (!payload.did && (user.device_lock === "all" || (user.device_lock === "managers" && ["manager", "assistant", "accountant"].includes(user.role)))) {
+      return res.status(401).json({ error: "device_not_enrolled" });
+    }
 
     // ⚠ سياسة الإدارة (migration 040) فوق الدور وفوق تخصيص المدير المحلي:
     //   الشاشات تُمنع/تُمنح، والعمليات تُمنع — والفرض هنا لا في الواجهة وحدها.

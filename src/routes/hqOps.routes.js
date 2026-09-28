@@ -3,6 +3,7 @@ import { withBranch, withoutBranch } from "../db.js";
 import { authenticateStore, requireCanManageBranches, requireStoreOwner } from "../middleware/storeAuth.js";
 import { closeMonth, fiscalStatus } from "../domain/periodClose.js";
 import { issueEnrollCode } from "../domain/enroll.js";
+import { branchDevices, revokeDevice } from "../domain/devices.js";
 
 const router = Router();
 
@@ -145,6 +146,51 @@ router.post("/store/branches/:branchId/users/:id/enroll-invite", requireCanManag
   } catch (err) {
     next(err);
   }
+});
+
+// ── أجهزة الدخول المربوطة (migration 062): السياسة لكل فرع · القائمة · الإلغاء · رمز «جهاز الفرع» ──
+router.get("/store/branches/:branchId/devices", requireCanManageBranches, async (req, res, next) => {
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    res.json(await withBranch(req.params.branchId, (c) => branchDevices(c, req.params.branchId)));
+  } catch (err) { next(err); }
+});
+router.put("/store/branches/:branchId/device-lock", requireCanManageBranches, async (req, res, next) => {
+  const mode = String(req.body?.mode || "");
+  if (!["off", "managers", "all"].includes(mode)) return res.status(400).json({ error: "invalid_mode" });
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const out = await withBranch(req.params.branchId, async (c) => {
+      await c.query(`insert into branch_settings (branch_id, device_lock) values ($1,$2)
+                     on conflict (branch_id) do update set device_lock = excluded.device_lock`, [req.params.branchId, mode]);
+      await c.query(`insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'update',null,'branch_settings',null,$2)`,
+        [req.params.branchId, JSON.stringify({ kind: "device_lock", mode, by: req.storeAuth.name || "الإدارة", byKind: "store" })]);
+      return branchDevices(c, req.params.branchId);
+    });
+    res.json(out);
+  } catch (err) { next(err); }
+});
+router.post("/store/branches/:branchId/devices/:deviceId/revoke", requireCanManageBranches, async (req, res, next) => {
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const r = await withBranch(req.params.branchId, async (c) => {
+      const out = await revokeDevice(c, req.params.branchId, req.params.deviceId, `الإدارة — ${req.storeAuth.name || ""}`.trim());
+      if (!out.error) await c.query(`insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'update',null,'devices',$2,$3)`,
+        [req.params.branchId, req.params.deviceId, JSON.stringify({ kind: "device_revoke", by: req.storeAuth.name || "الإدارة", byKind: "store" })]);
+      return out;
+    });
+    if (r.error) return res.status(404).json(r);
+    res.json(r);
+  } catch (err) { next(err); }
+});
+router.post("/store/branches/:branchId/shared-device-invite", requireCanManageBranches, async (req, res, next) => {
+  try {
+    const b = await inStore(req.storeAuth.storeId, req.params.branchId);
+    if (!b) return res.status(404).json({ error: "branch_not_found" });
+    const r = await withBranch(req.params.branchId, (c) => issueEnrollCode(c, { branchId: req.params.branchId, user: null, createdBy: null,
+      actor: { name: `الإدارة — ${req.storeAuth.name || ""}`.trim(), kind: "store" } }));
+    res.status(201).json({ ...r, branchRef: b.ref, branchName: b.name });
+  } catch (err) { next(err); }
 });
 
 const HQ_ROLE_IDS = ["chairman", "gm", "finance", "operations", "admin", "auditor", "hq_clerk", "hq_coder", "hq_warehouse"];
