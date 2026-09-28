@@ -5,6 +5,7 @@ import { postJournalEntry } from "../domain/journal.js";
 import { getOpenBusinessDay } from "../domain/saleOps.js";
 import { roundMoney } from "../domain/money.js";
 import { ACCOUNTANT_AI_SYSTEM, ACCOUNTANT_AI_TOOLS, maskPII, runAccountantTool, shapeProposal } from "../domain/accountantTools.js";
+import { aiConfig, aiMessages } from "../domain/aiProvider.js";
 
 const router = Router();
 
@@ -48,13 +49,13 @@ router.post("/ai/chat", authenticate, async (req, res, next) => {
       return res.status(403).json({ error: "ai_not_allowed" });
     }
 
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      console.error("ANTHROPIC_API_KEY missing from environment");
+    const cfg = aiConfig();
+    if (!cfg.apiKey) {
+      console.error("AI key missing from environment (DEEPSEEK_API_KEY / ANTHROPIC_API_KEY)");
       return res.status(503).json({ error: "ai_not_configured" });
     }
 
-    const { messages, max_tokens, model } = req.body || {};
+    const { messages, max_tokens, system } = req.body || {};
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: "messages_required" });
     }
@@ -63,26 +64,15 @@ router.post("/ai/chat", authenticate, async (req, res, next) => {
     // يحمي من استنزاف الرصيد المشترك عبر طلب معدَّل أو خاطئ.
     const safeMaxTokens = Math.min(Number(max_tokens) || 900, 4000);
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        // ⚠ الفرونت إند لا يُسمح له باختيار موديل تعسفيًا — فقط تمرير
-        // اسم معروف مسبقًا إن أراد؛ الافتراضي مطابق لما كان مضمَّنًا
-        // في كل نداء قديم مباشر.
-        model: typeof model === "string" && model ? model : "claude-sonnet-4-6",
-        max_tokens: safeMaxTokens,
-        messages,
-      }),
+    // ⚠ الموديل من الخادم وحده (AI_CHAT_MODEL) — الواجهة لا تختاره
+    const { ok, status, payload } = await aiMessages(cfg, {
+      model: cfg.chatModel,
+      max_tokens: safeMaxTokens,
+      ...(typeof system === "string" && system ? { system } : {}),
+      messages,
     });
-
-    const payload = await response.json();
-    if (!response.ok) {
-      console.error("Anthropic API error:", response.status, payload);
+    if (!ok) {
+      console.error(`AI API error (${cfg.provider}):`, status, payload);
       return res.status(502).json({ error: "ai_upstream_error" });
     }
 
@@ -100,31 +90,26 @@ router.post("/ai/chat", authenticate, async (req, res, next) => {
 // يُعاد رقمٌ قديم من ذاكرة المحادثة.
 const AI_REVIEWERS = ["manager", "accountant"];
 
-async function callModel({ apiKey, messages, system, tools }) {
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({
-      model: process.env.AI_MODEL || "claude-sonnet-4-6",
-      max_tokens: 1800,
-      tools,
-      system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }],
-      messages,
-    }),
+async function callModel({ cfg, messages, system, tools }) {
+  const { ok, status, payload } = await aiMessages(cfg, {
+    model: cfg.model,
+    max_tokens: 1800,
+    tools,
+    system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }],
+    messages,
   });
-  const payload = await r.json().catch(() => null);
-  if (!r.ok) {
-    console.error("Anthropic API error:", r.status, payload);
+  if (!ok) {
+    console.error(`AI API error (${cfg.provider}):`, status, payload);
     const e = new Error("ai_upstream_error");
-    e.status = r.status;
+    e.status = status;
     throw e;
   }
   return payload;
 }
 
 router.post("/ai/accountant", authenticate, requirePage("aiAccountant"), async (req, res, next) => {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return res.status(503).json({ error: "ai_not_configured" });
+  const cfg = aiConfig();
+  if (!cfg.apiKey) return res.status(503).json({ error: "ai_not_configured" });
   const history = Array.isArray(req.body?.messages) ? req.body.messages : [];
   const convo = history
     .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim())
@@ -137,7 +122,7 @@ router.post("/ai/accountant", authenticate, requirePage("aiAccountant"), async (
   let clarify = null, openScreen = null;
   try {
     for (let round = 0; round < 6; round++) {
-      const reply = await callModel({ apiKey, messages: convo, system: ACCOUNTANT_AI_SYSTEM, tools: ACCOUNTANT_AI_TOOLS });
+      const reply = await callModel({ cfg, messages: convo, system: ACCOUNTANT_AI_SYSTEM, tools: ACCOUNTANT_AI_TOOLS });
       const content = reply?.content || [];
       convo.push({ role: "assistant", content });
       const uses = content.filter((b) => b.type === "tool_use");
