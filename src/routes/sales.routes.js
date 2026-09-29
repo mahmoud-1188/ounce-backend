@@ -7,7 +7,7 @@ import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.
 import { extractInclusiveTax } from "../domain/money.js";
 import { fineWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
-import { insertSaleLines, isStocktakeLocked, postGoldMovement, requireBusinessDay, reserveSaleLines } from "../domain/saleOps.js";
+import { insertCashTx, insertSaleLines, isStocktakeLocked, nextRef, postGoldMovement, requireBusinessDay, reserveSaleLines } from "../domain/saleOps.js";
 
 const router = Router();
 
@@ -799,6 +799,162 @@ router.post("/sales/partial", async (req, res, next) => {
     if (typeof err.message === "string" && err.message.startsWith("journal_entry_unbalanced")) {
       console.error("BUG: partial sale produced an unbalanced journal entry:", err.message);
     }
+    next(err);
+  }
+});
+
+/**
+ * POST /api/sales/set-part — بيع جزءٍ من طقم (المرجع 5.2.0 — قرار المالك 2026-09-29).
+ *
+ * body: { itemId, partLabel, partWeight, total, paymentMethod: cash|card|credit,
+ *         cardNetwork?, customerId?, taxApplicable?, price24Snapshot? }
+ *
+ * الجزء سطرٌ واحد (quantity 1) بوزنه وسعره الشامل للضريبة كأي سطر ذهب — فيعمل
+ * المرتجع عليه كما يعمل على غيره. يخرج من الدفترين الجزء وحده بتكلفته بالوزن،
+ * ويبقى الباقي «بقايا طقم» مملوكًا بوزنه ونصيبه من المصنعية — لا هالك ولا فائض.
+ *   القيد: مدين الصندوق/الذمم بالإجمالي · دائن 4140 بالصافي و2220 بالضريبة.
+ */
+router.post("/sales/set-part", async (req, res, next) => {
+  const body = req.body || {};
+  const { itemId, customerId, cardNetwork } = body;
+  const paymentMethod = body.paymentMethod;
+  const partLabel = String(body.partLabel || "").trim().slice(0, 40);
+  const partWeight = Math.round(Number(body.partWeight) * 1000) / 1000;
+  const total = Math.round(Number(body.total) * 100) / 100;
+
+  if (!itemId) return res.status(400).json({ error: "item_id_required" });
+  if (!partLabel) return res.status(400).json({ error: "part_label_required" });
+  if (!["cash", "card", "credit"].includes(paymentMethod)) return res.status(400).json({ error: "invalid_payment_method" });
+  if (!(partWeight > 0)) return res.status(400).json({ error: "invalid_part_weight" });
+  if (!(total > 0)) return res.status(400).json({ error: "invalid_total" });
+  if (paymentMethod === "credit" && !customerId) return res.status(400).json({ error: "credit_sale_requires_customer" });
+
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      if (await isStocktakeLocked(client, req.auth.branchId)) return { error: "stocktake_locked" };
+      const dayGate = await requireBusinessDay(client, req.auth.branchId);
+      if (dayGate.error) return dayGate;
+      const businessDay = dayGate.day || { id: null, ref: null };
+
+      const { rows: itemRows } = await client.query(
+        `select i.*, c.sale_mode from items i join categories c on c.id = i.category_id
+          where i.id = $1 and i.branch_id = $2 for update of i`,
+        [itemId, req.auth.branchId]
+      );
+      const item = itemRows[0];
+      if (!item) return { error: "item_not_found", itemId };
+      const parts = Array.isArray(item.set_parts) ? item.set_parts : [];
+      if (item.sale_mode !== "set" && !parts.length) return { error: "item_is_not_set", itemId };
+      const { rows: unitRows } = await client.query(
+        "select id, code from item_units where item_id = $1 and sold = false and issued = false order by code limit 1", [item.id]);
+      if (!unitRows[0]) return { error: "insufficient_stock", itemId, available: 0, requested: 1 };
+
+      // الجزء أقلّ من الطقم — بيع الطقم كلّه بيعٌ كامل لا جزئي
+      const available = Number(item.weight);
+      if (partWeight >= available - 0.0005) return { error: "part_weight_not_less_than_set", available, requested: partWeight };
+
+      const ratio = partWeight / available;
+      const wmTotal = Number(item.workmanship) || 0;
+      const wmPart = Math.round(wmTotal * ratio * 100) / 100;
+      const remaining = Math.round((available - partWeight) * 1000) / 1000;
+      // الجزء المبيع يخرج من المكوّنات (أوّل مطابقٍ باسمه)، والباقي يبقى معروفًا لتكويد البقايا
+      const idx = parts.findIndex((p) => String(p.label).trim() === partLabel);
+      const restParts = idx >= 0 ? parts.filter((_, i) => i !== idx) : parts;
+      await client.query(
+        `update items set weight = $1, workmanship = $2, remnant = true, set_parts = $3 where id = $4`,
+        [remaining, Math.round((wmTotal - wmPart) * 100) / 100, JSON.stringify(restParts), item.id]
+      );
+
+      const { rows: settingsRows } = await client.query(
+        "select tax_enabled, tax_rate, card_fees from branch_settings where branch_id = $1", [req.auth.branchId]);
+      const settings = settingsRows[0] || { tax_enabled: true, tax_rate: 0.15, card_fees: {} };
+      const taxApplicable = body.taxApplicable != null ? !!body.taxApplicable : settings.tax_enabled;
+      const taxRate = taxApplicable ? Number(settings.tax_rate) : 0;
+      const taxAmount = taxApplicable ? extractInclusiveTax(total, taxRate) : 0;
+      const netAmount = Math.round((total - taxAmount) * 100) / 100;
+
+      const ref = await nextRef(client, "sales", req.auth.branchId, "SALE");
+      const { rows: saleRows } = await client.query(
+        `insert into sales
+           (branch_id, ref, business_day_id, customer_id, payment_method,
+            price24_snapshot, card_network, cash_part, network_part,
+            subtotal, total, tax_applicable, tax_rate, tax_amount, net_amount,
+            seller_id, created_by)
+         values ($1,$2,$3,$4,$5, $6,$7,$8,$9, $10,$11,$12,$13,$14, $15,$16,$16)
+         returning id, ref`,
+        [
+          req.auth.branchId, ref, businessDay.id, customerId || null, paymentMethod,
+          Number(body.price24Snapshot) || 0, cardNetwork || null,
+          paymentMethod === "cash" ? total : 0, paymentMethod === "card" ? total : 0,
+          total, total, taxApplicable, taxRate, taxAmount, netAmount, req.auth.userId,
+        ]
+      );
+      const sale = saleRows[0];
+      const lineLabel = `${partLabel} من طقم ${unitRows[0].code}`;
+      await client.query(
+        `insert into sale_lines
+           (sale_id, item_id, category, karat, quantity, unit_price,
+            weight_snapshot, cost_per_gram_snapshot, workmanship_snapshot, line_no, part_label)
+         values ($1,$2,$3,$4,1,$5,$6,$7,$8,0,$9)`,
+        [sale.id, item.id, item.category_id, item.karat, total, partWeight, item.cost_per_gram, wmPart, lineLabel]
+      );
+
+      await postGoldMovement(client, {
+        branchId: req.auth.branchId, businessDayId: businessDay.id, opType: "sale",
+        weightByKarat: new Map([[item.karat, partWeight]]), refTable: "sales", refId: sale.id,
+        note: `${lineLabel} — ${sale.ref}`, createdBy: req.auth.userId,
+      });
+
+      let fee = 0;
+      if (paymentMethod !== "credit") {
+        await insertCashTx(client, {
+          branchId: req.auth.branchId, businessDayId: businessDay.id, pool: "daily",
+          method: paymentMethod === "card" ? "network" : "cash", direction: "in", amount: total,
+          category: "sales_revenue", refTable: "sales", refId: sale.id, note: `${lineLabel} — ${sale.ref}`, createdBy: req.auth.userId,
+        });
+      }
+      if (paymentMethod === "card") {
+        const feePct = cardNetwork ? Number((settings.card_fees || {})[cardNetwork]) || 0 : 0;
+        fee = Math.round(total * (feePct / 100) * 100) / 100;
+        if (fee > 0) {
+          await insertCashTx(client, {
+            branchId: req.auth.branchId, businessDayId: businessDay.id, pool: "daily", method: "network", direction: "out",
+            amount: fee, category: "network_fees", refTable: "sales", refId: sale.id, note: `عمولة شبكة ${sale.ref}`, createdBy: req.auth.userId,
+          });
+        }
+      }
+
+      const debitAccount = paymentMethod === "cash" ? "1130" : paymentMethod === "card" ? "1140" : "1310";
+      const journalEntryId = await postJournalEntry(client, {
+        branchId: req.auth.branchId, businessDayId: businessDay.id, opType: "sale_partial",
+        refTable: "sales", refId: sale.id, description: `بيع ${lineLabel} ${sale.ref}`, createdBy: req.auth.userId,
+        lines: [
+          { account: debitAccount, side: "debit", amount: total },
+          { account: "4140", side: "credit", amount: netAmount },
+          ...(taxAmount > 0 ? [{ account: "2220", side: "credit", amount: taxAmount }] : []),
+        ],
+      });
+      if (fee > 0) {
+        await postJournalEntry(client, {
+          branchId: req.auth.branchId, businessDayId: businessDay.id, opType: "network_fee",
+          refTable: "sales", refId: sale.id, description: `عمولة شبكة ${sale.ref}`, createdBy: req.auth.userId,
+          lines: [{ account: "6500", side: "debit", amount: fee }, { account: "1140", side: "credit", amount: fee }],
+        });
+      }
+
+      await client.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
+         values ($1,'create',$2,'sales',$3,$4)`,
+        [req.auth.branchId, req.auth.userId, sale.id, JSON.stringify({ ref: sale.ref, total, paymentMethod, setPart: lineLabel, partWeight, remaining })]
+      );
+      return {
+        sale: { id: sale.id, ref: sale.ref, total, taxAmount, netAmount, paymentMethod, lineLabel },
+        journalEntryId, remainingWeight: remaining, remainingParts: restParts,
+      };
+    });
+    if (result.error) return res.status(result.error === "item_not_found" ? 404 : 409).json(result);
+    res.status(201).json(result);
+  } catch (err) {
     next(err);
   }
 });

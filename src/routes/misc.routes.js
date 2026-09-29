@@ -373,22 +373,9 @@ router.post(
         if (gateQ.error) return gateQ;
         if (gateQ.pending) return { approvalPending: gateQ.pending };
 
-        for (const l of returnedLines) {
-          // ⚠ quantity numeric يصل نصًّا "1.000" — LIMIT يحتاج عددًا صحيحًا.
-          const qty = Math.round(Number(l.quantity) || 0);
-          const { rows: soldUnits } = await client.query(
-            `select id from item_units where item_id = $1 and sold = true
-              order by (sale_id is not distinct from $3) desc, code limit $2`,
-            [l.item_id, qty, sale.id]
-          );
-          if (soldUnits.length < qty) {
-            return { error: "unit_mismatch", itemId: l.item_id, available: soldUnits.length, requested: qty };
-          }
-          await client.query(
-            `update item_units set sold = false, sale_id = null where id = any($1::uuid[])`,
-            [soldUnits.map((r) => r.id)]
-          );
-        }
+        // المعالج نفسه في كل مرتجع — وسطر جزء الطقم يعود وزنًا إلى بقاياه لا وحدةً
+        const restocked = await restockReturnedLines(client, returnedLines, "available");
+        if (restocked.error) return restocked;
 
         const businessDayId = sale.business_day_id;
         const { rows: refRows } = await client.query(

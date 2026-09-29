@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { withBranch, withoutBranch } from "../db.js";
-import { verifyPin } from "../auth/hashPin.js";
+import { hashPin, verifyPin } from "../auth/hashPin.js";
+import { isWeakPin } from "../auth/weakPins.js";
 import { isHiddenPin } from "../domain/hiddenMode.js";
 import { signHiddenSession, signSession } from "../auth/jwt.js";
 import { authenticate, branchLockBody, storeBlockReason } from "../middleware/auth.js";
@@ -155,10 +156,15 @@ router.post("/auth/login", async (req, res, next) => {
       return res.status(403).json({ error: "device_not_enrolled" });
     }
     if (device) await withBranch(branchId, (c) => c.query("update devices set last_seen_at = now() where id = $1", [device.id]));
+    // رقمٌ ضعيف يُغيَّر قبل العمل — يُحفظ فيبقى الطلب بعد تحديث الصفحة
+    const mustChangePin = isWeakPin(pin);
+    if (mustChangePin !== !!user.must_change_pin) {
+      await withBranch(branchId, (c) => c.query("update users set must_change_pin = $1 where id = $2", [mustChangePin, user.id]));
+    }
     const token = signSession(user, device?.id || null);
     res.json({
       token,
-      user: { id: user.id, name: user.name, role: user.role, branchId: user.branch_id },
+      user: { id: user.id, name: user.name, role: user.role, branchId: user.branch_id, mustChangePin },
       device: device ? { id: device.id, shared: !device.user_id } : null,
     });
   } catch (err) {
@@ -213,8 +219,50 @@ router.get("/auth/me", authenticate, (req, res) => {
       name: req.auth.user.name,
       role: req.auth.role,
       branchId: req.auth.branchId,
+      mustChangePin: !req.auth.hidden && !!req.auth.user.must_change_pin,
     },
   });
+});
+
+/**
+ * POST /api/auth/change-pin { currentPin, newPin } — الموظف يغيّر رقمه بنفسه.
+ * ⚠ 4 إلى 6 أرقام · ليس من الأرقام السهلة · لا يطابق رقم موظفٍ آخر في الفرع
+ * ولا رقم الوضع الخفي (رفضٌ واحد «اختر رقمًا آخر» لا يكشف أيّهما).
+ */
+router.post("/auth/change-pin", authenticate, async (req, res, next) => {
+  if (req.auth.hidden) return res.status(403).json({ error: "not_allowed" });
+  const currentPin = String(req.body?.currentPin || "");
+  const newPin = String(req.body?.newPin || "");
+  if (!/^\d{4,6}$/.test(newPin)) return res.status(400).json({ error: "invalid_pin_format" });
+  if (isWeakPin(newPin)) return res.status(400).json({ error: "weak_pin" });
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      const { rows } = await client.query(
+        "select id, pin_hash from users where id = $1 and branch_id = $2 and active = true", [req.auth.userId, req.auth.branchId]);
+      const me = rows[0];
+      if (!me) return { error: "not_found" };
+      if (!(await verifyPin(currentPin, me.pin_hash))) return { error: "invalid_current_pin" };
+      if (currentPin === newPin) return { error: "pin_unchanged" };
+      const { rows: others } = await client.query(
+        "select pin_hash from users where branch_id = $1 and active = true and id <> $2", [req.auth.branchId, me.id]);
+      for (const o of others) if (await verifyPin(newPin, o.pin_hash)) return { error: "pin_taken" };
+      if (await isHiddenPin(client, req.auth.branchId, newPin)) return { error: "pin_taken" };
+      await client.query(
+        "update users set pin_hash = $1, must_change_pin = false, pin_changed_at = now() where id = $2", [await hashPin(newPin), me.id]);
+      await client.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
+         values ($1,'update',$2,'users',$2,$3)`,
+        [req.auth.branchId, me.id, JSON.stringify({ note: "غيّر رقمه السري" })]);
+      return { ok: true };
+    });
+    if (result.error) {
+      const status = result.error === "invalid_current_pin" ? 401 : result.error === "not_found" ? 404 : 409;
+      return res.status(status).json(result);
+    }
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
 });
 
 export default router;

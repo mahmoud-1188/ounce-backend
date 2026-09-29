@@ -83,10 +83,21 @@ router.patch("/settings/branch", requirePage("settings"), requireManager, async 
          returning tax_enabled, tax_rate, card_fees, workday_mode`,
         [req.auth.branchId, taxEnabled, taxRate, JSON.stringify(cardFees), workdayMode]
       );
-      return { settings: rows[0] };
+      // الزكاة: مفتاح التشغيل وسنة الحساب (migration 065)
+      let zakat = null;
+      if (body.zakatEnabled != null || body.zakatYear != null) {
+        if (body.zakatYear != null && !["gregorian", "hijri"].includes(body.zakatYear)) return { error: "invalid_zakat_year" };
+        const { rows: z } = await client.query(
+          `update branch_settings set zakat_enabled = coalesce($2, zakat_enabled), zakat_year = coalesce($3, zakat_year)
+            where branch_id = $1 returning zakat_enabled, zakat_year`,
+          [req.auth.branchId, body.zakatEnabled != null ? !!body.zakatEnabled : null, body.zakatYear ?? null]
+        );
+        zakat = z[0];
+      }
+      return { settings: { ...rows[0], ...(zakat || {}) } };
     });
 
-    if (result.error === "invalid_tax_rate" || result.error === "invalid_workday_mode") {
+    if (result.error === "invalid_tax_rate" || result.error === "invalid_zakat_year" || result.error === "invalid_workday_mode") {
       return res.status(400).json({ error: result.error });
     }
     if (result.error === "settings_locked_by_hq") {

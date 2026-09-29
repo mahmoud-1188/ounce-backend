@@ -70,6 +70,8 @@ async function reserveSaleLines(client, branchId, lines, { excludeUnitIds = [] }
     if (item.sale_mode === "partial") {
       return { error: "item_requires_partial_sale_endpoint", itemId: line.itemId };
     }
+    // ⚠ بقايا طقمٍ بِيع جزءٌ منه لا تُباع طقمًا كاملًا حتى تُكوَّد قطعًا (migration 066)
+    if (item.remnant) return { error: "item_is_set_remnant", itemId: line.itemId };
 
     // ⚠ issued=false: قطعة أُخرجت (تالفة/فاقد) لا تُباع وإن بقيت sold=false.
     const { rows: unsoldRows } = await client.query(
@@ -222,7 +224,14 @@ function computeReturnAmounts(sale, allLines, returnedLines) {
  */
 async function restockReturnedLines(client, returnedLines, restock) {
   const unitIds = [];
+  const partsBack = [];
   for (const l of returnedLines) {
+    if (l.part_label) {
+      const back = await returnSetPart(client, l);
+      if (back.error) return back;
+      partsBack.push(back);
+      continue;
+    }
     // ⚠ sale_lines.quantity من نوع numeric(12,3) فيصل نصًّا "1.000" —
     // وLIMIT يرفضه (22P02) فكان كل مرتجع يفشل بخطأ خادم. عددٌ صحيح هنا.
     const qty = Math.round(Number(l.quantity) || 0);
@@ -243,7 +252,39 @@ async function restockReturnedLines(client, returnedLines, restock) {
     }
     unitIds.push(...ids);
   }
-  return { unitIds };
+  return { unitIds, partsBack };
+}
+
+/**
+ * جزءٌ مرتجع من طقم (migration 066): يعود وزنه ونصيبه من المصنعية إلى بقايا طقمه
+ * إن لم تُكوَّد بعد، وإلا صار بقايا جديدة («جزءٌ مرتجع») للتكويد. رمز الطقم لا يعود.
+ */
+async function returnSetPart(client, l) {
+  const { rows } = await client.query("select * from items where id = $1 for update", [l.item_id]);
+  const set = rows[0];
+  if (!set) return { error: "item_not_found", itemId: l.item_id };
+  const w = Number(l.weight_snapshot) || 0;
+  const wm = Number(l.workmanship_snapshot) || 0;
+  const label = String(l.part_label).split(" من طقم ")[0];
+  const { rows: owned } = await client.query(
+    "select id from item_units where item_id = $1 and sold = false and issued = false limit 1", [set.id]);
+  if (set.remnant && owned[0]) {
+    await client.query(
+      `update items set weight = round((weight + $2)::numeric, 3), workmanship = coalesce(workmanship, 0) + $3,
+              set_parts = coalesce(set_parts, '[]'::jsonb) || $4::jsonb where id = $1`,
+      [set.id, w, wm, JSON.stringify([{ label, weight: w }])]
+    );
+    return { itemId: set.id, weight: w, mode: "merged" };
+  }
+  const ref = await nextRef(client, "items", set.branch_id, "ITM");
+  const { rows: ni } = await client.query(
+    `insert into items (branch_id, ref, lot_id, category_id, karat, weight, cost_per_gram, workmanship,
+                        remnant, remnant_of, set_parts)
+     values ($1,$2,$3,$4,$5,$6,$7,$8, true, $9, $10) returning id`,
+    [set.branch_id, ref, set.lot_id, set.category_id, set.karat, w, set.cost_per_gram, wm, set.id, JSON.stringify([{ label, weight: w }])]
+  );
+  await client.query("insert into item_units (item_id, code) values ($1, $2)", [ni[0].id, ref]);
+  return { itemId: ni[0].id, weight: w, mode: "new", code: ref };
 }
 
 /** سطر نقد مباشر بلا قيد — القيد يكتبه المستند نفسه. */
