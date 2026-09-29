@@ -27,7 +27,7 @@ async function applyStocktake(client, { branchId, userId, entries, price24 = 0, 
         const it = itRows[0];
         if (!it) return { error: "item_not_found", itemId: e.itemId };
         const { rows: freeRows } = await client.query(
-          "select id from item_units where item_id = $1 and sold = false and issued = false order by code desc",
+          "select id, code from item_units where item_id = $1 and sold = false and issued = false order by code desc",
           [it.id]
         );
         const counted = Number(e.countedQty);
@@ -36,7 +36,14 @@ async function applyStocktake(client, { branchId, userId, entries, price24 = 0, 
         const countedWeight = e.countedWeight != null && Number(e.countedWeight) > 0 ? Number(e.countedWeight) : unitW;
 
         if (diff < 0) {
-          const ids = freeRows.slice(0, -diff).map((r) => r.id);
+          // ⚠ العدّ بالمسح يعرف الناقص بعينه (missingCodes): تُخرج تلك الرموز لا أيّ قطعٍ حرّة بعددها —
+          //   وإلا خرجت قطعةٌ قُرئت على الرفّ وبقيت الناقصة «متاحة». الباقي (عدٌّ يدوي) بالعدد كما كان.
+          const wanted = Array.isArray(e.missingCodes) ? e.missingCodes.map((c) => String(c).toUpperCase()) : [];
+          const named = wanted.length
+            ? freeRows.filter((r) => wanted.includes(String(r.code).toUpperCase())).slice(0, -diff)
+            : [];
+          const rest = freeRows.filter((r) => !named.includes(r)).slice(0, -diff - named.length);
+          const ids = [...named, ...rest].map((r) => r.id);
           await client.query(
             "update item_units set issued = true, issued_at = now(), issued_by = $2 where id = any($1::uuid[])",
             [ids, userId]
@@ -108,7 +115,7 @@ async function applyStocktake(client, { branchId, userId, entries, price24 = 0, 
  * POST /api/stocktake/apply — اعتماد الجرد: المخزون يطابق الرفّ، والفرق
  * يمرّ بالدفترين (كان يُعدَّل محليًا فقط فيضيع عند التحميل ولا يصل الدفتر).
  *
- * body: { entries: [{ itemId, countedQty, countedWeight }], price24 }
+ * body: { entries: [{ itemId, countedQty, countedWeight, missingCodes? }], price24 }
  *
  * ⚖ قاعدة السعر: الفرق يُقيَّم بتكلفة الشراء (وزن × تكلفة جرام الصنف
  *   بعياره). سعر اليوم بديلٌ **مُعلَن** لصنفٍ بلا تكلفة — يُذكر عدده في
@@ -188,6 +195,141 @@ router.post("/stocktake/remote/:id/reject", authenticate, requirePage("stocktake
     });
     if (out.error) return res.status(409).json(out);
     res.json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  قطعةٌ مسجّلة مباعة وُجدت في الجرد (migration 063 — قرار المالك 2026-09-29)
+// ══════════════════════════════════════════════════════════════
+//
+// لا إضافة آلية: تُحفظ بند مراجعةٍ بفاتورتها وعميلها ومن قرأها — بلا قيدٍ
+// ولا قطعة، وتبقى «مباعة» فلا تُباع ثانيةً. والمدير يقرّر بسببٍ مكتوب.
+//   GET  /stocktake/sold-found
+//   POST /stocktake/sold-found            { codes: [..], source }
+//   POST /stocktake/sold-found/:id/decide { decision: sale_ok|returned|added, reason, returnId?, heldForCustomer?, price24? }
+
+const soldFoundRow = (r) => ({
+  id: r.id, code: r.unit_code, itemId: r.item_id, saleId: r.sale_id, saleRef: r.sale_ref, saleDate: r.sale_date,
+  customerName: r.customer_name || "", foundBy: r.found_by_name || null, foundAt: r.found_at, source: r.source,
+  status: r.status, heldForCustomer: !!r.held_for_customer, reason: r.reason || "", decidedBy: r.decided_by_name || null,
+  decidedAt: r.decided_at, returnId: r.return_id, newCode: r.new_unit_code || null,
+});
+
+router.get("/stocktake/sold-found", authenticate, requirePage("stocktake"), async (req, res, next) => {
+  try {
+    const rows = await withBranch(req.auth.branchId, async (c) => (await c.query(
+      `select f.*, fu.name as found_by_name, du.name as decided_by_name
+         from stocktake_sold_found f
+         left join users fu on fu.id = f.found_by
+         left join users du on du.id = f.decided_by
+        where f.branch_id = $1 and (f.status = 'pending' or f.decided_at > now() - interval '30 days')
+        order by (f.status = 'pending') desc, f.found_at desc limit 100`, [req.auth.branchId])).rows);
+    res.json({ soldFound: rows.map(soldFoundRow) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/stocktake/sold-found", authenticate, requirePage("stocktake"), async (req, res, next) => {
+  const codes = [...new Set((Array.isArray(req.body?.codes) ? req.body.codes : [])
+    .map((c) => String(c || "").trim().toUpperCase()).filter(Boolean))].slice(0, 500);
+  const source = ["scan", "camera", "rfid", "manual", "hidden"].includes(req.body?.source) ? req.body.source : "scan";
+  if (!codes.length) return res.status(400).json({ error: "no_codes" });
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      const { rows: units } = await client.query(
+        `select u.id, u.code, u.item_id, u.sale_id, s.ref as sale_ref, s.date as sale_date, s.customer_name
+           from item_units u
+           join items i on i.id = u.item_id and i.branch_id = $1
+           left join sales s on s.id = u.sale_id
+          where upper(u.code) = any($2::text[]) and u.sold = true`,
+        [req.auth.branchId, codes]
+      );
+      const recorded = [];
+      for (const u of units) {
+        const { rows } = await client.query(
+          `insert into stocktake_sold_found
+             (branch_id, unit_id, unit_code, item_id, sale_id, sale_ref, sale_date, customer_name, found_by, source)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           on conflict (branch_id, unit_code) where status = 'pending' do nothing
+           returning *`,
+          [req.auth.branchId, u.id, u.code, u.item_id, u.sale_id, u.sale_ref, u.sale_date, u.customer_name, req.auth.userId, source]
+        );
+        if (rows[0]) recorded.push(soldFoundRow(rows[0]));
+      }
+      if (recorded.length) {
+        await client.query(
+          `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
+           values ($1,'update',$2,'stocktake',null,$3)`,
+          [req.auth.branchId, req.auth.userId, JSON.stringify({ soldFound: recorded.map((r) => ({ code: r.code, saleRef: r.saleRef })), source })]
+        );
+      }
+      const known = new Set(units.map((u) => u.code.toUpperCase()));
+      return { recorded, notSold: codes.filter((c) => !known.has(c)) };
+    });
+    res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/stocktake/sold-found/:id/decide", authenticate, requirePage("stocktake"), requireManager, async (req, res, next) => {
+  const body = req.body || {};
+  const decision = body.decision;
+  const reason = String(body.reason || "").trim().slice(0, 300);
+  if (!["sale_ok", "returned", "added"].includes(decision)) return res.status(400).json({ error: "invalid_decision" });
+  if (!reason) return res.status(400).json({ error: "reason_required" });
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      const { rows } = await client.query(
+        "select * from stocktake_sold_found where id = $1 and branch_id = $2 for update", [req.params.id, req.auth.branchId]);
+      const f = rows[0];
+      if (!f) return { error: "not_found" };
+      if (f.status !== "pending") return { error: "already_decided" };
+
+      let returnId = null, newCode = null, journalEntryId = null;
+      if (decision === "returned") {
+        // المرتجع نفسه يمرّ بمساره المعتاد (قيده وضريبته وبوّابة اعتماده) — هنا يُربط برقمه فقط
+        const { rows: ret } = await client.query(
+          "select id from returns where id = $1 and branch_id = $2 and sale_id = $3", [body.returnId || null, req.auth.branchId, f.sale_id]);
+        if (!ret[0]) return { error: "return_not_found" };
+        returnId = ret[0].id;
+      } else if (decision === "added") {
+        // زيادة جرد بتكلفة الصنف في الدفترين برمزٍ جديد — بمعالج الجرد نفسه (قطعةٌ حرّة زائدة)
+        const { rows: free } = await client.query(
+          "select count(*)::int as n from item_units where item_id = $1 and sold = false and issued = false", [f.item_id]);
+        const out = await applyStocktake(client, {
+          branchId: req.auth.branchId, userId: req.auth.userId,
+          entries: [{ itemId: f.item_id, countedQty: free[0].n + 1 }],
+          price24: Number(body.price24) || 0, extra: { soldFound: f.unit_code, saleRef: f.sale_ref },
+        });
+        if (out.error) return out;
+        journalEntryId = out.surplusJournalId;
+        const { rows: nu } = await client.query(
+          "select code from item_units where item_id = $1 and sold = false and issued = false order by code desc limit 1", [f.item_id]);
+        newCode = nu[0]?.code || null;
+      }
+
+      const { rows: upd } = await client.query(
+        `update stocktake_sold_found set status = $2, reason = $3, decided_by = $4, decided_at = now(),
+                held_for_customer = $5, return_id = $6, new_unit_code = $7, journal_entry_id = $8
+          where id = $1 returning *`,
+        [f.id, decision, reason, req.auth.userId, decision === "sale_ok" && !!body.heldForCustomer, returnId, newCode, journalEntryId]
+      );
+      await client.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
+         values ($1,'update',$2,'stocktake',null,$3)`,
+        [req.auth.branchId, req.auth.userId, JSON.stringify({ soldFound: f.unit_code, saleRef: f.sale_ref, decision, reason, newCode })]
+      );
+      return { soldFound: soldFoundRow(upd[0]) };
+    });
+    if (result.error) {
+      const status = result.error === "not_found" || result.error === "item_not_found" ? 404 : 409;
+      return res.status(status).json(result);
+    }
+    res.json(result);
   } catch (err) {
     next(err);
   }

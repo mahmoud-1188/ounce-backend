@@ -6,6 +6,7 @@ import { fineWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
 import { applyMarkup, loadBranchPricePolicy } from "../domain/pricePolicy.js";
 import { approvalGate } from "../domain/approvals.js";
+import { coverDailyNetworkRefund } from "../domain/cashPools.js";
 import {
   computeReturnAmounts, insertCashTx, insertReturnReceipt, insertSaleLines,
   isStocktakeLocked, loadSaleForReturn, nextRef, postGoldMovement, requireBusinessDay, reserveSaleLines, restockReturnedLines,
@@ -453,6 +454,12 @@ router.post(
           receiptRec = rcRows[0];
         } else {
           const { pool, method } = CASH_ACCOUNTS[refundSource];
+          if (pool === "daily" && method === "network") {
+            await coverDailyNetworkRefund(client, {
+              branchId: req.auth.branchId, businessDayId, amount: refund,
+              note: `تغطية ردّ الشبكة ${returnRec.ref || ""} من الخزنة`.trim(), createdBy: req.auth.userId,
+            });
+          }
           cashResult = {
             cashTx: await insertCashTx(client, {
               branchId: req.auth.branchId, businessDayId, pool, method, direction: "out",
@@ -502,13 +509,16 @@ router.post(
 const REFUND_TARGET_ACCOUNTS = {
   daily_cash: "1130",
   safe_cash: "1110",
-  network: "1120", // ⚠ "شبكة" هنا يعني شبكة الخزنة تحديدًا (1120) — لا شبكة اليومي (1140)، مطابقةً لـREFUND_TARGETS في workflow.js حرفيًا.
+  // ⚠ ردّ الشبكة على حساب بيعها نفسه: 1140 (شبكة الصندوق اليومي) — كان 1120
+  //   (شبكة الخزنة) فيبقى 1140 مدينًا ببيعٍ رُدّ. قرار المالك 2026-09-29 (المرجع 5.2.0).
+  //   المرتجعات القديمة تبقى كما رُحِّلت.
+  network: "1140",
   credit: "1310",
 };
 const REFUND_TARGET_CASH_SOURCE = {
   daily_cash: "daily_cash",
   safe_cash: "safe_cash",
-  network: "safe_network",
+  network: "daily_network",
 };
 const RETURN_RESTOCK = {
   changed_mind: "available", wrong_size: "available", wrong_item: "available",
@@ -610,6 +620,12 @@ router.post(
           });
         } else {
           const { pool, method } = CASH_ACCOUNTS[REFUND_TARGET_CASH_SOURCE[refundTarget]];
+          if (pool === "daily" && method === "network") {
+            await coverDailyNetworkRefund(client, {
+              branchId: req.auth.branchId, businessDayId, amount: amounts.gross,
+              note: `تغطية ردّ الشبكة ${returnRec.ref} من الخزنة`, createdBy: req.auth.userId,
+            });
+          }
           cashTx = await insertCashTx(client, {
             branchId: req.auth.branchId, businessDayId, pool, method, direction: "out",
             amount: amounts.gross, category: "sales_return", refTable: "returns", refId: returnRec.id,
