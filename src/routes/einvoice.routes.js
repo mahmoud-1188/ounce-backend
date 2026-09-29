@@ -34,6 +34,19 @@ router.get("/einvoices", ...gate, async (req, res, next) => {
   }
 });
 
+/** GET /api/einvoices/of/:refTable/:refId — مستند فاتورةٍ أو مرتجعٍ بعينه (لرمز QR على الفاتورة المطبوعة). */
+router.get("/einvoices/of/:refTable/:refId", authenticate, async (req, res, next) => {
+  if (!["sales", "returns"].includes(req.params.refTable)) return res.status(400).json({ error: "invalid_ref_table" });
+  try {
+    const e = await withBranch(req.auth.branchId, async (client) => (await client.query(
+      "select * from einvoices where branch_id = $1 and ref_table = $2 and ref_id = $3", [req.auth.branchId, req.params.refTable, req.params.refId])).rows[0]);
+    if (!e) return res.status(404).json({ error: "not_found" });
+    res.json({ einvoice: row(e) });
+  } catch (err) {
+    next(err);
+  }
+});
+
 /** GET /api/einvoices/verify — العدّاد بلا فجوة، وكل PIH تجزئة سابقه، وكل تجزئةٍ تطابق محتوى مستندها اليوم. */
 router.get("/einvoices/verify", ...gate, async (req, res, next) => {
   try {
