@@ -7,6 +7,18 @@ import { fineWeight } from "../domain/weight.js";
 
 const router = Router();
 
+/**
+ * مكوّنات الطقم كما اختارها المكوِّد — تُقبل أسماءً («خاتم») أو كائنات { label, weight }.
+ * ⚠ كانت الشاشة ترسلها (setPieces) والخادم يُسقطها، فلا يُعرف الجزء وقت بيعه.
+ */
+function cleanSetParts(v) {
+  if (!Array.isArray(v)) return [];
+  return v.map((p) => (typeof p === "string" ? { label: p } : p))
+    .filter((p) => p && String(p.label || "").trim())
+    .slice(0, 20)
+    .map((p) => ({ label: String(p.label).trim().slice(0, 40), ...(Number(p.weight) > 0 ? { weight: Math.round(Number(p.weight) * 1000) / 1000 } : {}) }));
+}
+
 router.use("/lots", authenticate, requirePage("addGoods"), requireNotDenied("addGoods"));
 
 const KARATS = [24, 22, 21, 18, 14];
@@ -148,13 +160,14 @@ router.post("/lots/:id/items", async (req, res, next) => {
         const costPerGram = row.costPerGram != null ? Number(row.costPerGram) : Number(lot.cost_per_gram) || null;
         const ref = `ITM-${String(nextRefNum++).padStart(6, "0")}`;
         const attrs = cleanAttrs(row.attrs);
+        const setParts = cleanSetParts(row.setParts ?? row.setPieces);
 
         const { rows: itemRows } = await client.query(
           `insert into items
              (branch_id, ref, lot_id, category_id, karat, weight, stones_weight,
               cost_per_gram, workmanship, lot_workmanship_share, from_scrap,
-              business_day_id, created_by, attrs)
-           values ($1,$2,$3,$4,$5,$6,$7, $8,$9,$10,false, $11,$12, $13)
+              business_day_id, created_by, attrs, set_parts)
+           values ($1,$2,$3,$4,$5,$6,$7, $8,$9,$10,false, $11,$12, $13, $14)
            returning id, ref, karat, weight, stones_weight, cost_per_gram,
                      workmanship, lot_workmanship_share, date_added, attrs`,
           [
@@ -162,6 +175,7 @@ router.post("/lots/:id/items", async (req, res, next) => {
             Number(row.weight), Number(row.stonesWeight) || 0,
             costPerGram, totalWorkmanship, allocatedWorkmanship,
             businessDayId, req.auth.userId, attrs ? JSON.stringify(attrs) : null,
+            JSON.stringify(setParts),
           ]
         );
         const newItem = itemRows[0];
@@ -251,6 +265,81 @@ router.post("/lots/:id/items", async (req, res, next) => {
       const status = result.error === "lot_not_found" || result.error === "category_not_found" ? 404 : 409;
       return res.status(status).json(result);
     }
+    res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/items/:id/code-remnant { pieces: [{ categoryId, weight, setParts? }] }
+ * تكويد بقايا طقم (المرجع 5.2.0: RemnantCodingForm): قطعٌ مجموع أوزانها وزنُ البقايا
+ * — الحارس يرفض غيره — بتكلفة جرام البقايا نفسها، ومصنعيّتها موزّعةٌ بالوزن.
+ * الذهب لا يغادر 1210 (المشغول يبقى مشغولًا بوزنه) فلا قيد ولا حركة وزن؛
+ * وحدة البقايا تُخرج (issued) ويبقى سطرها أثرًا.
+ */
+router.post("/items/:id/code-remnant", authenticate, requirePage("addGoods"), requireNotDenied("addGoods"), async (req, res, next) => {
+  const pieces = Array.isArray(req.body?.pieces) ? req.body.pieces : [];
+  if (!pieces.length) return res.status(400).json({ error: "no_pieces" });
+  for (const p of pieces) {
+    if (!p.categoryId) return res.status(400).json({ error: "missing_field", field: "categoryId" });
+    if (!(Number(p.weight) > 0)) return res.status(400).json({ error: "missing_field", field: "weight" });
+  }
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      const { rows } = await client.query(
+        "select * from items where id = $1 and branch_id = $2 for update", [req.params.id, req.auth.branchId]);
+      const rem = rows[0];
+      if (!rem) return { error: "item_not_found" };
+      if (!rem.remnant) return { error: "not_a_remnant" };
+      const { rows: units } = await client.query(
+        "select id from item_units where item_id = $1 and sold = false and issued = false", [rem.id]);
+      if (!units.length) return { error: "remnant_not_owned" };
+
+      const w3 = (x) => Math.round(Number(x) * 1000);
+      const totalMg = pieces.reduce((a, p) => a + w3(p.weight), 0);
+      if (totalMg !== w3(rem.weight)) {
+        return { error: "weights_must_equal_remnant", remnantWeight: Number(rem.weight), piecesWeight: totalMg / 1000 };
+      }
+
+      const { rows: catRows } = await client.query(
+        "select id from categories where branch_id = $1 or branch_id is null", [req.auth.branchId]);
+      const valid = new Set(catRows.map((c) => c.id));
+      if (pieces.some((p) => !valid.has(p.categoryId))) return { error: "category_not_found" };
+
+      // المصنعية بالوزن، والهللة الباقية على آخر قطعة فيبقى المجموع كما كان
+      const wmH = Math.round((Number(rem.workmanship) || 0) * 100);
+      let usedH = 0;
+      const created = [];
+      for (let i = 0; i < pieces.length; i++) {
+        const p = pieces[i];
+        const shareH = i === pieces.length - 1 ? wmH - usedH : Math.round((wmH * w3(p.weight)) / totalMg);
+        usedH += shareH;
+        const { rows: cnt } = await client.query("select count(*)::int + 1 as n from items where branch_id = $1", [req.auth.branchId]);
+        const ref = `ITM-${String(cnt[0].n).padStart(6, "0")}`;
+        const { rows: ni } = await client.query(
+          `insert into items (branch_id, ref, lot_id, category_id, karat, weight, cost_per_gram, workmanship,
+                              created_by, remnant_of, set_parts)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning id, ref, category_id, karat, weight, workmanship`,
+          [req.auth.branchId, ref, rem.lot_id, p.categoryId, rem.karat, w3(p.weight) / 1000, rem.cost_per_gram,
+            shareH / 100, req.auth.userId, rem.id, JSON.stringify(cleanSetParts(p.setParts))]
+        );
+        await client.query("insert into item_units (item_id, code) values ($1, $2)", [ni[0].id, ref]);
+        created.push({ ...ni[0], code: ref });
+      }
+      await client.query(
+        "update item_units set issued = true, issued_at = now(), issued_by = $2 where id = any($1::uuid[])",
+        [units.map((u) => u.id), req.auth.userId]
+      );
+      await client.query("update items set remnant = false where id = $1", [rem.id]);
+      await client.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
+         values ($1,'update',$2,'items',$3,$4)`,
+        [req.auth.branchId, req.auth.userId, rem.id, JSON.stringify({ codedRemnant: rem.ref, weight: Number(rem.weight), pieces: created.map((c) => c.code) })]
+      );
+      return { items: created };
+    });
+    if (result.error) return res.status(result.error === "item_not_found" ? 404 : 409).json(result);
     res.status(201).json(result);
   } catch (err) {
     next(err);
