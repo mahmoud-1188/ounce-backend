@@ -70,7 +70,11 @@ router.get("/payroll/runs/:runId/wps", authenticate, requirePage("payroll"), req
       if (!run[0]) return { error: "not_found" };
       const { rows } = await c.query(
         `select l.*, u.name, u.ref, u.hr_profile from payroll_lines l join users u on u.id = l.user_id where l.payroll_run_id = $1 order by u.name`, [run[0].id]);
-      const missing = rows.filter((r) => !ibanOk(String(r.hr_profile?.iban || ""))).map((r) => r.name);
+      // الناقص يُعلَن قبل الرفع: الآيبان والهوية كلاهما يرفض البنكُ الملفَّ بغيابه (المرجع 5.2.0)
+      const missing = rows.map((r) => {
+        const why = [!(r.hr_profile?.nationalId || r.hr_profile?.iqamaNo) && "الهوية", !ibanOk(String(r.hr_profile?.iban || "")) && "الآيبان"].filter(Boolean);
+        return why.length ? `${r.name} (${why.join(" و")})` : null;
+      }).filter(Boolean);
       const esc = (v) => { const s = String(v ?? ""); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
       const n = (v) => (Number(v) || 0).toFixed(2);
       const head = ["Employee ID", "Employee Name", "National ID / Iqama", "IBAN", "Bank", "Basic Salary", "Housing", "Other Earnings", "Deductions", "Net Salary", "Period"];

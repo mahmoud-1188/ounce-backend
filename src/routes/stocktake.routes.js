@@ -5,7 +5,7 @@ import { postJournalEntry } from "../domain/journal.js";
 import { roundMoney } from "../domain/money.js";
 import { fineWeight, PURITY } from "../domain/weight.js";
 import { getOpenBusinessDay } from "../domain/saleOps.js";
-import { closeMonth, fiscalStatus } from "../domain/periodClose.js";
+import { closeMonth, closeYear, fiscalStatus, listYearCloses, yearCloseChecks } from "../domain/periodClose.js";
 
 const router = Router();
 
@@ -347,6 +347,36 @@ router.post("/fiscal/close-month", authenticate, requirePage("financials"), requ
   try {
     const r = await withBranch(req.auth.branchId, (c) => closeMonth(c, req.auth.branchId, String(req.body?.period || ""), { by: req.auth.user?.name || "مدير الفرع", kind: "branch" }));
     if (r.error) return res.status(r.error === "invalid_period" ? 400 : 409).json(r);
+    res.status(201).json(r);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * السنة المالية على الخادم (migration 068):
+ *   GET  /fiscal/year        — دخل الفترة منذ آخر إقفال، والتحذيرات، وسجلّ الإقفالات
+ *   POST /fiscal/close-year  { snapshot, notes } — قيد الإقفال إلى 3300 وسجلٌّ دائم (المدير وحده)
+ */
+router.get("/fiscal/year", authenticate, requirePage("financials"), async (req, res, next) => {
+  try {
+    res.json(await withBranch(req.auth.branchId, async (c) => ({
+      ...(await yearCloseChecks(c, req.auth.branchId)), closures: await listYearCloses(c, req.auth.branchId),
+    })));
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/fiscal/close-year", authenticate, requirePage("financials"), requireManager, async (req, res, next) => {
+  const snapshot = req.body?.snapshot && typeof req.body.snapshot === "object" ? req.body.snapshot : {};
+  if (JSON.stringify(snapshot).length > 200000) return res.status(413).json({ error: "snapshot_too_large" });
+  try {
+    const r = await withBranch(req.auth.branchId, (c) => closeYear(c, req.auth.branchId, {
+      userId: req.auth.userId, snapshot, notes: req.body?.notes || "",
+      postJournal: (entry) => postJournalEntry(c, entry),
+    }));
+    if (r.error) return res.status(409).json(r);
     res.status(201).json(r);
   } catch (err) {
     next(err);

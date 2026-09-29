@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { issueEInvoicesSafe } from "../domain/einvoice.js";
 import { withBranch, withoutBranch } from "../db.js";
 import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.js";
 import { extractInclusiveTax, roundMoney } from "../domain/money.js";
@@ -463,6 +464,7 @@ router.post(
           lines: returnJournalLines(amounts, refundSource === "credit" ? "1310" : CASH_ACCOUNTS[refundSource].account),
         });
 
+        await issueEInvoicesSafe(client, req.auth.branchId);
         return { return: { ...returnRec, journalEntryId }, receipt: receiptRec, cashTx: cashResult?.cashTx || null, amounts: { net: amounts.net, tax: amounts.tax, gross: amounts.gross } };
       });
       if (result.error) {
@@ -620,6 +622,7 @@ router.post(
           });
         }
 
+        await issueEInvoicesSafe(client, req.auth.branchId);
         return {
           return: { ...returnRec, restock, journalEntryId },
           receipt: receiptRec,
@@ -811,6 +814,7 @@ router.post(
           })]
         );
 
+        await issueEInvoicesSafe(client, req.auth.branchId);
         return {
           return: { ...returnRec, exchange_sale_id: newSale.id, restock, journalEntryId: returnJournalId },
           sale: { ...newSale, journalEntryId: saleJournalId },

@@ -5,6 +5,7 @@ import { branchPolicyView } from "../domain/hqPolicy.js";
 import { loadProvision } from "../domain/branchProvision.js";
 import { withBranch, withBranchParallel } from "../db.js";
 import { authenticate } from "../middleware/auth.js";
+import { listYearCloses } from "../domain/periodClose.js";
 
 const router = Router();
 
@@ -363,7 +364,10 @@ router.get("/bootstrap", async (req, res, next) => {
       if (r.to_account) goldLedger.push({ ...base, accountCode: r.to_account, type: "in" });
     }
 
+    // إقفالات السنة المالية على الخادم (migration 068) — أساس أرصدة السنة الجارية في الواجهة
+    const fiscalClosures = await withBranch(branchId, (c) => listYearCloses(c, branchId)).catch(() => []);
     res.json({
+      fiscalClosures,
       branch: branch.rows[0] || null,
       // ⚠ businessDay (مفرد) يبقى بشكله الأصلي (أحدث سجل فقط) — لا يُكسَر
       // عقد المستهلك الحالي في bootstrap.routes.js/normalize.js. businessDays

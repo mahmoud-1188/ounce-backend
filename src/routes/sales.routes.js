@@ -2,6 +2,7 @@ import { Router } from "express";
 import { loadModules, modCfg, modOn } from "../domain/modules.js";
 import { PURITY } from "../domain/weight.js";
 import { validIdNumber } from "./customers.routes.js";
+import { issueEInvoicesSafe } from "../domain/einvoice.js";
 import { withBranch } from "../db.js";
 import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.js";
 import { extractInclusiveTax } from "../domain/money.js";
@@ -515,6 +516,7 @@ router.post("/sales", async (req, res, next) => {
         [req.auth.branchId, req.auth.userId, sale.id, JSON.stringify({ ref: sale.ref, total, paymentMethod })]
       );
 
+      await issueEInvoicesSafe(client, req.auth.branchId);
       return {
         sale: { id: sale.id, ref: sale.ref, total, taxAmount, netAmount, paymentMethod, depositApplied: Math.round((depositApplied + orderDeposit) * 100) / 100, giftApplied, payable, pointsEarned },
         journalEntryId,
@@ -781,6 +783,7 @@ router.post("/sales/partial", async (req, res, next) => {
         [req.auth.branchId, req.auth.userId, sale.id, JSON.stringify({ ref: sale.ref, total, paymentMethod, sellWeight, soldOut })]
       );
 
+      await issueEInvoicesSafe(client, req.auth.branchId);
       return {
         sale: { id: sale.id, ref: sale.ref, total, taxAmount: 0, netAmount: total, paymentMethod },
         journalEntryId,
@@ -947,6 +950,7 @@ router.post("/sales/set-part", async (req, res, next) => {
          values ($1,'create',$2,'sales',$3,$4)`,
         [req.auth.branchId, req.auth.userId, sale.id, JSON.stringify({ ref: sale.ref, total, paymentMethod, setPart: lineLabel, partWeight, remaining })]
       );
+      await issueEInvoicesSafe(client, req.auth.branchId);
       return {
         sale: { id: sale.id, ref: sale.ref, total, taxAmount, netAmount, paymentMethod, lineLabel },
         journalEntryId, remainingWeight: remaining, remainingParts: restParts,
