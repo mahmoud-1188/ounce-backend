@@ -359,6 +359,9 @@ router.get("/bootstrap", async (req, res, next) => {
         weight: Number(r.weight),
         note: r.note || "",
         createdBy: r.created_by_name || "",
+        // مستند الحركة — رجل القيد الوزنية تُعرف به (تفاصيل القيد في الأستاذ)
+        refTable: r.ref_table || null,
+        refId: r.ref_id || null,
       };
       if (r.from_account) goldLedger.push({ ...base, accountCode: r.from_account, type: "out" });
       if (r.to_account) goldLedger.push({ ...base, accountCode: r.to_account, type: "in" });
