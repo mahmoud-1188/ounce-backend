@@ -1,9 +1,10 @@
 import { Router } from "express";
 import { withBranch, withoutBranch } from "../db.js";
-import { authenticateStore, requireCanManageBranches, requireStoreOwner } from "../middleware/storeAuth.js";
+import { authenticateStore, requireCanManageBranches, requireCanSendCoding, requireStoreOwner } from "../middleware/storeAuth.js";
 import { closeMonth, fiscalStatus } from "../domain/periodClose.js";
 import { issueEnrollCode } from "../domain/enroll.js";
 import { branchDevices, revokeDevice } from "../domain/devices.js";
+import { codeRemnant, listRemnants } from "../domain/remnants.js";
 
 const router = Router();
 
@@ -202,6 +203,40 @@ router.patch("/store/users/:id/hq-role", requireStoreOwner, async (req, res, nex
       "update store_users set hq_role = $1 where id = $2 and store_id = $3 returning id, hq_role", [hqRole, req.params.id, req.storeAuth.storeId]));
     if (!rows[0]) return res.status(404).json({ error: "user_not_found" });
     res.json({ id: rows[0].id, hqRole: rows[0].hq_role });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * بقايا الأطقم في فرع — تكويدها من الإدارة (المرجع 5.2.0: «تكويد بقايا طقم» · HqRemoteRemnants).
+ * بالمعالج نفسه الذي في الفرع (القطع مجموع أوزانها وزن البقايا)، ولمن يملك التكويد في الإدارة.
+ *   GET  /store/branches/:branchId/remnants
+ *   POST /store/branches/:branchId/remnants/:itemId/code { pieces: [{ categoryId, weight }] }
+ */
+router.get("/store/branches/:branchId/remnants", async (req, res, next) => {
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const out = await withBranch(req.params.branchId, async (c) => ({
+      remnants: await listRemnants(c, req.params.branchId),
+      categories: (await c.query("select id, name, sale_mode from categories where (branch_id = $1 or branch_id is null) and sale_mode <> 'partial' order by sort_order, name", [req.params.branchId])).rows,
+    }));
+    res.json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/store/branches/:branchId/remnants/:itemId/code", requireCanSendCoding, async (req, res, next) => {
+  const pieces = Array.isArray(req.body?.pieces) ? req.body.pieces : [];
+  if (!pieces.length || pieces.some((p) => !p.categoryId || !(Number(p.weight) > 0))) return res.status(400).json({ error: "invalid_pieces" });
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const r = await withBranch(req.params.branchId, (c) => codeRemnant(c, {
+      branchId: req.params.branchId, itemId: req.params.itemId, pieces, by: req.storeAuth.name || "الإدارة",
+    }));
+    if (r.error) return res.status(r.error === "item_not_found" ? 404 : 409).json(r);
+    res.status(201).json(r);
   } catch (err) {
     next(err);
   }

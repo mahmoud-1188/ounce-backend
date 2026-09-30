@@ -2,6 +2,7 @@ import { Router } from "express";
 import { withBranch } from "../db.js";
 import { authenticate, requireAnyPage } from "../middleware/auth.js";
 import { computeZakat, zakatInputs } from "../domain/zakat.js";
+import { ledgerHealth } from "../domain/ledgerHealth.js";
 
 const router = Router();
 
@@ -24,6 +25,15 @@ router.get("/zakat", authenticate, requireAnyPage("financials", "reportsHub", "f
       return { on: true, ...computeZakat(inputs, { price24, year }) };
     });
     res.json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** GET /api/ledger/health — صحّة الدفتر من الدفاتر كاملةً (المرجع 5.2.0: auditHealth). */
+router.get("/ledger/health", authenticate, requireAnyPage("generalLedger", "trialBalance", "accountantReview", "financials"), async (req, res, next) => {
+  try {
+    res.json(await withBranch(req.auth.branchId, (client) => ledgerHealth(client, req.auth.branchId)));
   } catch (err) {
     next(err);
   }

@@ -1,6 +1,7 @@
 import { Router } from "express";
 import crypto from "node:crypto";
 import { withoutBranch, withBranch } from "../db.js";
+import { computeZakat, zakatInputs } from "../domain/zakat.js";
 import { authenticateStore, requireStoreOwner, requireCanManageBranches, requireCanSendCoding } from "../middleware/storeAuth.js";
 import { buildConsolidatedReport } from "../domain/consolidatedReport.js";
 import { buildAnalyticsReport } from "../domain/analyticsReport.js";
@@ -83,6 +84,51 @@ router.get("/store/report", async (req, res, next) => {
     });
 
     res.json(report);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/store/zakat?price24=… — زكاة الفروع الموحّدة (المرجع 5.2.0: HqZakatReport · قرار المالك 2026-09-29).
+ * كل فرعٍ على سطره بالدالّة نفسها التي في الفرع، من سجلّاته على الخادم وبسعر الإدارة اليوم،
+ * ثم إجمالي المجموعة. فرعٌ أطفأ الزكاة «متوقفة» خارج المجموع. المجموع جمع زكاة كل دفتر —
+ * لا زكاة وعاءٍ موحّد: فرعٌ التزاماته أكبر من أصوله لا يُنقص زكاة غيره.
+ */
+router.get("/store/zakat", async (req, res, next) => {
+  const price24 = Math.max(0, Number(req.query.price24) || 0);
+  try {
+    const branches = await withoutBranch(async (client) => (await client.query(
+      `select id, ref, name from branches where store_id = $1 and deleted_at is null order by name`, [req.storeAuth.storeId])).rows);
+    const lines = [];
+    for (const b of branches) {
+      try {
+        lines.push(await withBranch(b.id, async (client) => {
+          const { rows } = await client.query("select zakat_enabled, zakat_year from branch_settings where branch_id = $1", [b.id]);
+          const on = rows[0] ? rows[0].zakat_enabled !== false : true;
+          const year = rows[0]?.zakat_year === "hijri" ? "hijri" : "gregorian";
+          if (!on) return { branchId: b.id, ref: b.ref, name: b.name, status: "off", year };
+          const z = computeZakat(await zakatInputs(client, b.id), { price24, year });
+          return { branchId: b.id, ref: b.ref, name: b.name, status: "ok", year, z };
+        }));
+      } catch (err) {
+        console.error("store zakat branch failed", b.id, err.message);
+        lines.push({ branchId: b.id, ref: b.ref, name: b.name, status: "error" });
+      }
+    }
+    const counted = lines.filter((l) => l.status === "ok");
+    const sumH = (f) => counted.reduce((a, l) => a + Math.round(f(l.z) * 100), 0) / 100;
+    res.json({
+      price24, noPrice: !(price24 > 0), date: new Date().toISOString().slice(0, 10), lines,
+      total: {
+        cash: sumH((z) => z.cash), receivables: sumH((z) => z.receivables), goldValue: sumH((z) => z.goldValue),
+        goldFine: Math.round(counted.reduce((a, l) => a + l.z.goldFine, 0) * 1000) / 1000,
+        workmanship: sumH((z) => z.workmanship), goldRecvValue: sumH((z) => z.goldRecvValue),
+        liabilities: sumH((z) => z.liabilities), goldOwedValue: sumH((z) => z.goldOwedValue),
+        base: sumH((z) => z.base), due: sumH((z) => z.due),
+      },
+      counted: counted.length, off: lines.filter((l) => l.status === "off").length, errors: lines.filter((l) => l.status === "error").length,
+    });
   } catch (err) {
     next(err);
   }
