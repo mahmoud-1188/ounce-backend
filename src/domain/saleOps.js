@@ -98,6 +98,7 @@ async function reserveSaleLines(client, branchId, lines, { excludeUnitIds = [] }
 
     resolvedLines.push({
       itemId: item.id,
+      ref: item.ref,
       category: item.category_id,
       karat: item.karat,
       quantity: line.quantity,

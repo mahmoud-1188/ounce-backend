@@ -8,6 +8,7 @@ import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.
 import { extractInclusiveTax } from "../domain/money.js";
 import { fineWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
+import { amlCheck, approvalGuards, awardLoyalty, creditLimitIssue, priceFloorIssue, recordPendingApproval, saleVat, sideSaleGuards } from "../domain/saleGuards.js";
 import { insertCashTx, insertSaleLines, isStocktakeLocked, nextRef, postGoldMovement, requireBusinessDay, reserveSaleLines } from "../domain/saleOps.js";
 
 const router = Router();
@@ -149,10 +150,12 @@ router.post("/sales", async (req, res, next) => {
         }
       }
 
-      const total = Math.round(subtotal * 100) / 100;
+      // ⚖ الضريبة سطرًا بسطر بالهللة — كما يحسبها المستند الإلكتروني، فضريبة القيد = ضريبة الفاتورة المُبلَّغة
       const taxRate = taxApplicable ? Number(settings.tax_rate) : 0;
-      const taxAmount = taxApplicable ? extractInclusiveTax(total, taxRate) : 0;
-      const netAmount = Math.round((total - taxAmount) * 100) / 100;
+      const vat = saleVat(resolvedLines, { taxApplicable, rate: taxRate });
+      const total = vat.total;
+      const taxAmount = vat.taxAmount;
+      const netAmount = vat.netAmount;
 
       // ── الحجز: قطعةٌ محجوزة تُباع لصاحب حجزها وحده، وعربونه يُخصم من الفاتورة ──
       // (المرجع 5.2.0: «عربون الحجز يُخصم الآن من فاتورته» — وكان 2210 لا يُطفأ أبدًا)
@@ -212,24 +215,22 @@ router.post("/sales", async (req, res, next) => {
         networkPart = Math.round((networkPart - (prepaid - fromCash)) * 100) / 100;
       }
 
-      // ⚖ مكافحة غسل الأموال (وحدة aml): دفعٌ نقدي يبلغ الحدّ يحتاج عميلًا بهويته، أو اسم المشتري وهويته
-      let kyc = null;
-      {
-        const mods = await loadModules(client, req.auth.branchId);
-        const th = Number(modCfg(mods, "aml").cashThreshold) || 0;
-        const cashDue = paymentMethod === "cash" ? payable : paymentMethod === "split" ? cashPart : 0;
-        if (modOn(mods, "aml") && th > 0 && cashDue >= th) {
-          let idNo = String(body.kycIdNumber || "").trim().toUpperCase(), who = String(body.kycName || "").trim();
-          if (customerId) {
-            const { rows: cr } = await client.query("select name, id_number from customers where id = $1 and branch_id = $2", [customerId, req.auth.branchId]);
-            if (cr[0]?.id_number) { idNo = cr[0].id_number; who = cr[0].name; }
-            else if (!who && cr[0]) who = cr[0].name;
-          }
-          if (!validIdNumber(idNo) || !who) return { error: "aml_id_required", threshold: th, cash: cashDue };
-          kyc = { idNumber: idNo, name: who, cash: cashDue, at: new Date().toISOString() };
-          if (customerId && body.kycIdNumber) await client.query("update customers set id_number = coalesce(id_number, $2) where id = $1", [customerId, idNo]);
-        }
-      }
+      // ⚖ مكافحة غسل الأموال (وحدة aml): النقد يبلغ الحدّ — مع ما دفعه العميل نفسه نقدًا في آخر 24 ساعة —
+      //   يحتاج عميلًا بهويته أو اسم المشتري وهويته
+      const cashDue = paymentMethod === "cash" ? payable : paymentMethod === "split" ? cashPart : 0;
+      const aml = await amlCheck(client, req.auth.branchId, { cashDue, customerId, body, validIdNumber });
+      if (aml.error) return aml;
+      const kyc = aml.kyc || null;
+
+      // ⚖ أرضية السعر وحدّ الآجل — بموافقة (المدير يعتمد نفسه ويُسجَّل، وغيره يُرسل طلبًا)
+      const floorWhy = priceFloorIssue(resolvedLines.map((l) => ({
+        ref: l.ref, karat: l.karat, weight: l.weightSnapshot, costPerGram: l.costPerGramSnapshot,
+        workmanship: l.workmanshipSnapshot, price: l.unitPrice,
+      })), Number(body.price24Snapshot) || 0);
+      const creditPart = paymentMethod === "credit" ? payable : 0;
+      const creditWhy = await creditLimitIssue(client, req.auth.branchId, customerId, creditPart);
+      const guards = await approvalGuards(client, req.auth, { floorWhy, creditWhy, total, creditPart, payload: body, body });
+      if (guards.error) return guards;
 
       if (paymentMethod === "split") {
         const sumParts = Math.round((cashPart + networkPart) * 100) / 100;
@@ -513,7 +514,7 @@ router.post("/sales", async (req, res, next) => {
       await client.query(
         `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
          values ($1,'create',$2,'sales',$3,$4)`,
-        [req.auth.branchId, req.auth.userId, sale.id, JSON.stringify({ ref: sale.ref, total, paymentMethod })]
+        [req.auth.branchId, req.auth.userId, sale.id, JSON.stringify({ ref: sale.ref, total, paymentMethod, ...(Object.keys(guards.overrides).length ? { overrides: guards.overrides } : {}) })]
       );
 
       await issueEInvoicesSafe(client, req.auth.branchId);
@@ -527,6 +528,7 @@ router.post("/sales", async (req, res, next) => {
       };
     });
 
+    if (result.error === "approval_pending") return recordPendingApproval(res, req.auth, result.request);
     if (result.error) {
       const status = result.error === "item_not_found" ? 404 : 409;
       return res.status(status).json(result);
@@ -551,9 +553,8 @@ router.post("/sales", async (req, res, next) => {
  * كل item_units التابعة له sold=true — هذا هو "إغلاق" الصنف؛ السطر نفسه
  * لا يُحذف أبدًا.
  *
- * ⚠ قرارك الصريح: الإعفاء الضريبي دائم ومطلَق هنا (taxApplicable=false
- * ثابتًا، لا حقل اختياري) — مطابقة لِـPartialSaleModal في المرجع الذي لا
- * يعرض توگل ضريبة إطلاقًا لهذا النوع من البيع.
+ * ⚠ الضريبة من إعداد المحل كالفاتورة (المرجع ت١ — 2026-09-30: «البيع بالوزن بيعٌ
+ * كامل»)، ويمكن إطفاؤها للفاتورة بـtaxApplicable=false. كان معفًى دائمًا.
  *
  * ⚠ إصلاح حقيقي (بنفس نمط endpoint البيع الرئيسي أعلاه): posting_rules
  * 'sale_partial' في seed.sql يحدّد حساب مدين ثابت (1130) بصرف النظر عن
@@ -645,17 +646,26 @@ router.post("/sales/partial", async (req, res, next) => {
         );
       }
 
-      const total = Math.round(sellWeight * unitPrice * 100) / 100;
+      // ⚖ البيع بالوزن بيعٌ كامل (المرجع ت١ — 2026-09-30): الضريبة من إعداد المحل كالفاتورة، سطرًا بالهللة
+      //   كالمستند الإلكتروني (السطر: سعر الجرام × الوزن). كان معفًى دائمًا فيُخرج الذهب بإيرادٍ بلا ضريبته.
+      const { rows: taxRows } = await client.query(
+        "select tax_enabled, tax_rate from branch_settings where branch_id = $1", [req.auth.branchId]);
+      const taxApplicable = body.taxApplicable != null ? !!body.taxApplicable : taxRows[0]?.tax_enabled !== false;
+      const taxRate = taxApplicable ? Number(taxRows[0]?.tax_rate ?? 0.15) : 0;
+      const vat = saleVat([{ unitPrice, quantity: sellWeight }], { taxApplicable, rate: taxRate });
+      const total = vat.total;
       if (!(total > 0)) {
         return { error: "invalid_computed_total" };
       }
+      const taxAmount = vat.taxAmount;
+      const netAmount = vat.netAmount;
 
-      // ⚠ إعفاء ضريبي دائم — بقرارك الصريح، مطابقة للمرجع (لا توگل هنا
-      // إطلاقًا، بعكس endpoint البيع الرئيسي أعلاه).
-      const taxApplicable = false;
-      const taxRate = 0;
-      const taxAmount = 0;
-      const netAmount = total;
+      // ⚖ الهوية والأرضية والآجل كما في الفاتورة
+      const guard = await sideSaleGuards(client, req.auth, {
+        line: { ref: item.ref, karat: item.karat, weight: sellWeight, costPerGram: item.cost_per_gram, workmanship: wmShare, price: total },
+        total, paymentMethod, customerId, body, price24: Number(body.price24Snapshot) || 0, validIdNumber,
+      });
+      if (guard.error) return guard;
 
       const { rows: refRows } = await client.query(
         `select count(*)::int + 1 as n from sales where branch_id = $1`,
@@ -747,7 +757,13 @@ router.post("/sales/partial", async (req, res, next) => {
       } else if (paymentMethod === "credit") {
         debitLines.push({ account: "1310", side: "debit", amount: total });
       }
-      const creditLines = [{ account: "4140", side: "credit", amount: total }];
+      const creditLines = [
+        { account: "4140", side: "credit", amount: netAmount },
+        ...(taxAmount > 0 ? [{ account: "2220", side: "credit", amount: taxAmount }] : []),
+      ];
+      if (guard.kyc) await client.query("update sales set kyc = $1 where id = $2", [JSON.stringify(guard.kyc), sale.id]);
+      const pointsEarned = await awardLoyalty(client, req.auth.branchId, {
+        customerId, paymentMethod, paid: total, saleId: sale.id, ref: sale.ref, userId: req.auth.userId });
 
       const journalEntryId = await postJournalEntry(client, {
         branchId: req.auth.branchId,
@@ -780,12 +796,12 @@ router.post("/sales/partial", async (req, res, next) => {
       await client.query(
         `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
          values ($1,'create',$2,'sales',$3,$4)`,
-        [req.auth.branchId, req.auth.userId, sale.id, JSON.stringify({ ref: sale.ref, total, paymentMethod, sellWeight, soldOut })]
+        [req.auth.branchId, req.auth.userId, sale.id, JSON.stringify({ ref: sale.ref, total, paymentMethod, sellWeight, soldOut, ...(Object.keys(guard.overrides).length ? { overrides: guard.overrides } : {}) })]
       );
 
       await issueEInvoicesSafe(client, req.auth.branchId);
       return {
-        sale: { id: sale.id, ref: sale.ref, total, taxAmount: 0, netAmount: total, paymentMethod },
+        sale: { id: sale.id, ref: sale.ref, total, taxAmount, netAmount, paymentMethod, pointsEarned },
         journalEntryId,
         feeJournalEntryId,
         soldOut,
@@ -793,6 +809,7 @@ router.post("/sales/partial", async (req, res, next) => {
       };
     });
 
+    if (result.error === "approval_pending") return recordPendingApproval(res, req.auth, result.request);
     if (result.error) {
       const status = result.error === "item_not_found" ? 404 : 409;
       return res.status(status).json(result);
@@ -876,6 +893,13 @@ router.post("/sales/set-part", async (req, res, next) => {
       const taxAmount = taxApplicable ? extractInclusiveTax(total, taxRate) : 0;
       const netAmount = Math.round((total - taxAmount) * 100) / 100;
 
+      // ⚖ الهوية والأرضية والآجل كما في الفاتورة — الجزء بوزنه ونصيبه من المصنعية
+      const guard = await sideSaleGuards(client, req.auth, {
+        line: { ref: item.ref, karat: item.karat, weight: partWeight, costPerGram: item.cost_per_gram, workmanship: wmPart, price: total },
+        total, paymentMethod, customerId, body, price24: Number(body.price24Snapshot) || 0, validIdNumber,
+      });
+      if (guard.error) return guard;
+
       const ref = await nextRef(client, "sales", req.auth.branchId, "SALE");
       const { rows: saleRows } = await client.query(
         `insert into sales
@@ -901,6 +925,9 @@ router.post("/sales/set-part", async (req, res, next) => {
          values ($1,$2,$3,$4,1,$5,$6,$7,$8,0,$9)`,
         [sale.id, item.id, item.category_id, item.karat, total, partWeight, item.cost_per_gram, wmPart, lineLabel]
       );
+
+      if (guard.kyc) await client.query("update sales set kyc = $1 where id = $2", [JSON.stringify(guard.kyc), sale.id]);
+      await awardLoyalty(client, req.auth.branchId, { customerId, paymentMethod, paid: total, saleId: sale.id, ref: sale.ref, userId: req.auth.userId });
 
       await postGoldMovement(client, {
         branchId: req.auth.branchId, businessDayId: businessDay.id, opType: "sale",
@@ -948,7 +975,7 @@ router.post("/sales/set-part", async (req, res, next) => {
       await client.query(
         `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
          values ($1,'create',$2,'sales',$3,$4)`,
-        [req.auth.branchId, req.auth.userId, sale.id, JSON.stringify({ ref: sale.ref, total, paymentMethod, setPart: lineLabel, partWeight, remaining })]
+        [req.auth.branchId, req.auth.userId, sale.id, JSON.stringify({ ref: sale.ref, total, paymentMethod, setPart: lineLabel, partWeight, remaining, ...(Object.keys(guard.overrides).length ? { overrides: guard.overrides } : {}) })]
       );
       await issueEInvoicesSafe(client, req.auth.branchId);
       return {
@@ -956,6 +983,7 @@ router.post("/sales/set-part", async (req, res, next) => {
         journalEntryId, remainingWeight: remaining, remainingParts: restParts,
       };
     });
+    if (result.error === "approval_pending") return recordPendingApproval(res, req.auth, result.request);
     if (result.error) return res.status(result.error === "item_not_found" ? 404 : 409).json(result);
     res.status(201).json(result);
   } catch (err) {
