@@ -32,3 +32,30 @@ alter table reservations add column if not exists forfeited numeric(14,2) not nu
 insert into approval_rules (id, label, threshold, approver_role) values
   ('safe_audit', 'فرق جرد الخزنة', 500, 'manager')
 on conflict (id) do nothing;
+
+-- ⑤ إنهاء اليوم فعلٌ واحد (المرجع ت٢): فرق عدّ الصندوق فوق 100 يعتمده غير من عدّ (والمدير الذي عدّ يُرفع فرقه للإدارة).
+insert into approval_rules (id, label, threshold, approver_role) values
+  ('count_variance', 'فرق عدّ الصندوق', 100, 'manager')
+on conflict (id) do nothing;
+
+-- ⑥ إصلاح: المراجع تُرقَّم لكل فرع (SALE-000001 · DAY-001 …) لكن القيد كان «فريدًا في كل الفروع»،
+--    فأوّل فاتورةٍ أو يومٍ في الفرع الثاني يُرفض بخطأ خادم. الفريد الآن داخل الفرع.
+--    (التحويل بين الفروع ورموز الوحدات والمستخدمون والفروع تبقى فريدةً عامّةً — تُقرأ عبر الفروع.)
+do $$
+declare t text;
+begin
+  foreach t in array array['business_days','customers','daily_custody','expenses','fixed_assets','gold_issues','items',
+                           'purchases','receipts','repairs','reservations','returns','safe_audits','sales',
+                           'scrap_items','scrap_requests','suppliers','taskir_offices']
+  loop
+    execute format('alter table %I drop constraint if exists %I', t, t || '_ref_key');
+    if not exists (select 1 from pg_constraint where conname = t || '_branch_ref_key') then
+      execute format('alter table %I add constraint %I unique (branch_id, ref)', t, t || '_branch_ref_key');
+    end if;
+  end loop;
+end $$;
+
+-- ⑦ مهلة الطلب (المرجع ت٢): المعلّق بعد 72 ساعة «انتهت مهلته» — حالةٌ جديدة.
+alter table approvals drop constraint if exists approvals_status_check;
+alter table approvals add constraint approvals_status_check
+  check (status in ('pending', 'approved', 'rejected', 'executed', 'cancelled', 'expired'));
