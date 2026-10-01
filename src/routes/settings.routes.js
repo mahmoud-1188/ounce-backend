@@ -106,7 +106,19 @@ router.patch("/settings/branch", requirePage("settings"), requireManager, async 
         );
         credit = cr[0];
       }
-      return { settings: { ...rows[0], ...(zakat || {}), ...(credit || {}) } };
+      // تفضيلات البيع (migration 069): تُدمج مفتاحًا مفتاحًا — ما لم يُرسل يبقى
+      let prefs = null;
+      if (body.salePrefs && typeof body.salePrefs === "object") {
+        const p = {};
+        if (body.salePrefs.postSaleSheet != null) p.postSaleSheet = !!body.salePrefs.postSaleSheet;
+        if (body.salePrefs.sellDuringStocktake != null) p.sellDuringStocktake = !!body.salePrefs.sellDuringStocktake;
+        if (body.salePrefs.quoteDays != null) p.quoteDays = Math.max(1, Math.min(60, Math.round(Number(body.salePrefs.quoteDays) || 7)));
+        const { rows: pr } = await client.query(
+          "update branch_settings set sale_prefs = sale_prefs || $2::jsonb where branch_id = $1 returning sale_prefs",
+          [req.auth.branchId, JSON.stringify(p)]);
+        prefs = pr[0];
+      }
+      return { settings: { ...rows[0], ...(zakat || {}), ...(credit || {}), ...(prefs || {}) } };
     });
 
     if (result.error === "invalid_tax_rate" || result.error === "invalid_zakat_year" || result.error === "invalid_workday_mode") {

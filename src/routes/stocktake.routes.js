@@ -14,6 +14,10 @@ async function applyStocktake(client, { branchId, userId, entries, price24 = 0, 
       const day = await getOpenBusinessDay(client, branchId);
       const businessDayId = day?.id || null;
       const stamp = Date.now().toString(36).toUpperCase();
+      // البيع أثناء الجرد: قطعةٌ عُدّت ثم بيعت قبل التطبيق ليست زيادة — تُطرح من الزيادة بعدد ما بِيع منذ بدء القفل
+      const { rows: lockRows } = await client.query(
+        "select locked_at from stocktake_locks where branch_id = $1 and locked", [branchId]);
+      const lockedAt = lockRows[0]?.locked_at || null;
       const missing = new Map(); // karat -> weight
       const surplus = new Map();
       let missingValue = 0, surplusValue = 0, pricedAtMarket = 0;
@@ -31,7 +35,13 @@ async function applyStocktake(client, { branchId, userId, entries, price24 = 0, 
           [it.id]
         );
         const counted = Number(e.countedQty);
-        const diff = counted - freeRows.length;
+        let diff = counted - freeRows.length;
+        if (diff > 0 && lockedAt) {
+          const { rows: sd } = await client.query(
+            `select count(*)::int as n from item_units u join sales s on s.id = u.sale_id
+              where u.item_id = $1 and u.sold and s.date >= $2`, [it.id, lockedAt]);
+          diff = Math.max(0, diff - (sd[0]?.n || 0));
+        }
         const unitW = Number(it.weight) || 0;
         const countedWeight = e.countedWeight != null && Number(e.countedWeight) > 0 ? Number(e.countedWeight) : unitW;
 

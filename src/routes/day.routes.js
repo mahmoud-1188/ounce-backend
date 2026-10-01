@@ -24,6 +24,48 @@ const router = Router();
  * هنا. لقطة الإقفال هنا تقتصر على ما يُشتق مباشرة ورخيصًا من دفاتر
  * الحركة (عدّ/مجموع/رصيد لحظي)، تمامًا كفلسفة safe_audits.
  */
+// «نبّه المدير» (المرجع ت٢): من لا يملك فتح اليوم يطلبه — سطرٌ في سجلّ التدقيق يقرؤه من يدير اليوم.
+//   طلبٌ واحد لكل شخص كل عشر دقائق، ولا طلب واليوم مفتوح. خارج /day لأن الطالب قد لا يملك صفحة يوم العمل.
+router.post("/day-ask", authenticate, async (req, res, next) => {
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      if (await findOpenDay(client, req.auth.branchId)) return { error: "day_already_open" };
+      const { rows } = await client.query(
+        `select 1 from audit_log where branch_id = $1 and event_type = 'day_ask' and actor_id = $2
+            and created_at > now() - interval '10 minutes' limit 1`, [req.auth.branchId, req.auth.userId]);
+      if (rows[0]) return { ok: true, already: true };
+      await client.query(
+        "insert into audit_log (branch_id, event_type, actor_id, ref_table, details) values ($1, 'day_ask', $2, 'business_days', '{}'::jsonb)",
+        [req.auth.branchId, req.auth.userId]);
+      return { ok: true };
+    });
+    if (result.error) return res.status(409).json(result);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/// من طلب فتح اليوم منذ آخر فتحٍ (وفي آخر 18 ساعة على الأكثر) — فارغٌ واليوم مفتوح
+router.get("/day-ask", authenticate, async (req, res, next) => {
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      if (await findOpenDay(client, req.auth.branchId)) return { asks: [] };
+      const { rows } = await client.query(
+        `select u.name, max(a.created_at) as at
+           from audit_log a left join users u on u.id = a.actor_id
+          where a.branch_id = $1 and a.event_type = 'day_ask'
+            and a.created_at > greatest(now() - interval '18 hours',
+                  coalesce((select max(opened_at) from business_days where branch_id = $1), '-infinity'))
+          group by u.name order by at desc`, [req.auth.branchId]);
+      return { asks: rows.map((r) => ({ name: r.name || "", at: r.at })) };
+    });
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.use(["/day", "/custody"], authenticate, requirePage("workday"));
 
 async function findOpenDay(client, branchId) {

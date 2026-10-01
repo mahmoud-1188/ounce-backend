@@ -24,6 +24,16 @@ async function isStocktakeLocked(client, branchId) {
   return !!rows[0]?.locked;
 }
 
+/// البيع أثناء الجرد إعدادٌ (sale_prefs.sellDuringStocktake — migration 069): مفعّلًا يُسمح بالبيع والقفل قائم،
+///   وما بِيع منذ بدء القفل يُطابَق مبيعًا عند تطبيق الجرد (لا يُحسب زيادة).
+async function saleBlockedByStocktake(client, branchId) {
+  const { rows } = await client.query(
+    `select l.locked, coalesce((s.sale_prefs->>'sellDuringStocktake')::boolean, false) as sell
+       from stocktake_locks l left join branch_settings s on s.branch_id = l.branch_id
+      where l.branch_id = $1`, [branchId]);
+  return !!rows[0]?.locked && !rows[0]?.sell;
+}
+
 /**
  * يوم العمل للحركات التي تحتاجه (بيع، استبدال…).
  * يومٌ مفتوح ⇐ يُختم به. لا يوم والوضع 'off' ⇐ { day: null } وتمرّ الحركة
@@ -315,6 +325,7 @@ async function insertReturnReceipt(client, { branchId, sale, amount, note, busin
 export {
   nextRef,
   isStocktakeLocked,
+  saleBlockedByStocktake,
   getOpenBusinessDay,
   requireBusinessDay,
   reserveSaleLines,

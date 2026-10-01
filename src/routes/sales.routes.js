@@ -9,7 +9,7 @@ import { extractInclusiveTax } from "../domain/money.js";
 import { fineWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
 import { amlCheck, approvalGuards, awardLoyalty, keepRequesterAsSeller, creditLimitIssue, priceFloorIssue, recordPendingApproval, saleVat, sideSaleGuards } from "../domain/saleGuards.js";
-import { insertCashTx, insertSaleLines, isStocktakeLocked, nextRef, postGoldMovement, requireBusinessDay, reserveSaleLines } from "../domain/saleOps.js";
+import { insertCashTx, insertSaleLines, isStocktakeLocked, saleBlockedByStocktake, nextRef, postGoldMovement, requireBusinessDay, reserveSaleLines } from "../domain/saleOps.js";
 
 const router = Router();
 
@@ -113,8 +113,8 @@ router.post("/sales", async (req, res, next) => {
 
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
-      // ⚠ لا بيع أثناء الجرد — نفس حارس stocktakeLock في handleCreateSale.
-      if (await isStocktakeLocked(client, req.auth.branchId)) return { error: "stocktake_locked" };
+      // ⚠ لا بيع أثناء الجرد — إلا إن فعّل الفرع «البيع أثناء الجرد».
+      if (await saleBlockedByStocktake(client, req.auth.branchId)) return { error: "stocktake_locked" };
 
       // يوم عمل مفتوح إلزامي — إلا إن أُطفئ يوم العمل من الإعدادات
       // (migration 034)، فتُسجَّل الفاتورة بلا يوم.

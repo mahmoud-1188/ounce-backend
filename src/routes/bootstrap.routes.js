@@ -149,7 +149,7 @@ router.get("/bootstrap", async (req, res, next) => {
       (client) =>
         client.query(`select * from daily_custody where branch_id = $1 order by opened_at desc limit 60`, [branchId]),
       (client) =>
-        client.query(`select tax_enabled, tax_rate, card_fees, workday_mode, opening_mode, opening_finished_at, approvals_enabled, approval_thresholds, lock_all::text as lock_all, lock_posted::text as lock_posted, modules, zakat_enabled, zakat_year, credit_limit_default, credit_overdue_days from branch_settings where branch_id = $1`, [branchId]),
+        client.query(`select tax_enabled, tax_rate, card_fees, workday_mode, opening_mode, opening_finished_at, approvals_enabled, approval_thresholds, lock_all::text as lock_all, lock_posted::text as lock_posted, modules, zakat_enabled, zakat_year, credit_limit_default, credit_overdue_days, sale_prefs from branch_settings where branch_id = $1`, [branchId]),
       // فئات مشتركة بين الفروع (branch_id يمكن أن يكون null) + فئات هذا الفرع تحديدًا.
       // ⚠ order by sort_order صريح الآن (migration 029) — بلا هذا كان
       // ترتيب categories يعود عشوائيًّا فعليًّا (لا ضمان ترتيب من
@@ -224,7 +224,7 @@ router.get("/bootstrap", async (req, res, next) => {
       // بلا أي عمود لها هنا قبل ذلك، فتختفي عند إعادة التحميل).
       (client) =>
         client.query(
-          `select r.*, c.name as customer_name from reservations r
+          `select r.*, r.hold_until::text as hold_until, c.name as customer_name from reservations r
              left join customers c on c.id = r.customer_id
             where r.branch_id = $1 order by r.created_at desc limit 300`,
           [branchId]

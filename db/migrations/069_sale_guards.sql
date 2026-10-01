@@ -84,3 +84,12 @@ alter table sale_drafts enable row level security;
 drop policy if exists branch_isolation_sale_drafts on sale_drafts;
 create policy branch_isolation_sale_drafts on sale_drafts
   using (branch_id = current_setting('app.current_branch_id', true)::uuid);
+
+-- ⑨ تفضيلات البيع في إعدادات الفرع (المرجع: إعدادات البيع): ورقة ما بعد البيع (مطفأة افتراضيًّا)،
+--    البيع أثناء الجرد (مطفأ — ما بِيع منذ بدء القفل يُطابَق مبيعًا عند تطبيق الجرد)، وصلاحية عرض السعر بالأيام.
+alter table branch_settings add column if not exists sale_prefs jsonb not null default '{}'::jsonb;
+
+-- ⑩ الحجز (المرجع: ReservationsPage): «محجوز حتى» تاريخٌ يُذكّر بانتهاء المهلة، وخطّة تقسيطٍ اختيارية
+--    (جدول دفعاتٍ متساوية بعد العربون) تُسدَّد بدفعاتٍ على الحجز نفسه — كلّ دفعةٍ عربونٌ إضافيّ (2210).
+alter table reservations add column if not exists hold_until date;
+alter table reservations add column if not exists plan jsonb;

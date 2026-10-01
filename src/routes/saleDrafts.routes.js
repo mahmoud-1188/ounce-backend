@@ -21,7 +21,7 @@ const shape = (d) => ({
 router.get("/sale-drafts", async (req, res, next) => {
   try {
     const rows = await withBranch(req.auth.branchId, async (c) => (await c.query(
-      `select d.*, u.name as created_by_name from sale_drafts d left join users u on u.id = d.created_by
+      `select d.*, d.valid_until::text as valid_until, u.name as created_by_name from sale_drafts d left join users u on u.id = d.created_by
         where d.branch_id = $1 and (d.status = 'open' or d.created_at > now() - interval '30 days')
         order by d.created_at desc limit 200`, [req.auth.branchId])).rows);
     res.json({ drafts: rows.map(shape) });
@@ -46,7 +46,7 @@ router.post("/sale-drafts", async (req, res, next) => {
       }
       const { rows } = await c.query(
         `insert into sale_drafts (branch_id, ref, kind, customer_id, customer_name, payload, total, valid_until, note, created_by)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning *`,
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning *, valid_until::text as valid_until`,
         [req.auth.branchId, ref, kind, b.payload.customerId || null, customerName, JSON.stringify(b.payload),
           roundMoney(b.total), validUntil, b.note ? String(b.note).slice(0, 200) : null, req.auth.userId]);
       return { draft: shape({ ...rows[0], created_by_name: req.auth.user?.name || "" }) };
@@ -64,7 +64,7 @@ router.post("/sale-drafts/:id/:action(done|cancel)", async (req, res, next) => {
     const out = await withBranch(req.auth.branchId, async (c) => {
       const { rows } = await c.query(
         `update sale_drafts set status = $3, sale_id = coalesce($4, sale_id), closed_at = now()
-          where id = $1 and branch_id = $2 and status = 'open' returning *`,
+          where id = $1 and branch_id = $2 and status = 'open' returning *, valid_until::text as valid_until`,
         [req.params.id, req.auth.branchId, done ? "done" : "cancelled", done ? req.body?.saleId || null : null]);
       if (!rows[0]) return { error: "draft_not_open" };
       return { draft: shape(rows[0]) };
