@@ -82,6 +82,42 @@ router.get("/store/cash-transit", async (req, res, next) => {
   }
 });
 
+/// بضاعةٌ في الطريق (migration 069): صافي «في الطريق» في دفاتر الفروع (1350 عند المرسِل + 2140 عند المستلِم) يساوي
+///   تكلفة ما أُرسل ولم يُستلم وما نقص ولم يُقرَّر — وإلا ففرقٌ يُبحث. والقديم (3 أيام فأكثر) يُنبَّه عليه.
+async function goodsTransitRecon(storeId) {
+  const branches = await storeBranches(storeId);
+  let ledger = 0;
+  for (const b of branches) {
+    const [row] = await withBranch(b.id, async (c) => (await c.query(
+      `select coalesce(sum(case when l.side = 'debit' then l.amount else -l.amount end), 0) as v
+         from journal_lines l join journal_entries e on e.id = l.entry_id where e.branch_id = $1 and l.account_code in ('1350', '2140')`, [b.id])).rows);
+    ledger += Number(row.v) || 0;
+  }
+  const rows = await withoutBranch(async (c) => (await c.query(
+    `select t.id, t.ref, t.status, t.pieces, t.total_weight, t.total_cost, t.short_cost, t.missing, t.sent_at, fb.name as from_name, tb.name as to_name
+       from branch_transfers t join branches fb on fb.id = t.from_branch_id join branches tb on tb.id = t.to_branch_id
+      where t.store_id = $1 and (t.status = 'sent' or (t.status = 'short' and t.short_decision is null)) order by t.sent_at`, [storeId])).rows);
+  const pending = roundMoney(rows.reduce((a, r) => a + Number(r.status === "sent" ? r.total_cost : r.short_cost), 0));
+  ledger = roundMoney(ledger);
+  const diff = roundMoney(ledger - pending);
+  return {
+    ledger, pending, diff, ok: Math.abs(diff) < 0.01,
+    items: rows.map((r) => {
+      const ageDays = Math.max(0, Math.floor((Date.now() - new Date(r.sent_at).getTime()) / 864e5));
+      return { id: r.id, ref: r.ref, status: r.status, pieces: r.pieces, weight: Number(r.total_weight), cost: Number(r.status === "sent" ? r.total_cost : r.short_cost),
+        missing: (r.missing || []).length, from: r.from_name, to: r.to_name, at: r.sent_at, ageDays, stale: r.status === "sent" && ageDays >= 3 };
+    }),
+  };
+}
+
+router.get("/store/goods-transit", async (req, res, next) => {
+  try {
+    res.json(await goodsTransitRecon(req.storeAuth.storeId));
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ══ ① يحتاج انتباهك الآن ═══════════════════════════════════════════════
 router.get("/store/alerts", async (req, res, next) => {
   try {

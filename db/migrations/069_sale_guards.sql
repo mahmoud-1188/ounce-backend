@@ -1,0 +1,127 @@
+-- رقابة البيع المشتركة وصحّة الدفاتر (المرجع: ت١ «صحة الدفاتر» — 2026-09-30).
+--
+-- ① نوعا اعتمادٍ جديدان على كل مسارات البيع (الفاتورة · البيع بالوزن · جزء الطقم):
+--    «أرضية السعر» — بيعٌ تحت تكلفة القطعة أو تحت قيمة ذهبها الصافي بسعر اليوم،
+--    و«حدّ الآجل» — آجلٌ يتجاوز حدّ العميل أو لعميلٍ عليه فاتورةٌ آجلة متأخّرة.
+--    الحدّ صفر: كل حالةٍ منهما تحتاج اعتمادًا (المدير يعتمد نفسه ويُسجَّل).
+-- ② حدّ الآجل لكل عميل، وافتراضيٌّ وأيام التأخّر في إعدادات الفرع (صفر = بلا فحص).
+-- ③ العربون المحتجز عند إلغاء الحجز بلا ردّ يُصادَر إيرادًا (4350) — كان يبقى التزامًا في 2210 إلى الأبد.
+
+insert into approval_rules (id, label, threshold, approver_role) values
+  ('price_floor', 'بيعٌ تحت أرضية السعر', 0, 'manager'),
+  ('credit_limit', 'آجلٌ فوق حدّ العميل', 0, 'manager')
+on conflict (id) do nothing;
+
+alter table customers add column if not exists credit_limit numeric(14,2);
+alter table branch_settings add column if not exists credit_limit_default numeric(14,2) not null default 0;
+alter table branch_settings add column if not exists credit_overdue_days int not null default 0;
+
+insert into accounts (code, name, parent_code, unit, nature, statement, is_group) values
+  ('4350', 'عرابين مصادَرة', '4300', 'currency', 'credit', 'income', false)
+on conflict (code) do nothing;
+
+insert into posting_rules (op_type, label, rule) values
+  ('deposit_forfeit', 'مصادرة عربون حجزٍ ملغى',
+   '{"label": "مصادرة عربون حجزٍ ملغى", "cash": {"debit": "2210", "credit": "4350"}, "weight": null}'::jsonb)
+on conflict (op_type) do nothing;
+
+alter table reservations add column if not exists forfeited numeric(14,2) not null default 0;
+
+-- ④ جرد الخزنة يُسوّي فرق الذهب بقيدٍ ماليّ مع رجله الوزنية، وفرقٌ فوق 500 يمرّ ببوّابة الاعتماد
+--    (المدير يعتمد نفسه ويُسجَّل، أو الإدارة إن جعلته لها).
+insert into approval_rules (id, label, threshold, approver_role) values
+  ('safe_audit', 'فرق جرد الخزنة', 500, 'manager')
+on conflict (id) do nothing;
+
+-- ⑤ إنهاء اليوم فعلٌ واحد (المرجع ت٢): فرق عدّ الصندوق فوق 100 يعتمده غير من عدّ (والمدير الذي عدّ يُرفع فرقه للإدارة).
+insert into approval_rules (id, label, threshold, approver_role) values
+  ('count_variance', 'فرق عدّ الصندوق', 100, 'manager')
+on conflict (id) do nothing;
+
+-- ⑥ إصلاح: المراجع تُرقَّم لكل فرع (SALE-000001 · DAY-001 …) لكن القيد كان «فريدًا في كل الفروع»،
+--    فأوّل فاتورةٍ أو يومٍ في الفرع الثاني يُرفض بخطأ خادم. الفريد الآن داخل الفرع.
+--    (التحويل بين الفروع ورموز الوحدات والمستخدمون والفروع تبقى فريدةً عامّةً — تُقرأ عبر الفروع.)
+do $$
+declare t text;
+begin
+  foreach t in array array['business_days','customers','daily_custody','expenses','fixed_assets','gold_issues','items',
+                           'purchases','receipts','repairs','reservations','returns','safe_audits','sales',
+                           'scrap_items','scrap_requests','suppliers','taskir_offices']
+  loop
+    execute format('alter table %I drop constraint if exists %I', t, t || '_ref_key');
+    if not exists (select 1 from pg_constraint where conname = t || '_branch_ref_key') then
+      execute format('alter table %I add constraint %I unique (branch_id, ref)', t, t || '_branch_ref_key');
+    end if;
+  end loop;
+end $$;
+
+-- ⑦ مهلة الطلب (المرجع ت٢): المعلّق بعد 72 ساعة «انتهت مهلته» — حالةٌ جديدة.
+alter table approvals drop constraint if exists approvals_status_check;
+alter table approvals add constraint approvals_status_check
+  check (status in ('pending', 'approved', 'rejected', 'executed', 'cancelled', 'expired'));
+
+-- ⑧ فواتير معلّقة وعروض أسعار (المرجع D — SaleDraftsPage): فاتورةٌ تُحفظ قبل إتمامها وتُستأنف من أي جهاز،
+--    أو عرض سعرٍ يُطبع للعميل بصلاحيته. لا قيد ولا حركة مخزون — الحركة كلّها عند إتمامها فاتورةً.
+create table if not exists sale_drafts (
+  id           uuid primary key default gen_random_uuid(),
+  branch_id    uuid not null references branches(id),
+  ref          text not null,
+  kind         text not null check (kind in ('held', 'quote')),
+  customer_id  uuid references customers(id),
+  customer_name text,
+  payload      jsonb not null,
+  total        numeric(14,2) not null default 0,
+  valid_until  date,
+  status       text not null default 'open' check (status in ('open', 'done', 'cancelled')),
+  sale_id      uuid,
+  note         text,
+  created_by   uuid,
+  created_at   timestamptz not null default now(),
+  closed_at    timestamptz,
+  unique (branch_id, ref)
+);
+alter table sale_drafts enable row level security;
+drop policy if exists branch_isolation_sale_drafts on sale_drafts;
+create policy branch_isolation_sale_drafts on sale_drafts
+  using (branch_id = current_setting('app.current_branch_id', true)::uuid);
+
+-- ⑨ تفضيلات البيع في إعدادات الفرع (المرجع: إعدادات البيع): ورقة ما بعد البيع (مطفأة افتراضيًّا)،
+--    البيع أثناء الجرد (مطفأ — ما بِيع منذ بدء القفل يُطابَق مبيعًا عند تطبيق الجرد)، وصلاحية عرض السعر بالأيام.
+alter table branch_settings add column if not exists sale_prefs jsonb not null default '{}'::jsonb;
+
+-- ⑩ الحجز (المرجع: ReservationsPage): «محجوز حتى» تاريخٌ يُذكّر بانتهاء المهلة، وخطّة تقسيطٍ اختيارية
+--    (جدول دفعاتٍ متساوية بعد العربون) تُسدَّد بدفعاتٍ على الحجز نفسه — كلّ دفعةٍ عربونٌ إضافيّ (2210).
+alter table reservations add column if not exists hold_until date;
+alter table reservations add column if not exists plan jsonb;
+
+-- ⑪ الحلقة المغلقة للتحويل بين الفروع (المرجع ت٣): المستلِم يعدّ ما وصل — الناقص يبقى «في الطريق» (1350) بتكلفته عند المرسِل
+--    حتى يقرّر مديره: «عجز تحويل» مصروفًا (5340) أو «وُجدت» فتعود القطع لرفّه. لا يُقفل التحويل وفيه ناقصٌ بلا قرار.
+alter table branch_transfers drop constraint if exists branch_transfers_status_check;
+alter table branch_transfers add constraint branch_transfers_status_check
+  check (status in ('sent', 'received', 'short', 'cancelled'));
+alter table branch_transfers add column if not exists missing jsonb not null default '[]'::jsonb;
+alter table branch_transfers add column if not exists counted_weight numeric(12,3);
+alter table branch_transfers add column if not exists short_cost numeric(14,2) not null default 0;
+alter table branch_transfers add column if not exists short_decision text check (short_decision in ('write_off', 'found'));
+alter table branch_transfers add column if not exists short_decided_by uuid;
+alter table branch_transfers add column if not exists short_decided_at timestamptz;
+
+insert into accounts (code, name, parent_code, unit, nature, statement, is_group) values
+  ('5340', 'عجز التحويل بين الفروع', '5300', 'currency', 'debit', 'income', false)
+on conflict (code) do nothing;
+
+insert into posting_rules (op_type, label, rule) values
+  ('branch_transfer_short', 'عجز تحويلٍ بين الفروع',
+   '{"label": "عجز تحويلٍ بين الفروع", "cash": {"debit": "5340", "credit": "1350"}, "weight": {"from": "1350", "to": null}}'::jsonb),
+  ('branch_transfer_found', 'ناقص تحويلٍ وُجد عند المرسِل',
+   '{"label": "ناقص تحويلٍ وُجد عند المرسِل", "cash": {"debit": "5110", "credit": "1350"}, "weight": {"from": "1350", "to": "1210"}}'::jsonb)
+on conflict (op_type) do nothing;
+
+-- ⑫ البضاعة غير المكوَّدة (المرجع ت٣ «الحلقة المغلقة»): الفرع يرسل دفعةً للإدارة لتكوّدها — الدفعة ملكٌ للفرع
+--    (وزنها باقٍ في 1210 عنده) حتى تعود قطعًا في مخزونه، ولا يكوّدها الفرع وهي عند الإدارة. ونموذج الفرع
+--    (تضعه الإدارة): 'branch' يكوّد بنفسه · 'hq' الإدارة وحدها تكوّد · 'both' كلاهما.
+alter table lots add column if not exists coding_at text not null default 'branch' check (coding_at in ('branch', 'hq'));
+alter table lots add column if not exists sent_to_hq_at timestamptz;
+alter table lots add column if not exists sent_to_hq_by uuid;
+alter table branch_settings add column if not exists coding_model text not null default 'both'
+  check (coding_model in ('branch', 'hq', 'both'));

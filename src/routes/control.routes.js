@@ -8,7 +8,7 @@ import { hashPin, verifyPin } from "../auth/hashPin.js";
 import { postJournalEntry } from "../domain/journal.js";
 import { roundMoney } from "../domain/money.js";
 import { getOpenBusinessDay } from "../domain/saleOps.js";
-import { shapeApproval } from "../domain/approvals.js";
+import { APPROVAL_EXPIRY_HOURS, NO_SELF_KINDS, expireStaleApprovals, shapeApproval } from "../domain/approvals.js";
 import { logPermission } from "../domain/permissionLog.js";
 import { ENROLL_TTL_MIN, codeHash, issueEnrollCode } from "../domain/enroll.js";
 import { branchDevices, createDevice, deviceLabel, revokeDevice } from "../domain/devices.js";
@@ -88,6 +88,7 @@ router.post("/reviews", authenticate, requirePage("accountantReview"), async (re
 router.get("/approvals", authenticate, requireAnyPage("approvals", "accountantReview", "expenses", "salesReturn"), async (req, res, next) => {
   try {
     const rows = await withBranch(req.auth.branchId, async (client) => {
+      await expireStaleApprovals(client, req.auth.branchId);
       const { rows } = await client.query(
         `select a.*, r.label as rule_label from approvals a
            left join approval_rules r on r.id = a.rule_id
@@ -108,6 +109,29 @@ router.get("/approvals", authenticate, requireAnyPage("approvals", "accountantRe
 
 // القرار نهائي: لا يُقرَّر الطلب ثانية. التنفيذ بعده يعيد إرسال العملية
 // نفسها بـapprovalId (راجع domain/approvals.js).
+/** POST /api/approvals/:id/cancel — الطالب يُلغي طلبه المعلّق (أو المدير). */
+router.post("/approvals/:id/cancel", authenticate, async (req, res, next) => {
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      const { rows } = await client.query("select * from approvals where id = $1 and branch_id = $2 for update", [req.params.id, req.auth.branchId]);
+      const ap = rows[0];
+      if (!ap) return { error: "approval_not_found" };
+      if (ap.requested_by !== req.auth.userId && req.auth.role !== "manager") return { error: "not_your_request" };
+      if (ap.status !== "pending") return { error: "approval_already_decided", status: ap.status };
+      const { rows: upd } = await client.query(
+        "update approvals set status = 'cancelled', decided_at = now(), decision_note = 'ألغاه الطالب' where id = $1 returning *", [ap.id]);
+      await client.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'cancel',$2,'approvals',$3,$4)`,
+        [req.auth.branchId, req.auth.userId, ap.id, JSON.stringify({ ref: ap.ref, kind: ap.rule_id })]);
+      return { approval: shapeApproval(upd[0]) };
+    });
+    if (result.error) return res.status(result.error === "approval_not_found" ? 404 : 409).json(result);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post("/approvals/:id/decide", authenticate, requirePage("approvals"), requireManager, async (req, res, next) => {
   const decision = req.body?.decision;
   const note = String(req.body?.note || "").trim();
@@ -122,7 +146,13 @@ router.post("/approvals/:id/decide", authenticate, requirePage("approvals"), req
       );
       const ap = rows[0];
       if (!ap) return { error: "approval_not_found" };
+      if (ap.status === "pending" && new Date(ap.created_at).getTime() < Date.now() - APPROVAL_EXPIRY_HOURS * 3600000) {
+        await client.query("update approvals set status = 'expired', decision_note = 'انتهت مهلة الطلب' where id = $1", [ap.id]);
+        return { expired: true };
+      }
       if (ap.status !== "pending") return { error: "approval_already_decided", status: ap.status };
+      // ⚖ الشخص الثاني: فرق العدّ لا يعتمده من عدّ
+      if (NO_SELF_KINDS.includes(ap.rule_id) && ap.requested_by === req.auth.userId) return { error: "approval_self_decide_blocked" };
       // ما جعلته الإدارة لنفسها يُقرَّر في لوحة الإدارة لا في الفرع
       if (ap.approver_kind === "hq") return { error: "approval_requires_hq" };
       const { rows: upd } = await client.query(
@@ -138,6 +168,7 @@ router.post("/approvals/:id/decide", authenticate, requirePage("approvals"), req
       );
       return { approval: shapeApproval({ ...upd[0], rule_label: ap.rule_label }, { label: ap.rule_label }) };
     });
+    if (result.expired) return res.status(409).json({ error: "approval_expired" });
     if (result.error) return res.status(result.error === "approval_not_found" ? 404 : result.error === "approval_requires_hq" ? 403 : 409).json(result);
     res.json(result);
   } catch (err) {

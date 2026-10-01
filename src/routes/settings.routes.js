@@ -94,7 +94,31 @@ router.patch("/settings/branch", requirePage("settings"), requireManager, async 
         );
         zakat = z[0];
       }
-      return { settings: { ...rows[0], ...(zakat || {}) } };
+      // حدّ الآجل الافتراضي وأيام التأخّر (migration 069) — صفر = بلا فحص
+      let credit = null;
+      if (body.creditLimitDefault != null || body.creditOverdueDays != null) {
+        const { rows: cr } = await client.query(
+          `update branch_settings set credit_limit_default = coalesce($2, credit_limit_default), credit_overdue_days = coalesce($3, credit_overdue_days)
+            where branch_id = $1 returning credit_limit_default, credit_overdue_days`,
+          [req.auth.branchId,
+           body.creditLimitDefault != null ? Math.max(0, Number(body.creditLimitDefault) || 0) : null,
+           body.creditOverdueDays != null ? Math.max(0, Math.min(3650, Math.round(Number(body.creditOverdueDays) || 0))) : null]
+        );
+        credit = cr[0];
+      }
+      // تفضيلات البيع (migration 069): تُدمج مفتاحًا مفتاحًا — ما لم يُرسل يبقى
+      let prefs = null;
+      if (body.salePrefs && typeof body.salePrefs === "object") {
+        const p = {};
+        if (body.salePrefs.postSaleSheet != null) p.postSaleSheet = !!body.salePrefs.postSaleSheet;
+        if (body.salePrefs.sellDuringStocktake != null) p.sellDuringStocktake = !!body.salePrefs.sellDuringStocktake;
+        if (body.salePrefs.quoteDays != null) p.quoteDays = Math.max(1, Math.min(60, Math.round(Number(body.salePrefs.quoteDays) || 7)));
+        const { rows: pr } = await client.query(
+          "update branch_settings set sale_prefs = sale_prefs || $2::jsonb where branch_id = $1 returning sale_prefs",
+          [req.auth.branchId, JSON.stringify(p)]);
+        prefs = pr[0];
+      }
+      return { settings: { ...rows[0], ...(zakat || {}), ...(credit || {}), ...(prefs || {}) } };
     });
 
     if (result.error === "invalid_tax_rate" || result.error === "invalid_zakat_year" || result.error === "invalid_workday_mode") {

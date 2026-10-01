@@ -15,9 +15,12 @@ const router = Router();
  *   POST /branch-transfers { toBranchId, codes, note }  — المرسِل: القطع تخرج من الرفّ «في الطريق»
  *   POST /branch-transfers/:id/receive     — المستلم: القطعة نفسها تنتقل لمخزونه برمزها
  *   POST /branch-transfers/:id/cancel      — المرسِل قبل الاستلام: تعود القطع
+ *   POST /branch-transfers/:id/receive { missing:[codes], countedWeight } — المستلِم يعدّ: الناقص يبقى «في الطريق» عند المرسِل
+ *   POST /branch-transfers/:id/settle-short { decision: write_off|found } — مدير المرسِل يقرّر الناقص (migration 069)
  * ⚠ القيود على الطرفين بتكلفة القطع — ويتقابل 1350 (المرسِل) و2140 (المستلم) في الموحّد.
  */
 const MOVERS = new Set(["manager", "assistant"]);
+const TRANSIT_STALE_DAYS = 3;
 const unitKey = (c) => String(c || "").trim().toUpperCase();
 const useBranch = (c, id) => c.query("select set_config('app.current_branch_id', $1, true)", [id]);
 
@@ -27,6 +30,11 @@ function shape(t, me) {
     fromBranchId: t.from_branch_id, fromName: t.from_name || "", toBranchId: t.to_branch_id, toName: t.to_name || "",
     lines: t.lines || [], pieces: t.pieces, totalWeight: Number(t.total_weight), totalFine: Number(t.total_fine), totalCost: Number(t.total_cost),
     note: t.note || "", sentBy: t.sent_by_name || "", sentAt: t.sent_at, receivedBy: t.received_by_name || "", receivedAt: t.received_at, cancelledAt: t.cancelled_at,
+    missing: t.missing || [], countedWeight: t.counted_weight == null ? null : Number(t.counted_weight), shortCost: Number(t.short_cost || 0),
+    shortDecision: t.short_decision || null, shortDecidedAt: t.short_decided_at || null,
+    // في الطريق أكثر من ثلاثة أيام: تنبيهٌ للطرفين
+    ageDays: Math.max(0, Math.floor((Date.now() - new Date(t.sent_at).getTime()) / 864e5)),
+    stale: t.status === "sent" && Date.now() - new Date(t.sent_at).getTime() >= TRANSIT_STALE_DAYS * 864e5,
   };
 }
 
@@ -133,12 +141,22 @@ router.post("/branch-transfers/:id/receive", authenticate, requireAnyPage("branc
       const t = rows[0];
       if (!t) return { error: "transfer_not_found" };
       if (t.status !== "sent") return { error: `transfer_${t.status}` };
+      // العدّ: ما لم يصل يُسمّى برمزه — ورمزٌ ليس في الشحنة يُرفض
+      const sentCodes = new Set(t.lines.map((l) => unitKey(l.code)));
+      const missing = [...new Set((Array.isArray(req.body?.missing) ? req.body.missing : []).map(unitKey).filter(Boolean))];
+      const unknown = missing.filter((k) => !sentCodes.has(k));
+      if (unknown.length) return { error: "transfer_unknown_codes", codes: unknown };
+      if (missing.length === t.lines.length) return { error: "transfer_nothing_received" };
+      const lost = t.lines.filter((l) => missing.includes(unitKey(l.code)));
+      const got = t.lines.filter((l) => !missing.includes(unitKey(l.code)));
+      const countedWeight = req.body?.countedWeight != null && req.body.countedWeight !== "" ? Number(req.body.countedWeight) : null;
+      if (countedWeight != null && !(countedWeight >= 0)) return { error: "invalid_counted_weight" };
       const day = await getOpenBusinessDay(c, me);
       const { rows: fb } = await c.query("select name from branches where id = $1", [t.from_branch_id]);
       // تصنيفات المستلم بالاسم — ويُنشأ ما لا مثيل له
       const catOf = new Map();
       const groups = new Map();
-      for (const l of t.lines) {
+      for (const l of got) {
         const k = `${l.itemId}`;
         if (!groups.has(k)) groups.set(k, []);
         groups.get(k).push(l);
@@ -173,18 +191,69 @@ router.post("/branch-transfers/:id/receive", authenticate, requireAnyPage("branc
             [me, day?.id || null, l.karat, l.weight, fineWeight(l.weight, l.karat), t.id, `${t.ref} ${l.code} ← من ${fb[0]?.name || ""}`, req.auth.userId]);
         }
       }
-      const cost = Number(t.total_cost);
+      const shortCost = roundMoney(lost.reduce((a, l) => a + (Number(l.cost) || 0), 0));
+      const cost = roundMoney(Number(t.total_cost) - shortCost);
       if (cost > 0) {
         await postJournalEntry(c, { branchId: me, businessDayId: day?.id || null, opType: "branch_transfer_in", refTable: "branch_transfers", refId: t.id,
-          description: `استلام ${t.pieces} قطعة من ${fb[0]?.name || ""} — ${t.ref}`, createdBy: req.auth.userId,
+          description: `استلام ${got.length} قطعة من ${fb[0]?.name || ""} — ${t.ref}${lost.length ? ` (ناقص ${lost.length})` : ""}`, createdBy: req.auth.userId,
           lines: [{ account: "5110", side: "debit", amount: cost }, { account: "2140", side: "credit", amount: cost }] });
       }
       const { rows: up } = await c.query(
-        "update branch_transfers set status = 'received', received_by = $2, received_by_name = $3, received_at = now() where id = $1 returning *",
-        [t.id, req.auth.userId, req.auth.user.name]);
+        `update branch_transfers set status = $4, received_by = $2, received_by_name = $3, received_at = now(),
+                missing = $5, counted_weight = $6, short_cost = $7 where id = $1 returning *`,
+        [t.id, req.auth.userId, req.auth.user.name, lost.length ? "short" : "received", JSON.stringify(lost.map((l) => l.code)), countedWeight, shortCost]);
       await c.query(`insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'update',$2,'branch_transfers',$3,$4)`,
-        [me, req.auth.userId, t.id, JSON.stringify({ received: t.ref, pieces: t.pieces })]);
+        [me, req.auth.userId, t.id, JSON.stringify({ received: t.ref, pieces: got.length, missing: lost.map((l) => l.code), countedWeight, shortCost })]);
       return { transfer: shape({ ...up[0], from_name: fb[0]?.name }, me), itemIds: newItemIds };
+    });
+    if (result.error) return res.status(result.error === "transfer_not_found" ? 404 : result.error === "transfer_unknown_codes" || result.error === "invalid_counted_weight" ? 400 : 409).json(result);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/// قرار الناقص عند المرسِل (مديره): «عجز» يُخرج تكلفته من «في الطريق» مصروفًا (5340) ووزنه من 1350،
+///   أو «وُجدت» فتعود القطع لرفّه بقيد الإلغاء نفسه. مرّةً واحدة لكل تحويل.
+router.post("/branch-transfers/:id/settle-short", authenticate, requireAnyPage("branchTransfers", "inventory"), async (req, res, next) => {
+  if (req.auth.role !== "manager") return res.status(403).json({ error: "manager_only" });
+  const decision = req.body?.decision;
+  if (!["write_off", "found"].includes(decision)) return res.status(400).json({ error: "invalid_decision" });
+  try {
+    const me = req.auth.branchId;
+    const result = await withBranch(me, async (c) => {
+      const { rows } = await c.query("select * from branch_transfers where id = $1 and from_branch_id = $2 for update", [req.params.id, me]);
+      const t = rows[0];
+      if (!t) return { error: "transfer_not_found" };
+      if (t.status !== "short" || t.short_decision) return { error: "transfer_no_open_shortage" };
+      const missing = new Set((t.missing || []).map(unitKey));
+      const lost = t.lines.filter((l) => missing.has(unitKey(l.code)));
+      const day = await getOpenBusinessDay(c, me);
+      const cost = roundMoney(Number(t.short_cost) || 0);
+      const found = decision === "found";
+      if (found) {
+        await c.query("update item_units set issued = false, issued_at = null, issued_by = null, transfer_id = null where id = any($1::uuid[]) and transfer_id = $2",
+          [lost.map((l) => l.unitId), t.id]);
+      }
+      for (const l of lost) {
+        await c.query(
+          `insert into gold_ledger_entries (branch_id, business_day_id, op_type, karat, weight, fine_weight, from_account, to_account, ref_table, ref_id, note, created_by)
+           values ($1,$2,$3,$4,$5,$6,'1350',$7,'branch_transfers',$8,$9,$10)`,
+          [me, day?.id || null, found ? "branch_transfer_found" : "branch_transfer_short", l.karat, l.weight, fineWeight(l.weight, l.karat),
+           found ? "1210" : null, t.id, `${found ? "وُجدت" : "عجز تحويل"} ${t.ref} ${l.code}`, req.auth.userId]);
+      }
+      if (cost > 0) {
+        await postJournalEntry(c, { branchId: me, businessDayId: day?.id || null, opType: found ? "branch_transfer_found" : "branch_transfer_short",
+          refTable: "branch_transfers", refId: t.id, createdBy: req.auth.userId,
+          description: `${found ? "ناقص وُجد عند المرسِل" : "عجز تحويل"} — ${t.ref} (${lost.length} قطعة)`,
+          lines: [{ account: found ? "5110" : "5340", side: "debit", amount: cost }, { account: "1350", side: "credit", amount: cost }] });
+      }
+      const { rows: up } = await c.query(
+        "update branch_transfers set status = 'received', short_decision = $2, short_decided_by = $3, short_decided_at = now() where id = $1 returning *",
+        [t.id, decision, req.auth.userId]);
+      await c.query(`insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'update',$2,'branch_transfers',$3,$4)`,
+        [me, req.auth.userId, t.id, JSON.stringify({ shortDecision: decision, ref: t.ref, pieces: lost.length, cost })]);
+      return { transfer: shape(up[0], me) };
     });
     if (result.error) return res.status(result.error === "transfer_not_found" ? 404 : 409).json(result);
     res.json(result);

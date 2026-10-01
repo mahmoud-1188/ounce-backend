@@ -1,4 +1,5 @@
 import { cleanSetParts } from "./setParts.js";
+import { insertUnit, itemRefOf, nextItemRefNum } from "./itemCodes.js";
 
 /**
  * تكويد بقايا طقم (المرجع 5.2.0: RemnantCodingForm) — مشتركٌ بين الفرع (POST /items/:id/code-remnant)
@@ -34,8 +35,7 @@ async function codeRemnant(client, { branchId, itemId, pieces, userId = null, by
     const p = pieces[i];
     const shareH = i === pieces.length - 1 ? wmH - usedH : Math.round((wmH * w3(p.weight)) / totalMg);
     usedH += shareH;
-    const { rows: cnt } = await client.query("select count(*)::int + 1 as n from items where branch_id = $1", [branchId]);
-    const ref = `ITM-${String(cnt[0].n).padStart(6, "0")}`;
+    const ref = itemRefOf(await nextItemRefNum(client, branchId));
     const { rows: ni } = await client.query(
       `insert into items (branch_id, ref, lot_id, category_id, karat, weight, cost_per_gram, workmanship,
                           created_by, remnant_of, set_parts)
@@ -43,8 +43,8 @@ async function codeRemnant(client, { branchId, itemId, pieces, userId = null, by
       [branchId, ref, rem.lot_id, p.categoryId, rem.karat, w3(p.weight) / 1000, rem.cost_per_gram,
         shareH / 100, userId, rem.id, JSON.stringify(cleanSetParts(p.setParts))]
     );
-    await client.query("insert into item_units (item_id, code) values ($1, $2)", [ni[0].id, ref]);
-    created.push({ ...ni[0], code: ref });
+    const unit = await insertUnit(client, ni[0].id, ref);
+    created.push({ ...ni[0], code: unit.code });
   }
   await client.query(
     "update item_units set issued = true, issued_at = now(), issued_by = $2 where id = any($1::uuid[])",

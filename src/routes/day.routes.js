@@ -6,6 +6,8 @@ import { roundWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
 import { closeBusinessDay } from "../domain/businessDay.js";
 import { postPoolTransfer } from "../domain/cashPools.js";
+import { approvalGate } from "../domain/approvals.js";
+import { recordPendingApproval } from "../domain/saleGuards.js";
 
 const router = Router();
 
@@ -22,6 +24,48 @@ const router = Router();
  * هنا. لقطة الإقفال هنا تقتصر على ما يُشتق مباشرة ورخيصًا من دفاتر
  * الحركة (عدّ/مجموع/رصيد لحظي)، تمامًا كفلسفة safe_audits.
  */
+// «نبّه المدير» (المرجع ت٢): من لا يملك فتح اليوم يطلبه — سطرٌ في سجلّ التدقيق يقرؤه من يدير اليوم.
+//   طلبٌ واحد لكل شخص كل عشر دقائق، ولا طلب واليوم مفتوح. خارج /day لأن الطالب قد لا يملك صفحة يوم العمل.
+router.post("/day-ask", authenticate, async (req, res, next) => {
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      if (await findOpenDay(client, req.auth.branchId)) return { error: "day_already_open" };
+      const { rows } = await client.query(
+        `select 1 from audit_log where branch_id = $1 and event_type = 'day_ask' and actor_id = $2
+            and created_at > now() - interval '10 minutes' limit 1`, [req.auth.branchId, req.auth.userId]);
+      if (rows[0]) return { ok: true, already: true };
+      await client.query(
+        "insert into audit_log (branch_id, event_type, actor_id, ref_table, details) values ($1, 'day_ask', $2, 'business_days', '{}'::jsonb)",
+        [req.auth.branchId, req.auth.userId]);
+      return { ok: true };
+    });
+    if (result.error) return res.status(409).json(result);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/// من طلب فتح اليوم منذ آخر فتحٍ (وفي آخر 18 ساعة على الأكثر) — فارغٌ واليوم مفتوح
+router.get("/day-ask", authenticate, async (req, res, next) => {
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      if (await findOpenDay(client, req.auth.branchId)) return { asks: [] };
+      const { rows } = await client.query(
+        `select u.name, max(a.created_at) as at
+           from audit_log a left join users u on u.id = a.actor_id
+          where a.branch_id = $1 and a.event_type = 'day_ask'
+            and a.created_at > greatest(now() - interval '18 hours',
+                  coalesce((select max(opened_at) from business_days where branch_id = $1), '-infinity'))
+          group by u.name order by at desc`, [req.auth.branchId]);
+      return { asks: rows.map((r) => ({ name: r.name || "", at: r.at })) };
+    });
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.use(["/day", "/custody"], authenticate, requirePage("workday"));
 
 async function findOpenDay(client, branchId) {
@@ -156,6 +200,112 @@ router.post("/day/close", requireCanManageDay, requireNotDenied("closeDay"), asy
     const result = await withBranch(req.auth.branchId, (client) =>
       closeBusinessDay(client, req.auth.branchId, { closedBy: req.auth.userId, note })
     );
+    if (result.error) return res.status(409).json(result);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── إنهاء اليوم فعلٌ واحد (المرجع ت٢ — handleEndOfDay) ──
+//
+// عدٌّ إلزامي ← فرقه (فوق حدّ «فرق العدّ» يعتمده غير من عدّ) ← التوريد بالمعدود إلى الخزنة ← إقفال العهدة واليوم.
+// في معاملةٍ واحدة: لا يُقفل يومٌ بصندوقٍ لم يُعدّ، ولا يبقى نصف إقفال. العدّ «أعمى» في الواجهة: من يعدّ لا يرى المتوقَّع.
+router.post("/day/end", requireCanManageDay, requireNotDenied("closeDay"), async (req, res, next) => {
+  const body = req.body || {};
+  if (body.countedCash == null || body.countedCash === "") return res.status(400).json({ error: "count_required" });
+  const countedCash = roundMoney(body.countedCash) || 0;
+  const countedNetwork = roundMoney(body.countedNetwork) || 0;
+  const sweep = body.sweep !== false;
+  const note = body.note || null;
+  if (countedCash < 0 || countedNetwork < 0) return res.status(400).json({ error: "invalid_count" });
+
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      const day = await findOpenDay(client, req.auth.branchId);
+      if (!day) return { error: "no_open_business_day" };
+      const { rows: cashRows } = await client.query(
+        `select method, coalesce(sum(case when direction='in' then amount else -amount end), 0) as balance
+           from cash_tx where branch_id = $1 and pool = 'daily' group by method`, [req.auth.branchId]);
+      const expectedCash = roundMoney(Number(cashRows.find((r) => r.method === "cash")?.balance) || 0);
+      const expectedNetwork = roundMoney(Number(cashRows.find((r) => r.method === "network")?.balance) || 0);
+      const varianceCash = roundMoney(countedCash - expectedCash);
+      const varianceNetwork = roundMoney(countedNetwork - expectedNetwork);
+      const varianceAbs = roundMoney(Math.abs(varianceCash) + Math.abs(varianceNetwork));
+
+      // ⚖ الفرق فوق الحدّ (100 افتراضًا) يمرّ ببوّابة الاعتماد — لا يعتمده من عدّ
+      const gate = varianceAbs >= 0.01
+        ? await approvalGate(client, req.auth, {
+          kind: "count_variance", amount: varianceAbs, approvalId: body.approvalId || null,
+          note: `فرق عدّ الصندوق ${day.ref}: نقد ${varianceCash} · شبكة ${varianceNetwork}`,
+          payload: { ...body, approvalId: undefined },
+        })
+        : { proceed: true };
+      if (gate.error) return gate;
+      if (gate.pending) {
+        return { error: "approval_pending", request: { kind: "count_variance", amount: varianceAbs,
+          note: `فرق عدّ الصندوق ${day.ref}: نقد ${varianceCash} · شبكة ${varianceNetwork}`, payload: { ...body, approvalId: undefined } } };
+      }
+
+      // ① العهدة: تُقفل بالمعدود، والفرق تسويةٌ نقدية بقيدها (4330 زيادة · 5330 عجز)
+      const custody = await findOpenCustody(client, req.auth.branchId);
+      if (custody) {
+        await client.query(
+          `update daily_custody set status = 'closed', closed_by = $1, closed_at = now(), close_note = $2,
+             counted_cash = $3, counted_network = $4, expected_cash = $5, expected_network = $6,
+             variance_cash = $7, variance_network = $8 where id = $9`,
+          [req.auth.userId, note, countedCash, countedNetwork, expectedCash, expectedNetwork, varianceCash, varianceNetwork, custody.id]);
+      }
+      const journalEntryIds = [];
+      for (const [method, variance, cashAccount] of [["cash", varianceCash, "1130"], ["network", varianceNetwork, "1140"]]) {
+        if (Math.abs(variance) < 0.01) continue;
+        const isSurplus = variance > 0;
+        await client.query(
+          `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
+           values ($1,$2,'daily',$3,$4,$5,$6,'business_days',$7,$8,$9)`,
+          [req.auth.branchId, day.id, method, isSurplus ? "in" : "out", Math.abs(variance), isSurplus ? "cash_surplus" : "cash_shortage",
+            day.id, `${isSurplus ? "زيادة" : "عجز"} بعدّ إنهاء اليوم — ${day.ref}`, req.auth.userId]);
+        journalEntryIds.push(await postJournalEntry(client, {
+          branchId: req.auth.branchId, businessDayId: day.id, opType: isSurplus ? "cash_surplus" : "cash_shortage",
+          refTable: "business_days", refId: day.id, createdBy: req.auth.userId,
+          description: `${isSurplus ? "زيادة" : "عجز"} بعدّ إنهاء اليوم (${method}) — ${day.ref}`,
+          lines: isSurplus
+            ? [{ account: cashAccount, side: "debit", amount: Math.abs(variance) }, { account: "4330", side: "credit", amount: Math.abs(variance) }]
+            : [{ account: "5330", side: "debit", amount: Math.abs(variance) }, { account: cashAccount, side: "credit", amount: Math.abs(variance) }],
+        }));
+      }
+
+      // ② التوريد بالمعدود: الصندوق اليومي ← الخزنة (نقدًا وشبكة)، فيبدأ الغد من صفر
+      const swept = { cash: 0, network: 0 };
+      if (sweep) {
+        for (const [method, amount] of [["cash", countedCash], ["network", countedNetwork]]) {
+          if (!(amount > 0)) continue;
+          const { rows: out } = await client.query(
+            `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, note, created_by)
+             values ($1,$2,'daily',$3,'out',$4,'transfer_to_safe',$5,$6) returning id`,
+            [req.auth.branchId, day.id, method, amount, `توريد إنهاء اليوم ${day.ref}`, req.auth.userId]);
+          await client.query(
+            `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, note, created_by)
+             values ($1,$2,'safe',$3,'in',$4,'transfer_from_daily',$5,$6)`,
+            [req.auth.branchId, day.id, method, amount, `توريد إنهاء اليوم ${day.ref}`, req.auth.userId]);
+          journalEntryIds.push(await postPoolTransfer(client, {
+            branchId: req.auth.branchId, businessDayId: day.id, from: "daily", to: "safe", method, amount,
+            outTxId: out[0].id, description: `توريد إنهاء اليوم ${day.ref}`, createdBy: req.auth.userId,
+          }));
+          swept[method] = amount;
+        }
+      }
+
+      // ③ إقفال اليوم بلقطته
+      const closed = await closeBusinessDay(client, req.auth.branchId, { closedBy: req.auth.userId, note });
+      if (closed.error) return closed;
+      await client.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'close',$2,'business_days',$3,$4)`,
+        [req.auth.branchId, req.auth.userId, day.id, JSON.stringify({ ref: day.ref, endOfDay: true, countedCash, countedNetwork,
+          expectedCash, expectedNetwork, varianceCash, varianceNetwork, swept, approvalId: gate.approvalId || null })]);
+      return { ...closed, count: { countedCash, countedNetwork, expectedCash, expectedNetwork, varianceCash, varianceNetwork }, swept, journalEntryIds: journalEntryIds.filter(Boolean) };
+    });
+    if (result.error === "approval_pending") return recordPendingApproval(res, req.auth, result.request);
     if (result.error) return res.status(409).json(result);
     res.json(result);
   } catch (err) {

@@ -13,7 +13,8 @@ const router = Router();
  */
 const guard = [authenticate, requireAnyPage("customers", "sales")];
 const validIdNumber = (v) => /^[12]\d{9}$/.test(String(v || "").trim()) || /^(?=.*[A-Z])[A-Z0-9]{6,12}$/i.test(String(v || "").trim());
-const shape = (c) => ({ id: c.id, ref: c.ref, name: c.name, phone: c.phone || "", idNumber: c.id_number || "", note: c.note || "", createdAt: c.created_at });
+const shape = (c) => ({ id: c.id, ref: c.ref, name: c.name, phone: c.phone || "", idNumber: c.id_number || "", note: c.note || "", createdAt: c.created_at,
+  creditLimit: c.credit_limit != null ? Number(c.credit_limit) : null });
 
 router.post("/customers", ...guard, async (req, res, next) => {
   const b = req.body || {};
@@ -45,10 +46,13 @@ router.patch("/customers/:id", ...guard, async (req, res, next) => {
   if (idNumber && !validIdNumber(idNumber)) return res.status(400).json({ error: "invalid_id_number" });
   try {
     const rows = await withBranch(req.auth.branchId, async (c) => (await c.query(
-      `update customers set name = coalesce($3, name), phone = coalesce($4, phone), id_number = coalesce($5, id_number), note = coalesce($6, note)
+      `update customers set name = coalesce($3, name), phone = coalesce($4, phone), id_number = coalesce($5, id_number), note = coalesce($6, note),
+              credit_limit = case when $7::boolean then $8::numeric else credit_limit end
         where id = $1 and branch_id = $2 returning *`,
       [req.params.id, req.auth.branchId, b.name ? String(b.name).trim().slice(0, 120) : null, b.phone != null ? String(b.phone).trim() : null,
-       idNumber, b.note != null ? String(b.note).slice(0, 200) : null])).rows);
+       idNumber, b.note != null ? String(b.note).slice(0, 200) : null,
+       // حدّ الآجل (migration 069): رقمٌ موجب، أو فارغٌ يعيده إلى افتراضي الفرع
+       "creditLimit" in b, b.creditLimit === null || b.creditLimit === "" ? null : Math.max(0, Number(b.creditLimit) || 0)])).rows);
     if (!rows[0]) return res.status(404).json({ error: "customer_not_found" });
     res.json({ customer: shape(rows[0]) });
   } catch (err) {

@@ -12,6 +12,12 @@ import { roundMoney } from "./money.js";
  *
  * يعيد: { proceed: true } | { pending: <approval row> } | { error }
  */
+// أنواعٌ لا يعتمدها من طلبها أبدًا (المرجع ت٢ «الشخص الثاني»): فرق عدّ الصندوق يعتمده غير من عدّ.
+//   ومن هو أعلى معتمِدٍ في الفرع (المدير) يُرفع طلبه إلى الإدارة.
+const NO_SELF_KINDS = ["count_variance"];
+// مهلة الطلب المعلّق (المرجع ت٢): بعدها يُعلَّم «انتهت مهلته» ولا يُقرَّر ولا يُنفَّذ
+const APPROVAL_EXPIRY_HOURS = 72;
+
 async function approvalGate(client, auth, { kind, amount, payload = null, approvalId = null, note = null }) {
   const amt = roundMoney(amount);
   const branchId = auth.branchId;
@@ -26,6 +32,7 @@ async function approvalGate(client, auth, { kind, amount, payload = null, approv
     if (!ap || ap.rule_id !== kind) return { error: "approval_not_found" };
     if (ap.executed_at || ap.status === "executed") return { error: "approval_already_executed" };
     if (ap.status !== "approved") return { error: "approval_not_approved", status: ap.status };
+    if (NO_SELF_KINDS.includes(kind) && ap.decided_by && ap.decided_by === ap.requested_by) return { error: "approval_self_decided" };
     if (Math.abs(Number(ap.amount) - amt) > 0.01) return { error: "approval_amount_mismatch", approved: Number(ap.amount) };
     await client.query(`update approvals set status = 'executed', executed_at = now() where id = $1`, [ap.id]);
     return { proceed: true, approvalId: ap.id };
@@ -54,9 +61,11 @@ async function approvalGate(client, auth, { kind, amount, payload = null, approv
     "select s.approval_routing from branches b join stores s on s.id = b.store_id where b.id = $1",
     [branchId]
   );
-  const byHq = routesToHq(rt[0]?.approval_routing, kind, amt);
+  const noSelf = NO_SELF_KINDS.includes(kind);
+  // من لا يعتمد نفسه وهو أعلى معتمِدٍ في الفرع: طلبه للإدارة
+  const byHq = routesToHq(rt[0]?.approval_routing, kind, amt) || (noSelf && auth.role === (rule.approver_role || "manager"));
   const approverKind = byHq ? "hq" : rule.approver_role || "manager";
-  const selfApprove = !byHq && auth.role === (rule.approver_role || "manager");
+  const selfApprove = !byHq && !noSelf && auth.role === (rule.approver_role || "manager");
   const { rows: apRows } = await client.query(
     `insert into approvals
        (branch_id, rule_id, status, requested_by, ref, amount, payload, note,
@@ -123,4 +132,13 @@ async function loadBranchApprovalRouting(client, branchId) {
   return rows[0]?.approval_routing || {};
 }
 
-export { approvalGate, shapeApproval, loadBranchApprovalRouting, routesToHq };
+/** يُعلّم المعلّق الذي تجاوز مهلته — يُستدعى قبل القراءة والقرار، فلا حاجة لمهمّةٍ دورية. */
+async function expireStaleApprovals(client, branchId) {
+  await client.query(
+    `update approvals set status = 'expired', decision_note = coalesce(decision_note, 'انتهت مهلة الطلب')
+      where branch_id = $1 and status = 'pending' and created_at < now() - ($2 || ' hours')::interval`,
+    [branchId, String(APPROVAL_EXPIRY_HOURS)]
+  );
+}
+
+export { APPROVAL_EXPIRY_HOURS, NO_SELF_KINDS, expireStaleApprovals, approvalGate, shapeApproval, loadBranchApprovalRouting, routesToHq };

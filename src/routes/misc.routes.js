@@ -2,9 +2,10 @@ import { Router } from "express";
 import { issueEInvoicesSafe } from "../domain/einvoice.js";
 import { withBranch, withoutBranch } from "../db.js";
 import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.js";
-import { extractInclusiveTax, roundMoney } from "../domain/money.js";
+import { extractInclusiveTax, fromHalalas, roundMoney, toHalalas } from "../domain/money.js";
 import { fineWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
+import { reverseLoyalty } from "../domain/saleGuards.js";
 import { applyMarkup, loadBranchPricePolicy } from "../domain/pricePolicy.js";
 import { approvalGate } from "../domain/approvals.js";
 import { coverDailyNetworkRefund } from "../domain/cashPools.js";
@@ -110,11 +111,27 @@ async function moveCash(client, { branchId, businessDayId, direction, sourceId, 
 
 router.use("/reservations", authenticate, requirePage("sales"));
 
+const YMD = /^\d{4}-\d{2}-\d{2}$/;
+/// خطّة التقسيط: الباقي بعد العربون على دفعاتٍ متساوية (آخرها يأخذ كسر الهللة) كل everyDays يومًا من firstDue
+function instalmentSchedule({ total, deposit, count, firstDue, everyDays }) {
+  const left = toHalalas(total) - toHalalas(deposit);
+  const n = Math.max(1, Math.min(24, Math.round(Number(count) || 1)));
+  if (left <= 0) return [];
+  const base = Math.floor(left / n);
+  const start = YMD.test(String(firstDue || "")) ? new Date(`${firstDue}T12:00:00Z`) : new Date(Date.now() + 30 * 86400000);
+  const step = Math.max(1, Math.min(365, Math.round(Number(everyDays) || 30)));
+  return Array.from({ length: n }, (_, i) => ({
+    n: i + 1,
+    due: new Date(start.getTime() + i * step * 86400000).toISOString().slice(0, 10),
+    amount: fromHalalas(i === n - 1 ? left - base * (n - 1) : base),
+  }));
+}
+
 router.get("/reservations", async (req, res, next) => {
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
       const { rows } = await client.query(
-        `select r.*, c.name as customer_name
+        `select r.*, r.hold_until::text as hold_until, c.name as customer_name
            from reservations r left join customers c on c.id = r.customer_id
           where r.branch_id = $1 order by r.created_at desc limit 500`,
         [req.auth.branchId]
@@ -135,6 +152,11 @@ router.post("/reservations", async (req, res, next) => {
   if (!body.customerId) return res.status(400).json({ error: "customer_required" });
   if (!(total > 0)) return res.status(400).json({ error: "invalid_total" });
   if (deposit < 0 || deposit > total) return res.status(400).json({ error: "invalid_deposit" });
+  if (body.holdUntil && !YMD.test(String(body.holdUntil))) return res.status(400).json({ error: "invalid_hold_until" });
+  const plan = body.plan && Number(body.plan.count) > 0 && deposit < total
+    ? { initialDeposit: deposit, everyDays: Math.round(Number(body.plan.everyDays) || 30),
+        schedule: instalmentSchedule({ total, deposit, count: body.plan.count, firstDue: body.plan.firstDue, everyDays: body.plan.everyDays }) }
+    : null;
 
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
@@ -161,12 +183,13 @@ router.post("/reservations", async (req, res, next) => {
 
       const { rows: rsvRows } = await client.query(
         `insert into reservations
-           (branch_id, ref, customer_id, item_id, total, deposit, remaining, description, method, business_day_id, created_by)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-         returning *`,
+           (branch_id, ref, customer_id, item_id, total, deposit, remaining, description, method, business_day_id, created_by, hold_until, plan)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         returning *, hold_until::text as hold_until`,
         [
           req.auth.branchId, ref, body.customerId, body.itemId || null, total, deposit,
           roundMoney(total - deposit), body.description || null, method, businessDayId, req.auth.userId,
+          body.holdUntil || null, plan ? JSON.stringify(plan) : null,
         ]
       );
       const reservation = rsvRows[0];
@@ -193,6 +216,57 @@ router.post("/reservations", async (req, res, next) => {
       return res.status(status).json(result);
     }
     res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/// دفعةٌ على حجزٍ مفتوح (قسطٌ أو زيادة عربون): تُضاف للعربون وتُنقص الباقي — نقدها يدخل اليومي التزامًا (2210)
+router.post("/reservations/:id/pay", async (req, res, next) => {
+  const amount = roundMoney(req.body?.amount);
+  const method = req.body?.method === "network" ? "network" : "cash";
+  if (!(amount > 0)) return res.status(400).json({ error: "invalid_amount" });
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      const { rows } = await client.query(
+        `select r.*, c.name as customer_name from reservations r left join customers c on c.id = r.customer_id
+          where r.id = $1 and r.branch_id = $2 for update of r`, [req.params.id, req.auth.branchId]);
+      const r = rows[0];
+      if (!r) return { error: "reservation_not_found" };
+      if (r.status !== "open") return { error: "reservation_not_open" };
+      if (amount > roundMoney(Number(r.total) - Number(r.deposit)) + 0.001) return { error: "amount_exceeds_remaining" };
+      const businessDayId = await openDay(client, req.auth.branchId);
+      const { rows: up } = await client.query(
+        `update reservations set deposit = deposit + $2, remaining = greatest(0, remaining - $2) where id = $1 returning *, hold_until::text as hold_until`,
+        [r.id, amount]);
+      const cash = await moveCash(client, {
+        branchId: req.auth.branchId, businessDayId, direction: "in",
+        sourceId: method === "network" ? "daily_network" : "daily_cash", amount,
+        category: "customer_deposit", note: `دفعة حجز ${r.ref} — ${r.customer_name || ""}`,
+        refTable: "reservations", refId: r.id, createdBy: req.auth.userId,
+      });
+      return { reservation: { ...up[0], customerName: r.customer_name }, cashTx: cash?.cashTx || null };
+    });
+    if (result.error) return res.status(result.error.endsWith("_not_found") ? 404 : 409).json(result);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/// «محجوز حتى»: تمديد المهلة أو إزالتها
+router.post("/reservations/:id/hold", async (req, res, next) => {
+  const until = req.body?.holdUntil || null;
+  if (until && !YMD.test(String(until))) return res.status(400).json({ error: "invalid_hold_until" });
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      const { rows } = await client.query(
+        "update reservations set hold_until = $3 where id = $1 and branch_id = $2 and status = 'open' returning *, hold_until::text as hold_until",
+        [req.params.id, req.auth.branchId, until]);
+      return rows[0] ? { reservation: rows[0] } : { error: "reservation_not_open" };
+    });
+    if (result.error) return res.status(409).json(result);
+    res.json(result);
   } catch (err) {
     next(err);
   }
@@ -232,11 +306,24 @@ router.post("/reservations/:id/cancel", async (req, res, next) => {
         });
       }
 
+      // ⚖ إلغاءٌ بلا ردّ: العربون المحتجز يُصادَر إيرادًا (المرجع ت١) — كان يبقى التزامًا في 2210 إلى الأبد
+      let forfeitEntryId = null;
+      if (!refund && depositLeft > 0) {
+        const businessDayId = await openDay(client, req.auth.branchId);
+        forfeitEntryId = await postJournalEntry(client, {
+          branchId: req.auth.branchId, businessDayId, opType: "deposit_forfeit",
+          refTable: "reservations", refId: reservation.id,
+          description: `مصادرة عربون حجزٍ ملغى ${reservation.ref || ""}`.trim(), createdBy: req.auth.userId,
+          lines: [{ account: "2210", side: "debit", amount: depositLeft }, { account: "4350", side: "credit", amount: depositLeft }],
+        });
+        await client.query("update reservations set forfeited = $2 where id = $1", [reservation.id, depositLeft]);
+      }
+
       if (reservation.item_id) {
         await client.query(`update items set reserved_for = null where id = $1`, [reservation.item_id]);
       }
 
-      return { ok: true, refunded: refund, cashTx: cashResult?.cashTx || null };
+      return { ok: true, refunded: refund, forfeited: !refund ? depositLeft : 0, forfeitEntryId, cashTx: cashResult?.cashTx || null };
     });
     if (result.error) {
       const status = result.error === "reservation_not_found" ? 404 : 409;
@@ -463,6 +550,7 @@ router.post(
           description: `مرتجع مبيعات — ${sale.ref || ""}`.trim(), createdBy: req.auth.userId,
           lines: returnJournalLines(amounts, refundSource === "credit" ? "1310" : CASH_ACCOUNTS[refundSource].account),
         });
+        await reverseLoyalty(client, req.auth.branchId, { saleId: sale.id, saleTotal: sale.total, returnedGross: amounts.gross, ref: returnRec.ref, userId: req.auth.userId });
 
         await issueEInvoicesSafe(client, req.auth.branchId);
         return { return: { ...returnRec, journalEntryId }, receipt: receiptRec, cashTx: cashResult?.cashTx || null, amounts: { net: amounts.net, tax: amounts.tax, gross: amounts.gross } };
@@ -599,6 +687,7 @@ router.post(
           description: `مرتجع مبيعات — ${sale.ref}`, createdBy: req.auth.userId,
           lines: returnJournalLines(amounts, REFUND_TARGET_ACCOUNTS[refundTarget]),
         });
+        await reverseLoyalty(client, req.auth.branchId, { saleId: sale.id, saleTotal: sale.total, returnedGross: amounts.gross, ref: returnRec.ref, userId: req.auth.userId });
 
         let receiptRec = null;
         let cashTx = null;
