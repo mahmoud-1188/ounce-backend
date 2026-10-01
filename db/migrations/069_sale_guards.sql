@@ -59,3 +59,28 @@ end $$;
 alter table approvals drop constraint if exists approvals_status_check;
 alter table approvals add constraint approvals_status_check
   check (status in ('pending', 'approved', 'rejected', 'executed', 'cancelled', 'expired'));
+
+-- ⑧ فواتير معلّقة وعروض أسعار (المرجع D — SaleDraftsPage): فاتورةٌ تُحفظ قبل إتمامها وتُستأنف من أي جهاز،
+--    أو عرض سعرٍ يُطبع للعميل بصلاحيته. لا قيد ولا حركة مخزون — الحركة كلّها عند إتمامها فاتورةً.
+create table if not exists sale_drafts (
+  id           uuid primary key default gen_random_uuid(),
+  branch_id    uuid not null references branches(id),
+  ref          text not null,
+  kind         text not null check (kind in ('held', 'quote')),
+  customer_id  uuid references customers(id),
+  customer_name text,
+  payload      jsonb not null,
+  total        numeric(14,2) not null default 0,
+  valid_until  date,
+  status       text not null default 'open' check (status in ('open', 'done', 'cancelled')),
+  sale_id      uuid,
+  note         text,
+  created_by   uuid,
+  created_at   timestamptz not null default now(),
+  closed_at    timestamptz,
+  unique (branch_id, ref)
+);
+alter table sale_drafts enable row level security;
+drop policy if exists branch_isolation_sale_drafts on sale_drafts;
+create policy branch_isolation_sale_drafts on sale_drafts
+  using (branch_id = current_setting('app.current_branch_id', true)::uuid);

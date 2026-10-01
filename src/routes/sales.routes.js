@@ -453,6 +453,12 @@ router.post("/sales", async (req, res, next) => {
 
       if (kyc) await client.query("update sales set kyc = $1 where id = $2", [JSON.stringify(kyc), sale.id]);
       await keepRequesterAsSeller(client, sale.id, guards.overrides);
+      // فاتورةٌ أُكملت من مسودّةٍ معلّقة أو عرض سعر تُغلقها (migration 069 ⑧)
+      if (body.draftId) {
+        await client.query(
+          "update sale_drafts set status = 'done', sale_id = $2, closed_at = now() where id = $1 and branch_id = $3 and status = 'open'",
+          [body.draftId, sale.id, req.auth.branchId]);
+      }
       if (customOrder) {
         await client.query(
           `update custom_orders set stage = 'delivered', sale_id = $2, deposit_used = deposit_used + $3, stage_log = stage_log || $4::jsonb where id = $1`,

@@ -48,6 +48,7 @@ import stocktakeRoutes from "./routes/stocktake.routes.js";
 import controlRoutes from "./routes/control.routes.js";
 import zakatRoutes from "./routes/zakat.routes.js";
 import ifrsRoutes from "./routes/ifrs.routes.js";
+import saleDraftsRoutes from "./routes/saleDrafts.routes.js";
 import einvoiceRoutes from "./routes/einvoice.routes.js";
 
 const app = express();
@@ -121,6 +122,7 @@ app.use("/api", stocktakeRoutes);
 app.use("/api", controlRoutes);
 app.use("/api", zakatRoutes);
 app.use("/api", ifrsRoutes);
+app.use("/api", saleDraftsRoutes);
 app.use("/api", einvoiceRoutes);
 app.use("/api", platformRoutes);
 
