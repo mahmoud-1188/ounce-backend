@@ -5,6 +5,7 @@ import { closeMonth, fiscalStatus } from "../domain/periodClose.js";
 import { issueEnrollCode } from "../domain/enroll.js";
 import { branchDevices, revokeDevice } from "../domain/devices.js";
 import { codeRemnant, listRemnants } from "../domain/remnants.js";
+import { codeLotItems } from "./items.routes.js";
 
 const router = Router();
 
@@ -237,6 +238,73 @@ router.post("/store/branches/:branchId/remnants/:itemId/code", requireCanSendCod
     }));
     if (r.error) return res.status(r.error === "item_not_found" ? 404 : 409).json(r);
     res.status(201).json(r);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * التكويد في الإدارة (migration 069): دفعاتٌ أرسلتها الفروع لتكوّدها الإدارة — بمعالج تكويد الفرع نفسه، والقطع تدخل
+ * مخزون الفرع مباشرةً (الوزن لم يغادر 1210 عنده). ونموذج كل فرع: من يكوّد.
+ *   GET  /store/coding-queue
+ *   POST /store/branches/:branchId/lots/:lotId/items { rows, distributionMode }
+ *   POST /store/branches/:branchId/coding-model { model: branch|hq|both }
+ */
+const CODING_MODELS = ["branch", "hq", "both"];
+router.get("/store/coding-queue", async (req, res, next) => {
+  try {
+    const { rows: brs } = await withoutBranch((c) => c.query(
+      "select id, name, ref from branches where store_id = $1 and deleted_at is null order by name", [req.storeAuth.storeId]));
+    const branches = [];
+    for (const b of brs) {
+      const out = await withBranch(b.id, async (c) => {
+        const { rows: lots } = await c.query(
+          `select l.id, l.ref, l.karat, l.weight, l.cost_per_gram, l.workmanship_total, l.workmanship_allocated, l.sent_to_hq_at,
+                  coalesce((select sum(i.weight * (select count(*) from item_units u where u.item_id = i.id)) from items i where i.lot_id = l.id), 0) as coded_weight
+             from lots l where l.branch_id = $1 and l.status = 'open' and l.coding_at = 'hq' order by l.sent_to_hq_at`, [b.id]);
+        const { rows: st } = await c.query("select coding_model from branch_settings where branch_id = $1", [b.id]);
+        const { rows: cats } = lots.length
+          ? await c.query("select id, name from categories where (branch_id = $1 or branch_id is null) and sale_mode <> 'partial' order by sort_order, name", [b.id])
+          : { rows: [] };
+        return { lots, model: st[0]?.coding_model || "both", categories: cats };
+      });
+      branches.push({ id: b.id, name: b.name, ref: b.ref, model: out.model, categories: out.categories,
+        lots: out.lots.map((l) => ({ id: l.id, ref: l.ref, karat: l.karat, weight: Number(l.weight) || 0, codedWeight: Number(l.coded_weight) || 0,
+          remaining: Math.max(0, Math.round(((Number(l.weight) || 0) - (Number(l.coded_weight) || 0)) * 1000) / 1000),
+          costPerGram: Number(l.cost_per_gram) || 0, sentAt: l.sent_to_hq_at,
+          ageDays: Math.max(0, Math.floor((Date.now() - new Date(l.sent_to_hq_at || Date.now()).getTime()) / 864e5)) })) });
+    }
+    res.json({ branches });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/store/branches/:branchId/lots/:lotId/items", requireCanSendCoding, async (req, res, next) => {
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  const distributionMode = ["per_gram", "per_item", "by_karat"].includes(req.body?.distributionMode) ? req.body.distributionMode : "per_gram";
+  if (!rows.length || rows.some((r) => !r.categoryId || !(Number(r.weight) > 0))) return res.status(400).json({ error: "invalid_rows" });
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const r = await withBranch(req.params.branchId, (c) => codeLotItems(c, {
+      branchId: req.params.branchId, userId: null, lotId: req.params.lotId, rows, distributionMode, viaHq: true,
+    }));
+    if (r.error) return res.status(r.error === "lot_not_found" || r.error === "category_not_found" ? 404 : 409).json(r);
+    res.status(201).json({ items: r.items });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/store/branches/:branchId/coding-model", requireCanManageBranches, async (req, res, next) => {
+  const model = req.body?.model;
+  if (!CODING_MODELS.includes(model)) return res.status(400).json({ error: "invalid_model" });
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    await withBranch(req.params.branchId, (c) => c.query(
+      `insert into branch_settings (branch_id, coding_model) values ($1, $2)
+       on conflict (branch_id) do update set coding_model = excluded.coding_model`, [req.params.branchId, model]));
+    res.json({ model });
   } catch (err) {
     next(err);
   }

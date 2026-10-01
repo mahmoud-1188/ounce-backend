@@ -93,3 +93,35 @@ alter table branch_settings add column if not exists sale_prefs jsonb not null d
 --    (جدول دفعاتٍ متساوية بعد العربون) تُسدَّد بدفعاتٍ على الحجز نفسه — كلّ دفعةٍ عربونٌ إضافيّ (2210).
 alter table reservations add column if not exists hold_until date;
 alter table reservations add column if not exists plan jsonb;
+
+-- ⑪ الحلقة المغلقة للتحويل بين الفروع (المرجع ت٣): المستلِم يعدّ ما وصل — الناقص يبقى «في الطريق» (1350) بتكلفته عند المرسِل
+--    حتى يقرّر مديره: «عجز تحويل» مصروفًا (5340) أو «وُجدت» فتعود القطع لرفّه. لا يُقفل التحويل وفيه ناقصٌ بلا قرار.
+alter table branch_transfers drop constraint if exists branch_transfers_status_check;
+alter table branch_transfers add constraint branch_transfers_status_check
+  check (status in ('sent', 'received', 'short', 'cancelled'));
+alter table branch_transfers add column if not exists missing jsonb not null default '[]'::jsonb;
+alter table branch_transfers add column if not exists counted_weight numeric(12,3);
+alter table branch_transfers add column if not exists short_cost numeric(14,2) not null default 0;
+alter table branch_transfers add column if not exists short_decision text check (short_decision in ('write_off', 'found'));
+alter table branch_transfers add column if not exists short_decided_by uuid;
+alter table branch_transfers add column if not exists short_decided_at timestamptz;
+
+insert into accounts (code, name, parent_code, unit, nature, statement, is_group) values
+  ('5340', 'عجز التحويل بين الفروع', '5300', 'currency', 'debit', 'income', false)
+on conflict (code) do nothing;
+
+insert into posting_rules (op_type, label, rule) values
+  ('branch_transfer_short', 'عجز تحويلٍ بين الفروع',
+   '{"label": "عجز تحويلٍ بين الفروع", "cash": {"debit": "5340", "credit": "1350"}, "weight": {"from": "1350", "to": null}}'::jsonb),
+  ('branch_transfer_found', 'ناقص تحويلٍ وُجد عند المرسِل',
+   '{"label": "ناقص تحويلٍ وُجد عند المرسِل", "cash": {"debit": "5110", "credit": "1350"}, "weight": {"from": "1350", "to": "1210"}}'::jsonb)
+on conflict (op_type) do nothing;
+
+-- ⑫ البضاعة غير المكوَّدة (المرجع ت٣ «الحلقة المغلقة»): الفرع يرسل دفعةً للإدارة لتكوّدها — الدفعة ملكٌ للفرع
+--    (وزنها باقٍ في 1210 عنده) حتى تعود قطعًا في مخزونه، ولا يكوّدها الفرع وهي عند الإدارة. ونموذج الفرع
+--    (تضعه الإدارة): 'branch' يكوّد بنفسه · 'hq' الإدارة وحدها تكوّد · 'both' كلاهما.
+alter table lots add column if not exists coding_at text not null default 'branch' check (coding_at in ('branch', 'hq'));
+alter table lots add column if not exists sent_to_hq_at timestamptz;
+alter table lots add column if not exists sent_to_hq_by uuid;
+alter table branch_settings add column if not exists coding_model text not null default 'both'
+  check (coding_model in ('branch', 'hq', 'both'));

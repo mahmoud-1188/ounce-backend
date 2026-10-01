@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { withBranch } from "../db.js";
+import { insertUnit, itemRefOf, nextItemRefNum } from "../domain/itemCodes.js";
 import {
   authenticate,
   requirePage,
@@ -688,11 +689,7 @@ router.post(
           finalCategoryId = catRows[0].id;
         }
 
-        const { rows: refRows } = await client.query(
-          `select count(*)::int + 1 as n from items where branch_id = $1`,
-          [req.auth.branchId]
-        );
-        const ref = `ITM-${String(refRows[0].n).padStart(6, "0")}`;
+        const ref = itemRefOf(await nextItemRefNum(client, req.auth.branchId));
 
         const businessDayId = await openDay(client, req.auth.branchId);
 
@@ -709,10 +706,7 @@ router.post(
         );
         const newItem = itemRows[0];
 
-        const { rows: unitRows } = await client.query(
-          `insert into item_units (item_id, code) values ($1,$2) returning id, code`,
-          [newItem.id, ref]
-        );
+        const unitRows = [await insertUnit(client, newItem.id, ref)];
 
         await client.query(
           `update scrap_items set stage = 'used', weight_remaining = 0,
