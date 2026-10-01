@@ -26,3 +26,9 @@ insert into posting_rules (op_type, label, rule) values
 on conflict (op_type) do nothing;
 
 alter table reservations add column if not exists forfeited numeric(14,2) not null default 0;
+
+-- ④ جرد الخزنة يُسوّي فرق الذهب بقيدٍ ماليّ مع رجله الوزنية، وفرقٌ فوق 500 يمرّ ببوّابة الاعتماد
+--    (المدير يعتمد نفسه ويُسجَّل، أو الإدارة إن جعلته لها).
+insert into approval_rules (id, label, threshold, approver_role) values
+  ('safe_audit', 'فرق جرد الخزنة', 500, 'manager')
+on conflict (id) do nothing;

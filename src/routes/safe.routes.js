@@ -1,4 +1,6 @@
 import { Router } from "express";
+import { approvalGate } from "../domain/approvals.js";
+import { recordPendingApproval } from "../domain/saleGuards.js";
 import { withBranch } from "../db.js";
 import {
   authenticate,
@@ -404,6 +406,28 @@ router.post("/safe/audit", requireManager, async (req, res, next) => {
       );
       const audit = auditRows[0];
 
+      // ⚖ قيمة فرق الذهب بمتوسط تكلفة الجرام الصافي في 1220 (رصيده المالي ÷ وزنه)، وبلا رصيدٍ بسعر اليوم
+      const { rows: bookRows } = await client.query(
+        `select coalesce(sum(case when l.side = 'debit' then l.amount else -l.amount end), 0) as amount
+           from journal_lines l join journal_entries e on e.id = l.entry_id
+          where e.branch_id = $1 and l.account_code = '1220'`, [req.auth.branchId]);
+      const { rows: fineRows } = await client.query(
+        `select coalesce(sum(case when to_account = '1220' then fine_weight else 0 end) - sum(case when from_account = '1220' then fine_weight else 0 end), 0) as fine
+           from gold_ledger_entries where branch_id = $1 and (to_account = '1220' or from_account = '1220')`, [req.auth.branchId]);
+      const bookAmt = Number(bookRows[0].amount) || 0, bookFine = Number(fineRows[0].fine) || 0;
+      const price24 = Number(body.price24) || 0;
+      const perFine = bookAmt > 0 && bookFine > 0.0005 ? bookAmt / bookFine : price24;
+      for (const l of goldLines) l.value = roundMoney(Math.abs(fineWeight(Math.abs(l.variance), l.karat)) * perFine);
+      const varianceValue = roundMoney(Math.abs(varianceCash) + Math.abs(varianceNetwork) + goldLines.reduce((a, l) => a + (l.value || 0), 0));
+
+      // ⚖ فرقٌ فوق حدّ «فرق جرد الخزنة» (500 افتراضًا) يمرّ ببوّابة الاعتماد
+      const gate = await approvalGate(client, req.auth, {
+        kind: "safe_audit", amount: varianceValue, approvalId: body.approvalId || null,
+        note: `فرق جرد الخزنة ${audit.ref}`, payload: { ...body, approvalId: undefined },
+      });
+      if (gate.error) return gate;
+      if (gate.pending) return { error: "approval_pending", request: { kind: "safe_audit", amount: varianceValue, note: `فرق جرد الخزنة`, payload: { ...body, approvalId: undefined } } };
+
       const journalEntryIds = [];
 
       // ── فرق النقد: سطر cash_tx + قيد يومية بنفس أزواج حسابات
@@ -442,12 +466,9 @@ router.post("/safe/audit", requireManager, async (req, res, next) => {
         journalEntryIds.push(jid);
       }
 
-      // ── فرق الذهب لكل عيار: سطر safe_gold_tx + سطر دفتر وزن (1220) —
-      // لا قيد يومية مالي هنا (لا يوجد حساب إيراد/تكلفة صحيح مزروع لفرق
-      // ذهب خام في الخزنة تحديدًا — weight_surplus/audit_missing
-      // الموجودان في posting_rules يستهدفان 1210 لا 1220، فاستخدامهما هنا
-      // كان سيُحمّل الفرق على حساب المخزون المشغول خطأً؛ موثَّق كتحفّظ
-      // صريح، لا إصلاح صامت).
+      // ── فرق الذهب لكل عيار: سطر safe_gold_tx + رجل وزنية (1220) + قيدٌ ماليّ بقيمته (المرجع ت١):
+      //   زيادة: مدين 1220 / دائن 4320 فائض وزن · عجز: مدين 5330 عجز بالجرد / دائن 1220.
+      //   كان الفرق يدخل الدفتر الوزني وحده فيختلف رصيد 1220 بالجرام عن رصيده بالريال.
       for (const line of goldLines) {
         if (Math.abs(line.variance) < 0.0005) continue;
         const isSurplus = line.variance > 0;
@@ -473,16 +494,33 @@ router.post("/safe/audit", requireManager, async (req, res, next) => {
             gtxRows[0].id, `تسوية جرد الخزنة — عيار ${line.karat} — ${audit.ref}`, req.auth.userId,
           ]
         );
+        if (line.value > 0) {
+          journalEntryIds.push(await postJournalEntry(client, {
+            branchId: req.auth.branchId, businessDayId,
+            opType: isSurplus ? "safe_gold_in" : "safe_gold_out",
+            refTable: "safe_audits", refId: audit.id,
+            description: `${isSurplus ? "زيادة" : "عجز"} ذهب بجرد الخزنة — عيار ${line.karat} — ${audit.ref}`,
+            createdBy: req.auth.userId,
+            lines: isSurplus
+              ? [{ account: "1220", side: "debit", amount: line.value }, { account: "4320", side: "credit", amount: line.value }]
+              : [{ account: "5330", side: "debit", amount: line.value }, { account: "1220", side: "credit", amount: line.value }],
+          }));
+        }
       }
 
       return {
         audit: {
           id: audit.id, ref: audit.ref,
-          varianceCash, varianceNetwork, goldLines,
+          varianceCash, varianceNetwork, goldLines, varianceValue,
+          // فرق ذهبٍ بلا تكلفةٍ ولا سعر: دخل الدفتر الوزني وحده — يُقال لا يُخفى
+          unvalued: goldLines.some((l) => Math.abs(l.variance) > 0.0005 && !(l.value > 0)),
         },
         journalEntryIds,
+        approvalId: gate.approvalId || null,
       };
     });
+    if (result.error === "approval_pending") return recordPendingApproval(res, req.auth, result.request);
+    if (result.error) return res.status(409).json(result);
     res.status(201).json(result);
   } catch (err) {
     next(err);

@@ -187,6 +187,28 @@ async function awardLoyalty(client, branchId, { customerId, paymentMethod, paid,
   return points;
 }
 
+/**
+ * المرتجع يعكس الولاء (المرجع ت١): نقاط الفاتورة تُطرح بنسبة ما رُدّ منها، ولا يُطرح أكثر مما كُسب.
+ * يُعيد عدد النقاط المطروحة.
+ */
+async function reverseLoyalty(client, branchId, { saleId, saleTotal, returnedGross, ref, userId }) {
+  if (!saleId || !(Number(saleTotal) > 0) || !(Number(returnedGross) > 0)) return 0;
+  const { rows } = await client.query(
+    `select customer_id, coalesce(sum(case when points > 0 then points else 0 end), 0)::int as earned,
+            coalesce(-sum(case when points < 0 then points else 0 end), 0)::int as reversed
+       from loyalty_ledger where branch_id = $1 and sale_id = $2 group by customer_id`,
+    [branchId, saleId]
+  );
+  const row = rows[0];
+  if (!row || !(row.earned > 0)) return 0;
+  const share = Math.round(row.earned * Math.min(1, Number(returnedGross) / Number(saleTotal)));
+  const take = Math.min(share, row.earned - row.reversed);
+  if (!(take > 0)) return 0;
+  await client.query("insert into loyalty_ledger (branch_id, customer_id, points, sale_id, note, created_by) values ($1,$2,$3,$4,$5,$6)",
+    [branchId, row.customer_id, -take, saleId, `مرتجع ${ref || ""}`.trim(), userId]);
+  return take;
+}
+
 /** يكتب الطلب المعلّق في معاملته ويردّ 202 بحمولته — كما تفعل المصروفات. */
 async function recordPendingApproval(res, auth, request) {
   const out = await withBranch(auth.branchId, (client) => approvalGate(client, auth, request));
@@ -194,4 +216,4 @@ async function recordPendingApproval(res, auth, request) {
   return res.status(409).json({ error: "approval_state_changed" });
 }
 
-export { awardLoyalty, sideSaleGuards, recordPendingApproval, amlCheck, amlPriorCash, approvalGuards, creditLimitIssue, customerCredit, priceFloorIssue, saleVat };
+export { reverseLoyalty, awardLoyalty, sideSaleGuards, recordPendingApproval, amlCheck, amlPriorCash, approvalGuards, creditLimitIssue, customerCredit, priceFloorIssue, saleVat };

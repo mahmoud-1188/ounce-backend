@@ -5,6 +5,7 @@ import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.
 import { extractInclusiveTax, roundMoney } from "../domain/money.js";
 import { fineWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
+import { reverseLoyalty } from "../domain/saleGuards.js";
 import { applyMarkup, loadBranchPricePolicy } from "../domain/pricePolicy.js";
 import { approvalGate } from "../domain/approvals.js";
 import { coverDailyNetworkRefund } from "../domain/cashPools.js";
@@ -232,11 +233,24 @@ router.post("/reservations/:id/cancel", async (req, res, next) => {
         });
       }
 
+      // ⚖ إلغاءٌ بلا ردّ: العربون المحتجز يُصادَر إيرادًا (المرجع ت١) — كان يبقى التزامًا في 2210 إلى الأبد
+      let forfeitEntryId = null;
+      if (!refund && depositLeft > 0) {
+        const businessDayId = await openDay(client, req.auth.branchId);
+        forfeitEntryId = await postJournalEntry(client, {
+          branchId: req.auth.branchId, businessDayId, opType: "deposit_forfeit",
+          refTable: "reservations", refId: reservation.id,
+          description: `مصادرة عربون حجزٍ ملغى ${reservation.ref || ""}`.trim(), createdBy: req.auth.userId,
+          lines: [{ account: "2210", side: "debit", amount: depositLeft }, { account: "4350", side: "credit", amount: depositLeft }],
+        });
+        await client.query("update reservations set forfeited = $2 where id = $1", [reservation.id, depositLeft]);
+      }
+
       if (reservation.item_id) {
         await client.query(`update items set reserved_for = null where id = $1`, [reservation.item_id]);
       }
 
-      return { ok: true, refunded: refund, cashTx: cashResult?.cashTx || null };
+      return { ok: true, refunded: refund, forfeited: !refund ? depositLeft : 0, forfeitEntryId, cashTx: cashResult?.cashTx || null };
     });
     if (result.error) {
       const status = result.error === "reservation_not_found" ? 404 : 409;
@@ -463,6 +477,7 @@ router.post(
           description: `مرتجع مبيعات — ${sale.ref || ""}`.trim(), createdBy: req.auth.userId,
           lines: returnJournalLines(amounts, refundSource === "credit" ? "1310" : CASH_ACCOUNTS[refundSource].account),
         });
+        await reverseLoyalty(client, req.auth.branchId, { saleId: sale.id, saleTotal: sale.total, returnedGross: amounts.gross, ref: returnRec.ref, userId: req.auth.userId });
 
         await issueEInvoicesSafe(client, req.auth.branchId);
         return { return: { ...returnRec, journalEntryId }, receipt: receiptRec, cashTx: cashResult?.cashTx || null, amounts: { net: amounts.net, tax: amounts.tax, gross: amounts.gross } };
@@ -599,6 +614,7 @@ router.post(
           description: `مرتجع مبيعات — ${sale.ref}`, createdBy: req.auth.userId,
           lines: returnJournalLines(amounts, REFUND_TARGET_ACCOUNTS[refundTarget]),
         });
+        await reverseLoyalty(client, req.auth.branchId, { saleId: sale.id, saleTotal: sale.total, returnedGross: amounts.gross, ref: returnRec.ref, userId: req.auth.userId });
 
         let receiptRec = null;
         let cashTx = null;
