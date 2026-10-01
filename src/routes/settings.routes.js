@@ -94,7 +94,19 @@ router.patch("/settings/branch", requirePage("settings"), requireManager, async 
         );
         zakat = z[0];
       }
-      return { settings: { ...rows[0], ...(zakat || {}) } };
+      // حدّ الآجل الافتراضي وأيام التأخّر (migration 069) — صفر = بلا فحص
+      let credit = null;
+      if (body.creditLimitDefault != null || body.creditOverdueDays != null) {
+        const { rows: cr } = await client.query(
+          `update branch_settings set credit_limit_default = coalesce($2, credit_limit_default), credit_overdue_days = coalesce($3, credit_overdue_days)
+            where branch_id = $1 returning credit_limit_default, credit_overdue_days`,
+          [req.auth.branchId,
+           body.creditLimitDefault != null ? Math.max(0, Number(body.creditLimitDefault) || 0) : null,
+           body.creditOverdueDays != null ? Math.max(0, Math.min(3650, Math.round(Number(body.creditOverdueDays) || 0))) : null]
+        );
+        credit = cr[0];
+      }
+      return { settings: { ...rows[0], ...(zakat || {}), ...(credit || {}) } };
     });
 
     if (result.error === "invalid_tax_rate" || result.error === "invalid_zakat_year" || result.error === "invalid_workday_mode") {

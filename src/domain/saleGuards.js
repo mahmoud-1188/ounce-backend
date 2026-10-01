@@ -209,6 +209,16 @@ async function reverseLoyalty(client, branchId, { saleId, saleTotal, returnedGro
   return take;
 }
 
+/**
+ * فاتورةٌ نُفّذت باعتماد: البائع من طلبها لا من نفّذها — كي لا تنتقل المبيعة وعمولتها إلى المدير.
+ */
+async function keepRequesterAsSeller(client, saleId, overrides = {}) {
+  const ids = Object.values(overrides).filter((o) => o?.approvalId && !o.selfApproved).map((o) => o.approvalId);
+  if (!ids.length) return;
+  const { rows } = await client.query("select requested_by from approvals where id = any($1::uuid[]) and requested_by is not null limit 1", [ids]);
+  if (rows[0]) await client.query("update sales set seller_id = $2 where id = $1", [saleId, rows[0].requested_by]);
+}
+
 /** يكتب الطلب المعلّق في معاملته ويردّ 202 بحمولته — كما تفعل المصروفات. */
 async function recordPendingApproval(res, auth, request) {
   const out = await withBranch(auth.branchId, (client) => approvalGate(client, auth, request));
@@ -216,4 +226,4 @@ async function recordPendingApproval(res, auth, request) {
   return res.status(409).json({ error: "approval_state_changed" });
 }
 
-export { reverseLoyalty, awardLoyalty, sideSaleGuards, recordPendingApproval, amlCheck, amlPriorCash, approvalGuards, creditLimitIssue, customerCredit, priceFloorIssue, saleVat };
+export { keepRequesterAsSeller, reverseLoyalty, awardLoyalty, sideSaleGuards, recordPendingApproval, amlCheck, amlPriorCash, approvalGuards, creditLimitIssue, customerCredit, priceFloorIssue, saleVat };

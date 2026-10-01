@@ -2,7 +2,7 @@ import { Router } from "express";
 import { withBranch } from "../db.js";
 import { authenticate, requireAnyPage } from "../middleware/auth.js";
 import { computeZakat, zakatInputs } from "../domain/zakat.js";
-import { ledgerHealth } from "../domain/ledgerHealth.js";
+import { ledgerHealth, repostSale } from "../domain/ledgerHealth.js";
 
 const router = Router();
 
@@ -34,6 +34,18 @@ router.get("/zakat", authenticate, requireAnyPage("financials", "reportsHub", "f
 router.get("/ledger/health", authenticate, requireAnyPage("generalLedger", "trialBalance", "accountantReview", "financials"), async (req, res, next) => {
   try {
     res.json(await withBranch(req.auth.branchId, (client) => ledgerHealth(client, req.auth.branchId)));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** POST /api/ledger/repost/:saleId — المدير يُرحّل قيد فاتورةٍ قديمة بلا قيد (المرجع ت١ «فحص الدفاتر»). */
+router.post("/ledger/repost/:saleId", authenticate, requireAnyPage("accountantReview", "generalLedger"), async (req, res, next) => {
+  if (req.auth.role !== "manager") return res.status(403).json({ error: "manager_only" });
+  try {
+    const out = await withBranch(req.auth.branchId, (client) => repostSale(client, req.auth.branchId, req.params.saleId, req.auth.userId));
+    if (out.error) return res.status(out.error === "sale_not_found" ? 404 : 409).json(out);
+    res.status(201).json(out);
   } catch (err) {
     next(err);
   }

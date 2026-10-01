@@ -8,7 +8,7 @@ import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.
 import { extractInclusiveTax } from "../domain/money.js";
 import { fineWeight } from "../domain/weight.js";
 import { postJournalEntry } from "../domain/journal.js";
-import { amlCheck, approvalGuards, awardLoyalty, creditLimitIssue, priceFloorIssue, recordPendingApproval, saleVat, sideSaleGuards } from "../domain/saleGuards.js";
+import { amlCheck, approvalGuards, awardLoyalty, keepRequesterAsSeller, creditLimitIssue, priceFloorIssue, recordPendingApproval, saleVat, sideSaleGuards } from "../domain/saleGuards.js";
 import { insertCashTx, insertSaleLines, isStocktakeLocked, nextRef, postGoldMovement, requireBusinessDay, reserveSaleLines } from "../domain/saleOps.js";
 
 const router = Router();
@@ -452,6 +452,7 @@ router.post("/sales", async (req, res, next) => {
       }
 
       if (kyc) await client.query("update sales set kyc = $1 where id = $2", [JSON.stringify(kyc), sale.id]);
+      await keepRequesterAsSeller(client, sale.id, guards.overrides);
       if (customOrder) {
         await client.query(
           `update custom_orders set stage = 'delivered', sale_id = $2, deposit_used = deposit_used + $3, stage_log = stage_log || $4::jsonb where id = $1`,
@@ -762,6 +763,7 @@ router.post("/sales/partial", async (req, res, next) => {
         ...(taxAmount > 0 ? [{ account: "2220", side: "credit", amount: taxAmount }] : []),
       ];
       if (guard.kyc) await client.query("update sales set kyc = $1 where id = $2", [JSON.stringify(guard.kyc), sale.id]);
+      await keepRequesterAsSeller(client, sale.id, guard.overrides);
       const pointsEarned = await awardLoyalty(client, req.auth.branchId, {
         customerId, paymentMethod, paid: total, saleId: sale.id, ref: sale.ref, userId: req.auth.userId });
 
@@ -927,6 +929,7 @@ router.post("/sales/set-part", async (req, res, next) => {
       );
 
       if (guard.kyc) await client.query("update sales set kyc = $1 where id = $2", [JSON.stringify(guard.kyc), sale.id]);
+      await keepRequesterAsSeller(client, sale.id, guard.overrides);
       await awardLoyalty(client, req.auth.branchId, { customerId, paymentMethod, paid: total, saleId: sale.id, ref: sale.ref, userId: req.auth.userId });
 
       await postGoldMovement(client, {

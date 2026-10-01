@@ -1,4 +1,5 @@
 import { POOL_ACCOUNT } from "./cashPools.js";
+import { postJournalEntry } from "./journal.js";
 import { PURITY } from "./weight.js";
 
 /**
@@ -6,6 +7,7 @@ import { PURITY } from "./weight.js";
  * الميزان يُحسب ويُعرض ولا يُنبّه — ومن لم يفتحه لا يعرف أن دفتره انكسر. الفحص يجري ويظهر حيث يُرى.
  *   ① توازن الدفتر كلّه وكل قيد  ② الصناديق (cash_tx) مقابل حساباتها في الأستاذ
  *   ③ أصلٌ وزنيّ سالب  ④ المخزون المملوك بالوزن مقابل 1210 في الدفتر الوزني
+ *   ⑤ عملياتٌ بلا قيد (المرجع ت١ «فحص الدفاتر»): فاتورة · مرتجع · مصروف · شراء · إصلاحٌ بدخل
  */
 async function ledgerHealth(client, branchId) {
   const alerts = [];
@@ -74,7 +76,18 @@ async function ledgerHealth(client, branchId) {
       "المخزون ← الجرد");
   }
 
+  // ⑤ عملياتٌ بلا قيد — كل مسارٍ يقيّد في معاملته، فالناقص من بياناتٍ قديمة أو مستوردة
+  const unposted = await unpostedOps(client, branchId);
+  if (unposted.length) {
+    const fixable = unposted.filter((u) => u.repairable).length;
+    add("warn", `${unposted.length} عمليةً بلا قيد`,
+      `${unposted.slice(0, 5).map((u) => `${u.label} ${u.ref}`).join(" · ")}${unposted.length > 5 ? " …" : ""}` +
+        (fixable ? ` — ${fixable} منها يُرحَّل قيدها بزرّ المدير` : " — تحتاج قيدًا يدويًا"),
+      "المراجعة المحاسبية ← صحة الدفتر");
+  }
+
   return {
+    unposted,
     ok: !alerts.some((a) => a.level === "block"),
     blocks: alerts.filter((a) => a.level === "block").length,
     warns: alerts.filter((a) => a.level === "warn").length,
@@ -82,4 +95,63 @@ async function ledgerHealth(client, branchId) {
   };
 }
 
-export { ledgerHealth };
+const UNPOSTED_SOURCES = [
+  { table: "sales", label: "فاتورة", where: "true" },
+  { table: "returns", label: "مرتجع", where: "true" },
+  { table: "expenses", label: "مصروف", where: "x.amount > 0" },
+  { table: "purchases", label: "شراء", where: "true" },
+  { table: "repairs", label: "إصلاح", where: "x.profit > 0" },
+];
+
+/** العمليات التي لا يقابلها قيدٌ في الأستاذ. الفاتورة البسيطة (نقد · شبكة · آجل · مقسّم بلا عربونٍ ولا بطاقةٍ ولا بدل) يُعاد بناء قيدها. */
+async function unpostedOps(client, branchId) {
+  const out = [];
+  for (const src of UNPOSTED_SOURCES) {
+    const extra = src.table === "sales"
+      ? `, (x.payment_method in ('cash','card','credit','split') and coalesce(x.deposit_applied,0) = 0 and coalesce(x.gift_applied,0) = 0
+           and coalesce(x.trade_in_value,0) = 0 and x.custom_order_id is null) as repairable`
+      : ", false as repairable";
+    const { rows } = await client.query(
+      `select x.id, x.ref ${extra} from ${src.table} x
+        where x.branch_id = $1 and ${src.where}
+          and not exists (select 1 from journal_entries e where e.branch_id = $1 and e.ref_id = x.id)
+        limit 50`, [branchId]);
+    for (const r of rows) out.push({ table: src.table, id: r.id, ref: r.ref || r.id.slice(0, 8), label: src.label, repairable: !!r.repairable });
+  }
+  return out;
+}
+
+/**
+ * يُرحّل قيد فاتورةٍ بسيطةٍ بلا قيد — بالحسابات نفسها التي يكتبها مسار البيع اليوم:
+ * مدين الصندوق/الشبكة/الذمم (والمقسّم بجزأيه) · دائن 4140 بالصافي و2220 بالضريبة المحفوظة على الفاتورة.
+ */
+async function repostSale(client, branchId, saleId, userId) {
+  const { rows } = await client.query("select * from sales where id = $1 and branch_id = $2 for update", [saleId, branchId]);
+  const s = rows[0];
+  if (!s) return { error: "sale_not_found" };
+  const { rows: has } = await client.query("select 1 from journal_entries where branch_id = $1 and ref_id = $2 limit 1", [branchId, saleId]);
+  if (has[0]) return { error: "already_posted" };
+  const unsafe = Number(s.deposit_applied) > 0 || Number(s.gift_applied) > 0 || Number(s.trade_in_value) > 0 || s.custom_order_id
+    || !["cash", "card", "credit", "split"].includes(s.payment_method);
+  if (unsafe) return { error: "needs_manual_entry" };
+  const total = Number(s.total) || 0, tax = Number(s.tax_amount) || 0;
+  const debit = s.payment_method === "split"
+    ? [["1130", Number(s.cash_part) || 0], ["1140", Number(s.network_part) || 0]]
+    : [[s.payment_method === "card" ? "1140" : s.payment_method === "credit" ? "1310" : "1130", total]];
+  const lines = [
+    ...debit.filter(([, a]) => a > 0).map(([account, amount]) => ({ account, side: "debit", amount })),
+    { account: "4140", side: "credit", amount: Math.round((total - tax) * 100) / 100 },
+    ...(tax > 0 ? [{ account: "2220", side: "credit", amount: tax }] : []),
+  ];
+  const journalEntryId = await postJournalEntry(client, {
+    branchId, businessDayId: s.business_day_id,
+    opType: s.payment_method === "credit" ? "sale_credit" : s.payment_method === "card" ? "sale_card" : "sale_cash",
+    refTable: "sales", refId: s.id, description: `ترحيل قيد فاتورةٍ قديمة ${s.ref}`, createdBy: userId, lines,
+  });
+  await client.query(
+    `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'update',$2,'sales',$3,$4)`,
+    [branchId, userId, s.id, JSON.stringify({ ref: s.ref, repost: true, journalEntryId })]);
+  return { ok: true, journalEntryId };
+}
+
+export { ledgerHealth, repostSale, unpostedOps };
