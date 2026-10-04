@@ -2,6 +2,7 @@ import { verifySession } from "../auth/jwt.js";
 import { withoutBranch } from "../db.js";
 import { currentAllowed } from "../auth/permissions.js";
 import { applyScreenPolicy, hqDeniedActions, screenEntry } from "../domain/hqPolicy.js";
+import { applyPackage } from "../domain/storePackage.js";
 
 /**
  * Verifies the bearer JWT, loads the user's role from the database (not
@@ -49,7 +50,7 @@ async function authenticateHidden(payload, req, res, next) {
   try {
     const { rows } = await withoutBranch((client) =>
       client.query(
-        `select b.id as branch_id, s.status as store_status, s.subscription_expires_at,
+        `select b.id as branch_id, s.status as store_status, s.subscription_expires_at, s.package as store_package,
                 b.locked as branch_locked, b.lock_reason as branch_lock_reason,
                 b.locked_at as branch_locked_at, b.locked_by as branch_locked_by,
                 r.allowed_tabs, r.allowed_more, r.deny_actions, coalesce(bs.hidden_mode_enabled, true) as hidden_on
@@ -78,7 +79,8 @@ async function authenticateHidden(payload, req, res, next) {
       hidden: true,
       user: { id: null, name: "مخزون وجرد", role: "hidden", branch_id: row.branch_id, allowed_pages: null },
       roleConfig: role,
-      allowedPages: currentAllowed({ allowed_pages: null }, role),
+      storePackage: row.store_package || "full",
+      allowedPages: applyPackage(currentAllowed({ allowed_pages: null }, role), row.store_package),
     };
     next();
   } catch (err) {
@@ -120,7 +122,7 @@ async function authenticate(req, res, next) {
       client.query(
         `select u.*, r.allowed_tabs, r.allowed_more, r.deny_actions,
                 r.can_manage_day, r.can_break,
-                s.status as store_status, s.subscription_expires_at, s.hq_policy,
+                s.status as store_status, s.subscription_expires_at, s.hq_policy, s.package as store_package,
                 b.locked as branch_locked, b.lock_reason as branch_lock_reason,
                 b.locked_at as branch_locked_at, b.locked_by as branch_locked_by,
                 coalesce(bs.device_lock, 'off') as device_lock,
@@ -174,7 +176,9 @@ async function authenticate(req, res, next) {
       role: user.role,
       user,
       roleConfig: role,
-      allowedPages: applyScreenPolicy(currentAllowed(user, role), screenEntry(user.hq_policy, user.branch_id, user.role)),
+      storePackage: user.store_package || "full",
+      // باقة «بدون محاسبة» (migration 070) فوق كل شيء: الشاشات المحاسبية تسقط من الصلاحيات فتُرفض مساراتها
+      allowedPages: applyPackage(applyScreenPolicy(currentAllowed(user, role), screenEntry(user.hq_policy, user.branch_id, user.role)), user.store_package),
     };
     next();
   } catch (err) {
