@@ -29,7 +29,7 @@ router.post("/store-auth/login", async (req, res, next) => {
     // (authenticateStore يرفضه فقط عند أول طلب لاحق) — تجربة مربكة لا لزوم لها.
     const { rows } = await withoutBranch((client) =>
       client.query(
-        `select su.*, s.status as store_status, s.subscription_expires_at
+        `select su.*, s.status as store_status, s.subscription_expires_at, s.package as store_package
            from store_users su
            join stores s on s.id = su.store_id
           where su.email = $1 and su.active = true`,
@@ -64,6 +64,7 @@ router.post("/store-auth/login", async (req, res, next) => {
         allowedPages: storeUser.allowed_pages,
         canManageBranches: !!storeUser.can_manage_branches,
         canSendCoding: !!storeUser.can_send_coding,
+        storePackage: storeUser.store_package || "full",
       },
     });
   } catch (err) {
@@ -86,6 +87,7 @@ router.get("/store-auth/me", authenticateStore, (req, res) => {
       allowedPages: req.storeAuth.allowedPages,
       canManageBranches: req.storeAuth.canManageBranches,
       canSendCoding: req.storeAuth.canSendCoding,
+      storePackage: req.storeAuth.storePackage,
     },
   });
 });

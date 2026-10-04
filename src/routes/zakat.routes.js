@@ -12,6 +12,8 @@ const router = Router();
  * الإعدادات: { on: false } بلا حساب — فلا بطاقة ولا إيضاح.
  */
 router.get("/zakat", authenticate, requireAnyPage("financials", "reportsHub", "fullStatements", "ifrs"), async (req, res, next) => {
+  // الزكاة محاسبية: مخفيّة في باقة «بدون محاسبة» وإن سمح بها مركز التقارير
+  if (req.auth.storePackage === "no_accounting") return res.status(403).json({ error: "package_no_accounting" });
   const asOf = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.asOf || "")) ? String(req.query.asOf) : null;
   const price24 = Number(req.query.price24) || 0;
   try {

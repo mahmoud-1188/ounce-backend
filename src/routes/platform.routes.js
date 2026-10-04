@@ -3,6 +3,7 @@ import { pool, withoutBranch } from "../db.js";
 import { hashPassword, verifyPassword } from "../auth/hashPassword.js";
 import { signPlatformSession } from "../auth/jwt.js";
 import { authenticatePlatform, requirePlatformAdminKey } from "../middleware/platformAuth.js";
+import { PACKAGES } from "../domain/storePackage.js";
 
 /**
  * لوحة أدمن المنصة (ounce-admin) — migration 032.
@@ -122,6 +123,8 @@ function shapeStore(s) {
     id: s.id,
     name: s.name,
     plan: s.plan,
+    // باقة المحل (migration 070): كاملة أو بدون محاسبة
+    package: s.package || "full",
     maxBranches: s.max_branches,
     branchCount: s.branch_count ?? null,
     expiresAt: s.subscription_expires_at,
@@ -309,6 +312,7 @@ router.post("/platform/stores", async (req, res, next) => {
   const b = req.body || {};
   const name = String(b.name || "").trim();
   const plan = b.plan || "central";
+  const pkg = b.package || "full";
   const months = toNonNegInt(b.months ?? 12);
   let maxBranches = toNonNegInt(b.maxBranches ?? 1);
   const ownerName = String(b.ownerName || "").trim();
@@ -317,6 +321,7 @@ router.post("/platform/stores", async (req, res, next) => {
 
   if (!name) return res.status(400).json({ error: "store_name_required" });
   if (!PLANS.includes(plan)) return res.status(400).json({ error: "invalid_plan" });
+  if (!PACKAGES.includes(pkg)) return res.status(400).json({ error: "invalid_package" });
   if (months === null) return res.status(400).json({ error: "invalid_months" });
   if (!maxBranches || maxBranches < 1) return res.status(400).json({ error: "invalid_max_branches" });
   if (plan === "branch_only") maxBranches = 1;
@@ -332,12 +337,12 @@ router.post("/platform/stores", async (req, res, next) => {
     const passwordHash = await hashPassword(ownerPassword);
     const store = await inTx(async (client) => {
       const { rows } = await client.query(
-        `insert into stores (name, plan, max_branches, subscription_expires_at, status, price_base, price_per_branch)
+        `insert into stores (name, plan, max_branches, subscription_expires_at, status, price_base, price_per_branch, package)
          values ($1, $2, $3,
                  case when $4::int = 0 then null else now() + make_interval(months => $4::int) end,
-                 'active', $5, $6)
+                 'active', $5, $6, $7)
          returning *`,
-        [name, plan, maxBranches, months, priceBase, pricePerBranch]
+        [name, plan, maxBranches, months, priceBase, pricePerBranch, pkg]
       );
       const s = rows[0];
       await client.query(
@@ -441,6 +446,7 @@ router.patch("/platform/stores/:id", async (req, res, next) => {
       const nv = {
         name: b.name !== undefined ? String(b.name).trim() : cur.name,
         plan: b.plan !== undefined ? b.plan : cur.plan,
+        pkg: b.package !== undefined ? b.package : (cur.package || "full"),
         maxBranches: b.maxBranches !== undefined ? toNonNegInt(b.maxBranches) : cur.max_branches,
         expiresAt: b.expiresAt !== undefined ? b.expiresAt : cur.subscription_expires_at,
         priceBase: b.priceBase !== undefined ? toMoney(b.priceBase) : Number(cur.price_base),
@@ -449,6 +455,7 @@ router.patch("/platform/stores/:id", async (req, res, next) => {
       if (nv.priceBase === null || nv.pricePerBranch === null) return { status: 400, body: { error: "invalid_price" } };
       if (!nv.name) return { status: 400, body: { error: "store_name_required" } };
       if (!PLANS.includes(nv.plan)) return { status: 400, body: { error: "invalid_plan" } };
+      if (!PACKAGES.includes(nv.pkg)) return { status: 400, body: { error: "invalid_package" } };
       if (!nv.maxBranches || nv.maxBranches < 1) return { status: 400, body: { error: "invalid_max_branches" } };
       if (nv.plan === "branch_only") nv.maxBranches = 1;
       if (nv.expiresAt !== null && Number.isNaN(new Date(nv.expiresAt).getTime())) {
@@ -460,18 +467,18 @@ router.patch("/platform/stores/:id", async (req, res, next) => {
 
       const { rows: upd } = await client.query(
         `update stores set name = $1, plan = $2, max_branches = $3, subscription_expires_at = $4,
-                price_base = $6, price_per_branch = $7
+                price_base = $6, price_per_branch = $7, package = $8
           where id = $5 returning *`,
-        [nv.name, nv.plan, nv.maxBranches, nv.expiresAt, cur.id, nv.priceBase, nv.pricePerBranch]
+        [nv.name, nv.plan, nv.maxBranches, nv.expiresAt, cur.id, nv.priceBase, nv.pricePerBranch, nv.pkg]
       );
       await logAction(client, {
         adminId: req.platformAuth.adminId,
         action: "store_updated",
         storeId: cur.id,
         details: {
-          before: { name: cur.name, plan: cur.plan, maxBranches: cur.max_branches, expiresAt: cur.subscription_expires_at,
+          before: { name: cur.name, plan: cur.plan, package: cur.package, maxBranches: cur.max_branches, expiresAt: cur.subscription_expires_at,
             priceBase: Number(cur.price_base), pricePerBranch: Number(cur.price_per_branch) },
-          after: { name: upd[0].name, plan: upd[0].plan, maxBranches: upd[0].max_branches, expiresAt: upd[0].subscription_expires_at,
+          after: { name: upd[0].name, plan: upd[0].plan, package: upd[0].package, maxBranches: upd[0].max_branches, expiresAt: upd[0].subscription_expires_at,
             priceBase: Number(upd[0].price_base), pricePerBranch: Number(upd[0].price_per_branch) },
         },
       });

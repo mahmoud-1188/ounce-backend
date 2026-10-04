@@ -372,6 +372,8 @@ router.get("/bootstrap", async (req, res, next) => {
     res.json({
       fiscalClosures,
       branch: branch.rows[0] || null,
+      // باقة المحل (migration 070) — الواجهة تُخفي بها القسم المحاسبي (والخادم يرفضه بالصلاحيات)
+      storePackage: req.auth.storePackage || "full",
       // ⚠ businessDay (مفرد) يبقى بشكله الأصلي (أحدث سجل فقط) — لا يُكسَر
       // عقد المستهلك الحالي في bootstrap.routes.js/normalize.js. businessDays
       // (جمع) إضافة جديدة: قائمة كاملة بكل أعمدة اللقطة، لعرض سجل "الأيام

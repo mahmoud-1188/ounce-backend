@@ -1,5 +1,6 @@
 import { verifySession } from "../auth/jwt.js";
 import { withoutBranch } from "../db.js";
+import { hqRouteBlocked } from "../domain/storePackage.js";
 
 /**
  * ⚠ نظير authenticate في auth.js لكن للمستخدم المركزي (store_users) —
@@ -33,7 +34,7 @@ async function authenticateStore(req, res, next) {
   try {
     const { rows } = await withoutBranch((client) =>
       client.query(
-        `select su.*, s.status as store_status, s.subscription_expires_at
+        `select su.*, s.status as store_status, s.subscription_expires_at, s.package as store_package
            from store_users su
            join stores s on s.id = su.store_id
           where su.id = $1 and su.store_id = $2 and su.active = true`,
@@ -67,7 +68,10 @@ async function authenticateStore(req, res, next) {
       allowedPages: storeUser.allowed_pages,
       canManageBranches: !!storeUser.can_manage_branches,
       canSendCoding: !!storeUser.can_send_coding,
+      storePackage: storeUser.store_package || "full",
     };
+    // باقة «بدون محاسبة» (migration 070): مسارات الإدارة المحاسبية مرفوضة
+    if (hqRouteBlocked(req.storeAuth.storePackage, req.originalUrl)) return res.status(403).json({ error: "package_no_accounting" });
     next();
   } catch (err) {
     next(err);
