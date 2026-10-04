@@ -7,7 +7,7 @@ const PACKAGES = ["full", "no_accounting"];
 const ACCOUNTING_PAGES = [
   "journal", "generalLedger", "trialBalance", "fullStatements", "financials", "ifrs", "combinedBook",
   "anyStatement", "queryBuilder", "docCycle", "accountantReview", "aiAccountant",
-  "supplierLedger", "officeLedger", "bankRecon",
+  "supplierLedger", "officeLedger", "bankRecon", "fixedAssets", "budgets",
 ];
 
 // مسارات الإدارة المحاسبية: الميزان الموحّد · الزكاة · السنة المالية وإقفال الأشهر · دفاتر الفرع وقيوده
