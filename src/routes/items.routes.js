@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { withBranch } from "../db.js";
-import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.js";
+import { authenticate, requireAnyPage, requirePage, requireNotDenied } from "../middleware/auth.js";
 import { postJournalEntry } from "../domain/journal.js";
 import { roundMoney } from "../domain/money.js";
 import { fineWeight } from "../domain/weight.js";
@@ -242,6 +242,23 @@ async function codeLotItems(client, { branchId, userId, lotId, rows, distributio
 
 /// إرسال دفعةٍ للتكويد في الإدارة (migration 069) — لا قيد: الوزن باقٍ في 1210 عند الفرع حتى يعود قطعًا.
 ///   فرعٌ نموذجه «الفرع يكوّد» لا يرسل، والدفعة الافتتاحية تُكوَّد في وضع الافتتاح هنا.
+// علامة طباعة الملصق على القطع برموزها (migration 071) — لا تخرج قطعةٌ بلا ملصقها
+router.post("/items/units/printed", authenticate, requireAnyPage("addGoods", "printing", "inventory", "branchTransfers"), async (req, res, next) => {
+  const codes = [...new Set((Array.isArray(req.body?.codes) ? req.body.codes : []).map((c) => String(c || "").trim().toUpperCase()).filter(Boolean))].slice(0, 500);
+  const printed = req.body?.printed !== false;
+  if (!codes.length) return res.status(400).json({ error: "codes_required" });
+  try {
+    const rows = await withBranch(req.auth.branchId, async (c) => {
+      const { rows } = await c.query(
+        `update item_units u set printed = $3 from items i
+          where i.id = u.item_id and i.branch_id = $1 and upper(u.code) = any($2::text[])
+          returning u.code`, [req.auth.branchId, codes, printed]);
+      return rows;
+    });
+    res.json({ updated: rows.length });
+  } catch (err) { next(err); }
+});
+
 router.post("/lots/:id/send-to-hq", async (req, res, next) => {
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
