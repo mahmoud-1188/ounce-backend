@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { approvalGate } from "../domain/approvals.js";
 import { withBranch } from "../db.js";
 import { authenticate, requireAnyPage, requirePage, requireNotDenied } from "../middleware/auth.js";
 import { postJournalEntry } from "../domain/journal.js";
@@ -260,6 +261,37 @@ router.post("/items/units/printed", authenticate, requireAnyPage("addGoods", "pr
       return rows;
     });
     res.json({ updated: rows.length });
+  } catch (err) { next(err); }
+});
+
+// إعادة طباعة ملصقٍ مطبوع أو استبدال رقاقته (migration 076) — بموافقة تُسجَّل
+router.post("/items/units/reprint", authenticate, requireAnyPage("printing", "addGoods", "inventory"), async (req, res, next) => {
+  const codes = [...new Set((Array.isArray(req.body?.codes) ? req.body.codes : []).map((c) => String(c || "").trim().toUpperCase()).filter(Boolean))].slice(0, 200);
+  const action = ["reprint", "replace", "unmark"].includes(req.body?.action) ? req.body.action : "reprint";
+  if (!codes.length) return res.status(400).json({ error: "codes_required" });
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows } = await c.query(
+        `select u.code from item_units u join items i on i.id = u.item_id
+          where i.branch_id = $1 and upper(u.code) = any($2::text[])`, [req.auth.branchId, codes]);
+      if (rows.length !== codes.length) return { error: "unit_not_found" };
+      const label = action === "replace" ? "استبدال رقاقة" : action === "unmark" ? "إلغاء علامة الطباعة" : "إعادة طباعة ملصق";
+      const gate = await approvalGate(c, req.auth, {
+        kind: "label_reprint", amount: 0, approvalId: req.body?.approvalId || null,
+        note: `${label}: ${codes.slice(0, 6).join(" · ")}${codes.length > 6 ? ` +${codes.length - 6}` : ""}${req.body?.reason ? ` — ${String(req.body.reason).slice(0, 80)}` : ""}`,
+        payload: { codes, action, reason: req.body?.reason || null },
+      });
+      if (gate.error) return gate;
+      if (gate.pending) return { approvalPending: gate.pending };
+      await c.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
+         values ($1,'update',$2,'item_units',null,$3)`,
+        [req.auth.branchId, req.auth.userId, JSON.stringify({ action: `label_${action}`, codes, approvalId: gate.approvalId || null })]);
+      return { ok: true, codes, action };
+    });
+    if (out.approvalPending) return res.status(202).json(out);
+    if (out.error) return res.status(out.error === "unit_not_found" ? 404 : 409).json(out);
+    res.json(out);
   } catch (err) { next(err); }
 });
 
