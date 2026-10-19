@@ -91,7 +91,7 @@ async function authenticateHidden(payload, req, res, next) {
 }
 
 // ما يُرفض في فترة التجهيز: كل ما يحرّك النقد أو الدفاتر. يعمل: التكويد · الجرد · الإعدادات · الأشخاص · الرصيد الافتتاحي
-const SETUP_BLOCKED = /^\/api\/(sales|sale-drafts\/[^/]+\/convert|day|day-ask|safe|expenses|purchases|purchase-orders\/[^/]+\/receive|payroll|fixed-assets|custody|commissions|bank-fees|reservations|gift-cards|loyalty|custom-orders|taskirat|taskir-offices|price-fix|ledger|fiscal|hq-purchase|branch-transfers|scrap|inventory\/issue|journal)(\/|$)/;
+const SETUP_BLOCKED = /^\/api\/(sales|sale-drafts\/[^/]+\/convert|day|day-ask|safe|expenses|purchases|purchase-orders\/[^/]+\/receive|payroll|fixed-assets|custody|commissions|bank-fees|reservations|gift-cards|loyalty|custom-orders|taskirat|taskir-offices|price-fix|ledger|fiscal|hq-purchase|branch-transfers|scrap|inventory\/issue|journal|workshop)(\/|$)/;
 
 async function authenticate(req, res, next) {
   const header = req.headers.authorization || "";
