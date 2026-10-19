@@ -621,7 +621,8 @@ async function insertReturnRow(client, { branchId, sale, allLines, lineIndexes, 
      returning *`,
     [
       branchId, ref, sale.id, businessDayId, amounts.gross, amounts.totalWeight, note || null,
-      JSON.stringify(lineIndexes), JSON.stringify(returnedLines), lineIndexes.length === allLines.length,
+      JSON.stringify(lineIndexes), JSON.stringify(returnedLines),
+      lineIndexes.length === allLines.length && returnedLines.every((l, k) => Number(l.quantity) === Number(allLines[lineIndexes[k]].quantity)),
       refundSource, sale.customer_id, sale.customer_name, createdBy,
       exchange?.settle || null, exchange ? exchange.diff : null,
     ]
@@ -647,7 +648,7 @@ router.post(
 
     try {
       const result = await withBranch(req.auth.branchId, async (client) => {
-        const loaded = await loadSaleForReturn(client, req.auth.branchId, req.params.id, lineIndexes);
+        const loaded = await loadSaleForReturn(client, req.auth.branchId, req.params.id, lineIndexes, body.lineParts || null);
         if (loaded.error) return loaded;
         const { sale, allLines, returnedLines } = loaded;
         // ⚠ الآجل يُخصم من الدَّين لا يُردّ نقدًا — نفس validateReturnRequest.
@@ -779,7 +780,7 @@ router.post(
         if (dayGate.error) return dayGate;
         const businessDay = dayGate.day || { id: null, ref: null };
 
-        const loaded = await loadSaleForReturn(client, req.auth.branchId, req.params.id, lineIndexes);
+        const loaded = await loadSaleForReturn(client, req.auth.branchId, req.params.id, lineIndexes, body.lineParts || null);
         if (loaded.error) return loaded;
         const { sale, allLines, returnedLines } = loaded;
         if (body.settle === "credit" && !sale.customer_id) return { error: "credit_settle_requires_customer" };
