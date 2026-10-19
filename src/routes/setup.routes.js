@@ -1,10 +1,11 @@
 import { Router } from "express";
 import { withBranch } from "../db.js";
-import { authenticate, requireManager } from "../middleware/auth.js";
+import { authenticate, requireAnyPage, requireManager } from "../middleware/auth.js";
 import { postJournalEntry } from "../domain/journal.js";
 import { fineWeight } from "../domain/weight.js";
 import { approvalGate, shapeApproval } from "../domain/approvals.js";
 import { branchDelegation } from "../domain/delegation.js";
+import { roundMoney } from "../domain/money.js";
 
 /**
  * فترة التجهيز وبدء التشغيل (migration 073).
@@ -20,6 +21,9 @@ async function setupState(client, branchId) {
   const s = rows[0] || { ledger_state: "live" };
   const { rows: pc } = await client.query(
     `select count(*)::int as n from item_units u join items i on i.id = u.item_id where i.branch_id = $1`, [branchId]);
+  const { rows: sx } = await client.query(
+    `select count(*)::int as n, coalesce(sum(i.weight), 0) as w from item_units u join items i on i.id = u.item_id
+      where i.branch_id = $1 and u.exit_ref is not null`, [branchId]);
   const { rows: ap } = await client.query(
     `select a.*, r.label as rule_label from approvals a left join approval_rules r on r.id = a.rule_id
       where a.branch_id = $1 and a.rule_id = 'go_live' and a.status in ('pending', 'approved')
@@ -33,6 +37,7 @@ async function setupState(client, branchId) {
     openingBalance: s.opening_balance || null,
     goLiveAt: s.go_live_at || null,
     goLiveDate: s.go_live_date || null,
+    exited: { pieces: sx[0]?.n || 0, weight: Number(sx[0]?.w) || 0 },
     request: ap[0] ? shapeApproval(ap[0], { label: ap[0].rule_label }) : null,
   };
 }
@@ -73,6 +78,58 @@ router.post("/setup/opening-balance", authenticate, requireManager, async (req, 
       return setupState(c, req.auth.branchId);
     });
     if (out.error) return res.status(409).json(out);
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
+// بيعٌ بلا سعر في فترة التجهيز: قطعةٌ من البضاعة القديمة بِيعت قبل التشغيل تخرج من المخزون بلا فاتورةٍ ولا قيد،
+//   وتنقص من الافتتاحي المؤجَّل فلا تدخل الدفاتر يوم البدء. تُوسم issued برقم إخراجٍ SX- وأثرها في التدقيق.
+router.post("/setup/exit-units", authenticate, requireAnyPage("sales", "addGoods"), async (req, res, next) => {
+  const codes = [...new Set((Array.isArray(req.body?.codes) ? req.body.codes : []).map((c) => String(c || "").trim().toUpperCase()).filter(Boolean))].slice(0, 200);
+  const note = String(req.body?.note || "").trim().slice(0, 160);
+  if (!codes.length) return res.status(400).json({ error: "codes_required" });
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const st = await setupState(c, req.auth.branchId);
+      if (st.ledgerState !== "setup") return { error: "already_live" };
+      const { rows } = await c.query(
+        `select u.id, u.code, u.sold, u.issued, u.held, i.weight, i.cost_per_gram, i.workmanship, l.id as lot_id, l.source, l.opening_posted
+           from item_units u join items i on i.id = u.item_id left join lots l on l.id = i.lot_id
+          where i.branch_id = $1 and upper(u.code) = any($2::text[]) for update of u`, [req.auth.branchId, codes]);
+      if (rows.length !== codes.length) {
+        const have = new Set(rows.map((r) => r.code.toUpperCase()));
+        return { error: "unit_not_found", code: codes.find((x) => !have.has(x)) };
+      }
+      for (const r of rows) {
+        if (r.sold || r.issued || r.held) return { error: "unit_not_available", code: r.code };
+        if (r.source !== "opening" || r.opening_posted !== false) return { error: "not_opening_stock", code: r.code };
+      }
+      const { rows: nr } = await c.query(
+        `select count(distinct exit_ref)::int + 1 as n from item_units u join items i on i.id = u.item_id
+          where i.branch_id = $1 and u.exit_ref is not null`, [req.auth.branchId]);
+      const ref = `SX-${String(nr[0].n).padStart(4, "0")}`;
+      await c.query(
+        `update item_units set issued = true, issued_at = now(), issued_by = $2, exit_ref = $3, exit_note = $4 where id = any($1::uuid[])`,
+        [rows.map((r) => r.id), req.auth.userId, ref, note || "بيع قبل التشغيل — بلا سعر"]);
+      const byLot = new Map();
+      for (const r of rows) {
+        const g = byLot.get(r.lot_id) || { w: 0, gold: 0, total: 0 };
+        g.w += Number(r.weight); g.gold += (Number(r.cost_per_gram) || 0) * Number(r.weight);
+        g.total += (Number(r.cost_per_gram) || 0) * Number(r.weight) + (Number(r.workmanship) || 0);
+        byLot.set(r.lot_id, g);
+      }
+      for (const [lotId, g] of byLot) await c.query(
+        `update lots set weight = greatest(0, coalesce(weight, 0) - $2), gold_cost = greatest(0, coalesce(gold_cost, 0) - $3),
+                         total_cost = greatest(0, coalesce(total_cost, 0) - $4) where id = $1`,
+        [lotId, g.w, roundMoney(g.gold), roundMoney(g.total)]);
+      const weight = Math.round(rows.reduce((a, r) => a + Number(r.weight), 0) * 1000) / 1000;
+      await c.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
+         values ($1,'delete',$2,'item_units',null,$3)`,
+        [req.auth.branchId, req.auth.userId, JSON.stringify({ action: "setup_exit", ref, codes, weight, note: note || null })]);
+      return { ok: true, ref, count: rows.length, weight };
+    });
+    if (out.error) return res.status(out.error === "unit_not_found" ? 404 : 409).json(out);
     res.json(out);
   } catch (err) { next(err); }
 });
