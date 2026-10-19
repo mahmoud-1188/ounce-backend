@@ -42,6 +42,8 @@ async function approvalGate(client, auth, { kind, amount, payload = null, approv
   // ⚖ «بلا موافقات» من الإدارة: لا طلبات اعتمادٍ أصلًا
   const deleg = await branchDelegation(client, branchId);
   if (deleg.noApprovals) return { proceed: true };
+  // ⚖ «مخزون وجرد فقط» (باقة بلا محاسبة): إدخالٌ وإخراجٌ بلا موافقاتٍ ولا طلبات
+  if (auth.storePackage === "no_accounting") return { proceed: true };
   const { rows: st } = await client.query(
     "select approvals_enabled, approval_thresholds from branch_settings where branch_id = $1",
     [branchId]
