@@ -4,6 +4,7 @@ import { withoutBranch, withBranch } from "../db.js";
 import { computeZakat, zakatInputs } from "../domain/zakat.js";
 import { authenticateStore, requireStoreOwner, requireCanManageBranches, requireCanSendCoding } from "../middleware/storeAuth.js";
 import { buildConsolidatedReport } from "../domain/consolidatedReport.js";
+import { branchNetWeights } from "../domain/netWeight.js";
 import { buildAnalyticsReport } from "../domain/analyticsReport.js";
 import { storeCanAddBranch } from "../domain/stores.js";
 import { hashPassword } from "../auth/hashPassword.js";
@@ -87,6 +88,30 @@ router.get("/store/report", async (req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+/**
+ * GET /api/store/net-weight?price24=…&karat=21|24 — صافي كل فرعٍ بالوزن بعد الالتزامات، سطرًا سطرًا ثم المجموع
+ * (المرجع: «صافي الفرع بالوزن» — في الفرع بطاقةٌ وتقرير، وفي الإدارة جدولٌ لكل الفروع).
+ */
+router.get("/store/net-weight", async (req, res, next) => {
+  const price24 = Number(req.query.price24) || 0;
+  const karat = Number(req.query.karat) === 24 ? 24 : 21;
+  try {
+    const out = await withoutBranch(async (client) => {
+      const { rows: branches } = await client.query(
+        `select b.id, b.ref, b.name, coalesce(s.ledger_state, 'live') as ledger_state
+           from branches b left join branch_settings s on s.branch_id = b.id
+          where b.store_id = $1 and b.deleted_at is null order by b.name`, [req.storeAuth.storeId]);
+      const live = branches.filter((b) => b.ledger_state !== "setup");
+      const nw = await branchNetWeights(client, live.map((b) => b.id), { price24, baseKarat: karat });
+      const rows = branches.map((b) => ({ branchId: b.id, ref: b.ref, name: b.name, setup: b.ledger_state === "setup", ...(nw.get(b.id) || {}) }));
+      const sum = (k) => Math.round(rows.reduce((a, r) => a + (Number(r[k]) || 0), 0) * 1000) / 1000;
+      return { karat, price24, priceMissing: !(price24 > 0), branches: rows,
+        totals: { gold: sum("gold"), cashGrams: sum("cashGrams"), liabilitiesGrams: sum("liabilitiesGrams"), net: sum("net"), withReceivables: sum("withReceivables") } };
+    });
+    res.json(out);
+  } catch (err) { next(err); }
 });
 
 /**
@@ -224,6 +249,10 @@ router.post("/store/branches", requireCanManageBranches, async (req, res, next) 
         [req.storeAuth.storeId, ref, name.trim()]
       );
       const branch = branchRows[0];
+      // الفرع الجديد يبدأ في فترة التجهيز: يكوّد ويدخل رصيده ثم يطلب «بدء التشغيل» من الإدارة (migration 073)
+      await client.query(
+        `insert into branch_settings (branch_id, ledger_state, opening_mode) values ($1, 'setup', true)
+         on conflict (branch_id) do update set ledger_state = 'setup', opening_mode = true`, [branch.id]);
 
       // ⚠ عبر createBranchUser المشتركة (لا INSERT يدوي منفصل كما كان
       // سابقًا) — نفس المسار الذي يستخدمه أي إنشاء موظفٍ آخر، فيحصل

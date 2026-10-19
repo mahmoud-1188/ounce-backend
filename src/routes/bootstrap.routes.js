@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { branchDelegation } from "../domain/delegation.js";
 import { loadBranchApprovalRouting, shapeApproval } from "../domain/approvals.js";
 import { loadBranchNotices, loadBranchPricePolicy } from "../domain/pricePolicy.js";
 import { branchPolicyView } from "../domain/hqPolicy.js";
@@ -170,7 +171,11 @@ router.get("/bootstrap", async (req, res, next) => {
       // قد لا يطابق أي سطر فعليًا على الخادم.
       (client) =>
         client.query(
-          `select sl.* from sale_lines sl join sales s on s.id = sl.sale_id
+          // unit_codes: رموز القطع المباعة في السطر وما زالت عند العميل — المرتجع يجدها بمسح رمزها
+          `select sl.*,
+                  (select coalesce(array_agg(u.code order by u.code), '{}') from item_units u
+                    where u.sale_id = sl.sale_id and u.item_id = sl.item_id and u.sold) as unit_codes
+             from sale_lines sl join sales s on s.id = sl.sale_id
              where s.branch_id = $1
             order by sl.sale_id, sl.line_no`,
           [branchId]
@@ -369,7 +374,10 @@ router.get("/bootstrap", async (req, res, next) => {
 
     // إقفالات السنة المالية على الخادم (migration 068) — أساس أرصدة السنة الجارية في الواجهة
     const fiscalClosures = await withBranch(branchId, (c) => listYearCloses(c, branchId)).catch(() => []);
+    // تحكّم الإدارة (migration 072): الواجهة تُخفي حدود الاعتماد وإدارة الموظفين حين تكون للإدارة
+    const hqControl = await withBranch(branchId, (c) => branchDelegation(c, branchId)).catch(() => ({ linked: false, full: false, noApprovals: false }));
     res.json({
+      hqControl,
       fiscalClosures,
       branch: branch.rows[0] || null,
       // باقة المحل (migration 070) — الواجهة تُخفي بها القسم المحاسبي (والخادم يرفضه بالصلاحيات)

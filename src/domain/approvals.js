@@ -1,4 +1,5 @@
 import { roundMoney } from "./money.js";
+import { branchDelegation } from "./delegation.js";
 
 /**
  * بوّابة الاعتماد (approvalGate في المرجع) — على الخادم.
@@ -14,7 +15,8 @@ import { roundMoney } from "./money.js";
  */
 // أنواعٌ لا يعتمدها من طلبها أبدًا (المرجع ت٢ «الشخص الثاني»): فرق عدّ الصندوق يعتمده غير من عدّ.
 //   ومن هو أعلى معتمِدٍ في الفرع (المدير) يُرفع طلبه إلى الإدارة.
-const NO_SELF_KINDS = ["count_variance"];
+// وهدر الورشة فوق المسموح: يعتمده غير من سجّله (والمدير يرفعه للإدارة)
+const NO_SELF_KINDS = ["count_variance", "workshop_wastage"];
 // مهلة الطلب المعلّق (المرجع ت٢): بعدها يُعلَّم «انتهت مهلته» ولا يُقرَّر ولا يُنفَّذ
 const APPROVAL_EXPIRY_HOURS = 72;
 
@@ -38,6 +40,11 @@ async function approvalGate(client, auth, { kind, amount, payload = null, approv
     return { proceed: true, approvalId: ap.id };
   }
 
+  // ⚖ «بلا موافقات» من الإدارة: لا طلبات اعتمادٍ أصلًا
+  const deleg = await branchDelegation(client, branchId);
+  if (deleg.noApprovals) return { proceed: true };
+  // ⚖ «مخزون وجرد فقط» (باقة بلا محاسبة): إدخالٌ وإخراجٌ بلا موافقاتٍ ولا طلبات
+  if (auth.storePackage === "no_accounting") return { proceed: true };
   const { rows: st } = await client.query(
     "select approvals_enabled, approval_thresholds from branch_settings where branch_id = $1",
     [branchId]
@@ -61,9 +68,10 @@ async function approvalGate(client, auth, { kind, amount, payload = null, approv
     "select s.approval_routing from branches b join stores s on s.id = b.store_id where b.id = $1",
     [branchId]
   );
-  const noSelf = NO_SELF_KINDS.includes(kind);
+  // «تفويض كامل للفرع»: لا شيء يصعد للإدارة، والمعتمِد في الفرع يعتمد ما يطلبه
+  const noSelf = NO_SELF_KINDS.includes(kind) && !deleg.full;
   // من لا يعتمد نفسه وهو أعلى معتمِدٍ في الفرع: طلبه للإدارة
-  const byHq = routesToHq(rt[0]?.approval_routing, kind, amt) || (noSelf && auth.role === (rule.approver_role || "manager"));
+  const byHq = !deleg.full && (routesToHq(rt[0]?.approval_routing, kind, amt) || (noSelf && auth.role === (rule.approver_role || "manager")));
   const approverKind = byHq ? "hq" : rule.approver_role || "manager";
   const selfApprove = !byHq && !noSelf && auth.role === (rule.approver_role || "manager");
   const { rows: apRows } = await client.query(

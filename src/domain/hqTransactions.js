@@ -22,6 +22,8 @@ const HQ_FLOWS = {
   cash_transfer: { label: "تحويل نقدي للإدارة", dir: "branch", needs: ["amount"] },
   // migration 041: نقدٌ من خزنة الإدارة (أو فرعٍ مصدر) إلى خزنة الفرع — بقيدٍ على الطرفين
   cash_from_hq: { label: "تحويل نقد من الإدارة", dir: "hq", needs: ["amount"] },
+  // migration 077: الإدارة تطلب، ومدير الفرع يوافق فيخرج النقد من خزنته — أو يرفض بسببه
+  capital_draw: { label: "سحب الإدارة من رأس مال الفرع", dir: "hq", needs: ["amount"] },
 };
 
 const FIELD_LABEL = { weight: "الوزن", karat: "العيار", pieces: "عدد القطع", amount: "المبلغ" };
@@ -44,6 +46,8 @@ const RECEIVER_SIDE = {
   taskir_to_hq: "hq",
   cash_transfer: "hq",
   cash_from_hq: "branch",
+  // لا «استلام» عامّ: قراره بمسار الموافقة وحده (capital-draw)
+  capital_draw: null,
 };
 
 function validateHqTransactionFields(flow, { weight, karat, pieces, amount }) {

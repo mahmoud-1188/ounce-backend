@@ -41,7 +41,12 @@ function docOf(type, rec, sale, saleLines) {
   const rate = Number(sale.tax_rate) || 0;
   const taxable = !!sale.tax_applicable;
   const lines = type === "381"
-    ? (rec.line_indexes || []).map((i) => saleLines[i]).filter(Boolean)
+    // إشعار الدائن بما رُدّ فعلًا: السطر بعدده المرتجع (lines المحفوظة)، وإلا السطر كاملًا
+    ? (rec.line_indexes || []).map((i, k) => {
+      const line = saleLines[i];
+      const saved = Array.isArray(rec.lines) ? rec.lines[k] : null;
+      return line && saved && saved.quantity != null ? { ...line, quantity: saved.quantity } : line;
+    }).filter(Boolean)
     : saleLines;
   return {
     type, ref: rec.ref, date: type === "381" ? rec.created_at : sale.date,

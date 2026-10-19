@@ -12,7 +12,7 @@ const ACCOUNTING_PAGES = [
 
 // مسارات الإدارة المحاسبية: الميزان الموحّد · الزكاة · السنة المالية وإقفال الأشهر · دفاتر الفرع وقيوده
 const HQ_ACCOUNTING_ROUTES = [
-  /^\/api\/store\/(zakat|consolidated|fiscal)(\/|$)/,
+  /^\/api\/store\/(zakat|consolidated|fiscal|net-weight)(\/|$)/,
   /^\/api\/store\/branches\/[^/]+\/(books|journal|adjustment|close-month)(\/|$)/,
 ];
 

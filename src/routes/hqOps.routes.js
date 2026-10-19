@@ -262,16 +262,23 @@ router.get("/store/coding-queue", async (req, res, next) => {
           `select l.id, l.ref, l.karat, l.weight, l.cost_per_gram, l.workmanship_total, l.workmanship_allocated, l.sent_to_hq_at,
                   coalesce((select sum(i.weight * (select count(*) from item_units u where u.item_id = i.id)) from items i where i.lot_id = l.id), 0) as coded_weight
              from lots l where l.branch_id = $1 and l.status = 'open' and l.coding_at = 'hq' order by l.sent_to_hq_at`, [b.id]);
+        const { rows: pieces } = lots.length
+          ? await c.query(
+            `select i.lot_id, u.code, u.printed, u.sold, i.weight, c.name as category
+               from items i join item_units u on u.item_id = i.id left join categories c on c.id = i.category_id
+              where i.lot_id = any($1::uuid[]) order by i.date_added, u.code`, [lots.map((l) => l.id)])
+          : { rows: [] };
         const { rows: st } = await c.query("select coding_model from branch_settings where branch_id = $1", [b.id]);
         const { rows: cats } = lots.length
           ? await c.query("select id, name from categories where (branch_id = $1 or branch_id is null) and sale_mode <> 'partial' order by sort_order, name", [b.id])
           : { rows: [] };
-        return { lots, model: st[0]?.coding_model || "both", categories: cats };
+        return { lots, pieces, model: st[0]?.coding_model || "both", categories: cats };
       });
       branches.push({ id: b.id, name: b.name, ref: b.ref, model: out.model, categories: out.categories,
         lots: out.lots.map((l) => ({ id: l.id, ref: l.ref, karat: l.karat, weight: Number(l.weight) || 0, codedWeight: Number(l.coded_weight) || 0,
           remaining: Math.max(0, Math.round(((Number(l.weight) || 0) - (Number(l.coded_weight) || 0)) * 1000) / 1000),
           costPerGram: Number(l.cost_per_gram) || 0, sentAt: l.sent_to_hq_at,
+          pieces: out.pieces.filter((p) => p.lot_id === l.id).map((p) => ({ code: p.code, weight: Number(p.weight) || 0, category: p.category || "", printed: !!p.printed, sold: !!p.sold })),
           ageDays: Math.max(0, Math.floor((Date.now() - new Date(l.sent_to_hq_at || Date.now()).getTime()) / 864e5)) })) });
     }
     res.json({ branches });
@@ -296,6 +303,60 @@ router.post("/store/branches/:branchId/lots/:lotId/items", requireCanSendCoding,
   }
 });
 
+/// مراجعة دورة التكويد قبل الشحن: ما كُوِّد خطأً يُلغى ووزنه يعود للدفعة ما دامت عند الإدارة، ثم «أنهِ وأرسل للفرع»
+router.post("/store/branches/:branchId/lots/:lotId/uncode", requireCanSendCoding, async (req, res, next) => {
+  const codes = [...new Set((Array.isArray(req.body?.codes) ? req.body.codes : []).map((c) => String(c || "").trim().toUpperCase()).filter(Boolean))].slice(0, 100);
+  if (!codes.length) return res.status(400).json({ error: "codes_required" });
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const out = await withBranch(req.params.branchId, async (c) => {
+      const { rows: lr } = await c.query("select id, ref, status, coding_at from lots where id = $1 and branch_id = $2 for update", [req.params.lotId, req.params.branchId]);
+      const lot = lr[0];
+      if (!lot) return { error: "lot_not_found" };
+      if (lot.status !== "open" || lot.coding_at !== "hq") return { error: "lot_not_at_hq" };
+      const { rows } = await c.query(
+        `select u.id, u.code, u.sold, u.issued, i.id as item_id, i.weight, i.lot_workmanship_share
+           from item_units u join items i on i.id = u.item_id
+          where i.lot_id = $1 and upper(u.code) = any($2::text[]) for update of u`, [lot.id, codes]);
+      if (rows.length !== codes.length) return { error: "unit_not_found" };
+      const bad = rows.find((r) => r.sold || r.issued);
+      if (bad) return { error: "unit_not_available", code: bad.code };
+      const share = rows.reduce((a, r) => a + (Number(r.lot_workmanship_share) || 0), 0);
+      if (share > 0) await c.query("update lots set workmanship_allocated = greatest(0, workmanship_allocated - $2) where id = $1", [lot.id, Math.round(share * 100) / 100]);
+      await c.query("delete from item_units where id = any($1::uuid[])", [rows.map((r) => r.id)]);
+      await c.query(
+        `delete from items i where i.id = any($1::uuid[]) and not exists (select 1 from item_units u where u.item_id = i.id)
+            and not exists (select 1 from sale_lines s where s.item_id = i.id)`, [[...new Set(rows.map((r) => r.item_id))]]);
+      const weight = Math.round(rows.reduce((a, r) => a + Number(r.weight), 0) * 1000) / 1000;
+      await c.query(`insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'delete',null,'lots',$2,$3)`,
+        [req.params.branchId, lot.id, JSON.stringify({ action: "hq_uncode", lot: lot.ref, codes, weight })]);
+      return { ok: true, codes, weight };
+    });
+    if (out.error) return res.status(out.error === "lot_not_found" || out.error === "unit_not_found" ? 404 : 409).json(out);
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
+router.post("/store/branches/:branchId/lots/:lotId/ship", requireCanSendCoding, async (req, res, next) => {
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const out = await withBranch(req.params.branchId, async (c) => {
+      const { rows: lr } = await c.query("select id, ref, status, coding_at from lots where id = $1 and branch_id = $2 for update", [req.params.lotId, req.params.branchId]);
+      const lot = lr[0];
+      if (!lot) return { error: "lot_not_found" };
+      if (lot.status !== "open" || lot.coding_at !== "hq") return { error: "lot_not_at_hq" };
+      const { rows: pc } = await c.query("select count(*)::int n from item_units u join items i on i.id = u.item_id where i.lot_id = $1", [lot.id]);
+      if (!pc[0].n) return { error: "nothing_coded" };
+      await c.query("update lots set coding_at = 'branch' where id = $1", [lot.id]);
+      await c.query(`insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'update',null,'lots',$2,$3)`,
+        [req.params.branchId, lot.id, JSON.stringify({ action: "hq_ship_coded", lot: lot.ref, pieces: pc[0].n })]);
+      return { ok: true, lot: lot.ref, pieces: pc[0].n };
+    });
+    if (out.error) return res.status(out.error === "lot_not_found" ? 404 : 409).json(out);
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
 router.post("/store/branches/:branchId/coding-model", requireCanManageBranches, async (req, res, next) => {
   const model = req.body?.model;
   if (!CODING_MODELS.includes(model)) return res.status(400).json({ error: "invalid_model" });
@@ -308,6 +369,33 @@ router.post("/store/branches/:branchId/coding-model", requireCanManageBranches, 
   } catch (err) {
     next(err);
   }
+});
+
+// التفويض بضغطة (migration 072): «تفويض كامل للفرع» و«بلا موافقات» — ضغطةٌ تشغّل وضغطةٌ تُطفئ
+router.get("/store/branches/:branchId/delegation", requireCanManageBranches, async (req, res, next) => {
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const { rows } = await withoutBranch((c) => c.query("select delegation from branches where id = $1", [req.params.branchId]));
+    const d = rows[0]?.delegation || {};
+    res.json({ delegation: { full: d.full === true, noApprovals: d.noApprovals === true } });
+  } catch (err) { next(err); }
+});
+router.post("/store/branches/:branchId/delegation", requireCanManageBranches, async (req, res, next) => {
+  const b = req.body || {};
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const { rows } = await withoutBranch((c) => c.query("select delegation from branches where id = $1", [req.params.branchId]));
+    const cur = rows[0]?.delegation || {};
+    const next = { full: b.full != null ? !!b.full : cur.full === true, noApprovals: b.noApprovals != null ? !!b.noApprovals : cur.noApprovals === true };
+    await withBranch(req.params.branchId, async (c) => {
+      await c.query("update branches set delegation = $2 where id = $1", [req.params.branchId, JSON.stringify(next)]);
+      await c.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
+         values ($1,'update',null,'branches',$1,$2)`,
+        [req.params.branchId, JSON.stringify({ action: "delegation", by: req.storeAuth.name || "الإدارة", from: cur, to: next })]);
+    });
+    res.json({ delegation: next });
+  } catch (err) { next(err); }
 });
 
 export default router;

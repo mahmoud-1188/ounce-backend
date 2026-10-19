@@ -9,6 +9,7 @@ import {
   setBranchUserPermissions,
   removeBranchUser,
 } from "../domain/branchUsers.js";
+import { branchDelegation, branchSelfManaged } from "../domain/delegation.js";
 
 const router = Router();
 
@@ -22,6 +23,15 @@ const router = Router();
 // الصحيحة في الـrouter المقصود. كل ملفات routes مركّبة بنفس البادئة
 // app.use("/api", ...)، فتحديد المسار هنا إلزامي لعزل كل بوابة بمسارها.
 router.use("/users", authenticate, requirePage("access"));
+
+// ⚠ فرعٌ مرتبطٌ بالإدارة لا يمنح صلاحيات ولا يضيف موظفين ولا يحذفهم — الإدارة تفعل (ما لم تفوّضه كاملًا)
+const staffByHq = async (req, res, next) => {
+  try {
+    const d = await withBranch(req.auth.branchId, (c) => branchDelegation(c, req.auth.branchId));
+    if (!branchSelfManaged(d)) return res.status(403).json({ error: "staff_by_hq" });
+    next();
+  } catch (err) { next(err); }
+};
 
 // ⚠ منطق كل مسارٍ هنا مُستخرَج الآن إلى src/domain/branchUsers.js
 // (نفس السلوك حرفيًّا) ليشترك فيه هذا الملف ومسارات الفروع عن بعد في
@@ -49,7 +59,7 @@ router.get("/users", async (req, res, next) => {
  * required, PIN 4-6 digits, name not taken (normalizeName), PIN not
  * already used by anyone in the branch.
  */
-router.post("/users", async (req, res, next) => {
+router.post("/users", staffByHq, async (req, res, next) => {
   const { name, pin, role, salary } = req.body || {};
   if (!name || !String(name).trim()) {
     return res.status(400).json({ error: "name_required" });
@@ -106,7 +116,7 @@ router.patch("/users/:id/ai", async (req, res, next) => {
  * explicit override (togglePage()) — including the guard that refuses to
  * strip "access" from the last person who holds it.
  */
-router.patch("/users/:id/permissions", async (req, res, next) => {
+router.patch("/users/:id/permissions", staffByHq, async (req, res, next) => {
   const { allowedPages } = req.body || {};
   if (allowedPages !== null && !Array.isArray(allowedPages)) {
     return res.status(400).json({ error: "allowedPages_must_be_array_or_null" });
@@ -130,7 +140,7 @@ router.patch("/users/:id/permissions", async (req, res, next) => {
  * that's a UI convenience for a single-employee shop, not a safety rule,
  * so it is intentionally NOT replicated here as a hard block.)
  */
-router.delete("/users/:id", async (req, res, next) => {
+router.delete("/users/:id", staffByHq, async (req, res, next) => {
   try {
     const result = await withBranch(req.auth.branchId, (client) =>
       removeBranchUser(client, req.auth.branchId, req.params.id, { id: req.auth.userId, name: req.auth.user?.name, kind: "branch" })

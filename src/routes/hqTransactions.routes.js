@@ -116,6 +116,48 @@ router.post("/branch/hq-transactions", async (req, res, next) => {
  * يستلم الفرع (goods_from_hq، send_for_coding) — الوحيد الذي يُرحّل
  * قيدًا حقيقيًّا هو goods_from_hq (راجع postGoodsFromHqReceipt).
  */
+// سحب الإدارة من رأس مال الفرع (migration 077): المدير يوافق فيخرج النقد من خزنة الفرع إلى خزنة الإدارة، أو يرفض
+router.post("/branch/hq-transactions/:id/capital-draw", async (req, res, next) => {
+  if (req.auth.role !== "manager") return res.status(403).json({ error: "manager_only" });
+  const approve = req.body?.decision === "approved";
+  const note = String(req.body?.note || "").trim().slice(0, 200) || null;
+  if (!approve && !note) return res.status(400).json({ error: "reject_reason_required" });
+  try {
+    const result = await withBranch(req.auth.branchId, async (c) => {
+      const { rows } = await c.query(`select * from hq_transactions where id = $1 and branch_id = $2 and flow = 'capital_draw' for update`, [req.params.id, req.auth.branchId]);
+      const txn = rows[0];
+      if (!txn) return { notFound: true };
+      if (txn.status !== "pending") return { error: "already_decided", status: txn.status };
+      if (!approve) {
+        const { rows: up } = await c.query(
+          `update hq_transactions set status = 'rejected', decided_at = now(), decision_note = $2 where id = $1 returning *`, [txn.id, note]);
+        return { txn: up[0] };
+      }
+      const amount = roundMoney(txn.amount);
+      const bal = await safeCashBalance(c, req.auth.branchId);
+      if (amount > bal + 0.005) return { error: "insufficient_source_cash", available: roundMoney(bal) };
+      await postCashFromHqSend(c, { fromBranchId: req.auth.branchId, txnId: txn.id, amount, toName: "الإدارة", note: txn.note, actorName: req.auth.user?.name || "مدير الفرع" });
+      // طرف الإدارة: يدخل خزنتها (فرعها المركزي) في المعاملة نفسها — إن وُجد
+      const { rows: hq } = await c.query(
+        `select h.id from branches h join branches b on b.store_id = h.store_id where b.id = $1 and h.is_hq and h.deleted_at is null limit 1`, [req.auth.branchId]);
+      if (hq[0] && hq[0].id !== req.auth.branchId) {
+        await c.query("select set_config('app.current_branch_id', $1, true)", [hq[0].id]);
+        await postCashFromHqReceipt(c, { branchId: hq[0].id, txn: { ...txn, note: `سحب من رأس مال الفرع${txn.note ? ` · ${txn.note}` : ""}` }, userId: null, userName: req.auth.user?.name || "" });
+        await c.query("select set_config('app.current_branch_id', $1, true)", [req.auth.branchId]);
+      }
+      const { rows: up } = await c.query(
+        `update hq_transactions set status = 'received', decided_at = now(), received_at = now(), decision_note = $2 where id = $1 returning *`, [txn.id, note]);
+      return { txn: up[0] };
+    });
+    if (result.notFound) return res.status(404).json({ error: "not_found" });
+    if (result.error) return res.status(409).json(result);
+    res.json(serializeTxn(result.txn));
+  } catch (err) {
+    if (err && err.code === "period_locked") return res.status(409).json({ error: "period_locked", why: err.why || null });
+    next(err);
+  }
+});
+
 router.post("/branch/hq-transactions/:id/receive", async (req, res, next) => {
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
@@ -252,6 +294,24 @@ router.post("/store/hq-transactions", requireCanSendCoding, async (req, res, nex
  * تحويل نقد من خزنة المصدر (الفرع الرئيسي افتراضًا) إلى خزنة فرع — يُرحَّل
  * طرف الإرسال فورًا (1170/1110)، وطرف الاستلام حين يؤكّده الفرع (1110/1170).
  */
+// الإدارة تطلب سحبًا من رأس مال فرع — ينتظر موافقة مديره
+router.post("/store/hq-transactions/capital-draw", requireCanManageBranches, async (req, res, next) => {
+  const branchId = req.body?.branchId;
+  const amount = roundMoney(req.body?.amount);
+  const note = String(req.body?.note || "").trim().slice(0, 200) || null;
+  if (!branchId) return res.status(400).json({ error: "branch_id_required" });
+  if (!(amount > 0)) return res.status(400).json({ error: "invalid_amount" });
+  try {
+    const { rows: br } = await withoutBranch((c) => c.query("select id, name, is_hq from branches where id = $1 and store_id = $2 and deleted_at is null", [branchId, req.storeAuth.storeId]));
+    if (!br[0]) return res.status(404).json({ error: "branch_not_found" });
+    if (br[0].is_hq) return res.status(400).json({ error: "same_branch" });
+    const row = await withBranch(branchId, async (c) => (await c.query(
+      `insert into hq_transactions (branch_id, flow, amount, note, requested_by_store_user_id) values ($1, 'capital_draw', $2, $3, $4) returning *`,
+      [branchId, amount, note, req.storeAuth.storeUserId])).rows[0]);
+    res.status(201).json(serializeTxn({ ...row, branch_name: br[0].name }));
+  } catch (err) { next(err); }
+});
+
 router.post("/store/hq-transactions/cash", requireCanManageBranches, async (req, res, next) => {
   const { toBranchId, note } = req.body || {};
   let { fromBranchId } = req.body || {};

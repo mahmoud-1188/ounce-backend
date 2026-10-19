@@ -82,15 +82,36 @@ async function reserveSaleLines(client, branchId, lines, { excludeUnitIds = [] }
     }
     // ⚠ بقايا طقمٍ بِيع جزءٌ منه لا تُباع طقمًا كاملًا حتى تُكوَّد قطعًا (migration 066)
     if (item.remnant) return { error: "item_is_set_remnant", itemId: line.itemId };
+    // ما كوّدته الإدارة يبقى عندها حتى تراجعه وترسله — لا يُباع في الفرع قبل وصوله
+    if (item.lot_id) {
+      const { rows: lr } = await client.query("select coding_at from lots where id = $1", [item.lot_id]);
+      if (lr[0]?.coding_at === "hq") return { error: "item_at_hq", itemId: line.itemId };
+    }
 
     // ⚠ issued=false: قطعة أُخرجت (تالفة/فاقد) لا تُباع وإن بقيت sold=false.
-    const { rows: unsoldRows } = await client.query(
-      `select id from item_units
-        where item_id = $1 and sold = false and issued = false
-          and not (id = any($3::uuid[]))
-        order by held desc, code limit $2`,
-      [item.id, line.quantity, excludeUnitIds]
-    );
+    // القطع الممسوحة نفسها تُباع (unitCodes)، وإلا أوّل المتاح من الصنف
+    const codes = Array.isArray(line.unitCodes) ? [...new Set(line.unitCodes.map((c) => String(c || "").trim()).filter(Boolean))] : [];
+    if (codes.length && codes.length !== Number(line.quantity)) {
+      return { error: "unit_codes_mismatch", itemId: line.itemId, requested: line.quantity, codes: codes.length };
+    }
+    const { rows: unsoldRows } = codes.length
+      ? await client.query(
+        `select id from item_units
+          where item_id = $1 and sold = false and issued = false
+            and upper(code) = any($2::text[])
+            and not (id = any($3::uuid[]))`,
+        [item.id, codes.map((c) => c.toUpperCase()), excludeUnitIds]
+      )
+      : await client.query(
+        `select id from item_units
+          where item_id = $1 and sold = false and issued = false
+            and not (id = any($3::uuid[]))
+          order by held desc, code limit $2`,
+        [item.id, line.quantity, excludeUnitIds]
+      );
+    if (codes.length && unsoldRows.length < codes.length) {
+      return { error: "unit_not_available", itemId: line.itemId, requested: codes.length, available: unsoldRows.length };
+    }
     if (unsoldRows.length < line.quantity) {
       return {
         error: "insufficient_stock",
@@ -160,7 +181,7 @@ async function postGoldMovement(client, { branchId, businessDayId, opType, weigh
  * يقفل الفاتورة ويقرأ أسطرها ويتحقق من فهارس المرتجع ومن عدم إرجاع سطرٍ
  * مرّتين.
  */
-async function loadSaleForReturn(client, branchId, saleId, lineIndexes) {
+async function loadSaleForReturn(client, branchId, saleId, lineIndexes, lineParts = null) {
   const { rows: saleRows } = await client.query(
     "select * from sales where id = $1 and branch_id = $2 for update",
     [saleId, branchId]
@@ -177,16 +198,47 @@ async function loadSaleForReturn(client, branchId, saleId, lineIndexes) {
   }
   if (new Set(lineIndexes).size !== lineIndexes.length) return { error: "duplicate_line_index" };
 
+  // ما أُرجع سلفًا من كل سطر بالعدد ورموز قطعه — من أسطر المرتجعات المحفوظة (lines بترتيب line_indexes)
   const { rows: priorReturns } = await client.query(
-    `select line_indexes from returns where sale_id = $1 and branch_id = $2`,
+    `select line_indexes, lines from returns where sale_id = $1 and branch_id = $2`,
     [sale.id, branchId]
   );
-  const alreadyReturned = new Set();
-  for (const r of priorReturns) for (const i of r.line_indexes || []) alreadyReturned.add(i);
-  const dup = lineIndexes.find((i) => alreadyReturned.has(i));
-  if (dup != null) return { error: "line_already_returned", index: dup };
+  const qtyOf = (l) => Math.max(1, Math.round(Number(l?.quantity) || 1));
+  const returnedQty = new Map();
+  const returnedCodes = new Map();
+  for (const r of priorReturns) {
+    (r.line_indexes || []).forEach((i, k) => {
+      const saved = Array.isArray(r.lines) ? r.lines[k] : null;
+      const q = saved && saved.quantity != null ? qtyOf(saved) : qtyOf(allLines[i]);
+      returnedQty.set(i, (returnedQty.get(i) || 0) + q);
+      const codes = returnedCodes.get(i) || new Set();
+      for (const c of (saved && saved.unit_codes) || []) codes.add(String(c).toUpperCase());
+      returnedCodes.set(i, codes);
+    });
+  }
 
-  return { sale, allLines, returnedLines: lineIndexes.map((i) => allLines[i]) };
+  // سطرٌ بأكثر من قطعة يُرجع منه بعضه (lineParts[i] = { qty, unitCodes })، وبلا جزءٍ يُرجع ما بقي منه كلّه
+  const returnedLines = [];
+  for (const i of lineIndexes) {
+    const line = allLines[i];
+    const full = qtyOf(line);
+    const left = full - (returnedQty.get(i) || 0);
+    if (left <= 0) return { error: "line_already_returned", index: i };
+    const part = lineParts ? (lineParts[i] || lineParts[String(i)] || null) : null;
+    if (!part) {
+      returnedLines.push(left === full ? line : { ...line, quantity: left });
+      continue;
+    }
+    if (line.part_label) return { error: "invalid_line_part", index: i };
+    const q = Math.round(Number(part.qty) || 0);
+    if (q < 1 || q > left) return { error: "invalid_line_part", index: i, left };
+    const gone = returnedCodes.get(i) || new Set();
+    const codes = [...new Set((Array.isArray(part.unitCodes) ? part.unitCodes : []).map((c) => String(c || "").trim().toUpperCase()).filter(Boolean))];
+    if (codes.length > q || codes.some((c) => gone.has(c))) return { error: "invalid_line_part", index: i };
+    returnedLines.push({ ...line, quantity: q, unit_codes: codes });
+  }
+
+  return { sale, allLines, returnedLines };
 }
 
 /**
@@ -246,12 +298,25 @@ async function restockReturnedLines(client, returnedLines, restock) {
     // ⚠ sale_lines.quantity من نوع numeric(12,3) فيصل نصًّا "1.000" —
     // وLIMIT يرفضه (22P02) فكان كل مرتجع يفشل بخطأ خادم. عددٌ صحيح هنا.
     const qty = Math.round(Number(l.quantity) || 0);
-    // وحدات هذه الفاتورة أولًا (sale_id)، ثم أيّ مباعةٍ من الصنف للقديم قبل 045
-    const { rows: soldUnits } = await client.query(
-      `select id from item_units where item_id = $1 and sold = true
-        order by (sale_id is not distinct from $3) desc, code limit $2`,
-      [l.item_id, qty, l.sale_id || null]
-    );
+    // القطع المختارة برموزها تعود هي بعينها، والباقي من وحدات هذه الفاتورة أولًا (sale_id) ثم القديم قبل 045
+    const codes = Array.isArray(l.unit_codes) ? l.unit_codes : [];
+    const { rows: byCode } = codes.length
+      ? await client.query(
+        `select id from item_units where item_id = $1 and sold = true and upper(code) = any($2::text[])`,
+        [l.item_id, codes.map((c) => String(c).toUpperCase())]
+      )
+      : { rows: [] };
+    if (byCode.length < codes.length) {
+      return { error: "unit_mismatch", itemId: l.item_id, available: byCode.length, requested: codes.length };
+    }
+    const { rows: rest } = qty > byCode.length
+      ? await client.query(
+        `select id from item_units where item_id = $1 and sold = true and not (id = any($4::uuid[]))
+          order by (sale_id is not distinct from $3) desc, code limit $2`,
+        [l.item_id, qty - byCode.length, l.sale_id || null, byCode.map((r) => r.id)]
+      )
+      : { rows: [] };
+    const soldUnits = [...byCode, ...rest];
     if (soldUnits.length < qty) {
       return { error: "unit_mismatch", itemId: l.item_id, available: soldUnits.length, requested: qty };
     }

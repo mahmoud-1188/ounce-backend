@@ -1,6 +1,7 @@
 import { Router } from "express";
+import { approvalGate } from "../domain/approvals.js";
 import { withBranch } from "../db.js";
-import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.js";
+import { authenticate, requireAnyPage, requirePage, requireNotDenied } from "../middleware/auth.js";
 import { postJournalEntry } from "../domain/journal.js";
 import { roundMoney } from "../domain/money.js";
 import { fineWeight } from "../domain/weight.js";
@@ -210,7 +211,11 @@ async function codeLotItems(client, { branchId, userId, lotId, rows, distributio
           where id = $4 returning weight, gold_cost, total_cost`,
         [weightNow, goldValue, value, lot.id]
       );
-      await client.query(
+      // ⚠ فترة التجهيز (migration 073): لا قيد ولا حركة وزن — يُرحَّل الافتتاح كلّه يوم «بدء التشغيل»
+      const { rows: ls } = await client.query("select coalesce(ledger_state, 'live') as s from branch_settings where branch_id = $1", [branchId]);
+      const inSetup = ls[0]?.s === "setup";
+      if (inSetup) await client.query("update lots set opening_posted = false where id = $1", [lot.id]);
+      else await client.query(
         `insert into gold_ledger_entries
            (branch_id, business_day_id, op_type, karat, weight, fine_weight,
             from_account, to_account, ref_table, ref_id, note, created_by)
@@ -219,7 +224,7 @@ async function codeLotItems(client, { branchId, userId, lotId, rows, distributio
           `افتتاحي ${lot.ref}`, userId]
       );
       let journalEntryId = null;
-      if (value > 0) {
+      if (value > 0 && !inSetup) {
         journalEntryId = await postJournalEntry(client, {
           branchId: branchId, businessDayId, opType: "opening_inventory",
           refTable: "lots", refId: lot.id,
@@ -242,6 +247,143 @@ async function codeLotItems(client, { branchId, userId, lotId, rows, distributio
 
 /// إرسال دفعةٍ للتكويد في الإدارة (migration 069) — لا قيد: الوزن باقٍ في 1210 عند الفرع حتى يعود قطعًا.
 ///   فرعٌ نموذجه «الفرع يكوّد» لا يرسل، والدفعة الافتتاحية تُكوَّد في وضع الافتتاح هنا.
+// علامة طباعة الملصق على القطع برموزها (migration 071) — لا تخرج قطعةٌ بلا ملصقها
+router.post("/items/units/printed", authenticate, requireAnyPage("addGoods", "printing", "inventory", "branchTransfers"), async (req, res, next) => {
+  const codes = [...new Set((Array.isArray(req.body?.codes) ? req.body.codes : []).map((c) => String(c || "").trim().toUpperCase()).filter(Boolean))].slice(0, 500);
+  const printed = req.body?.printed !== false;
+  if (!codes.length) return res.status(400).json({ error: "codes_required" });
+  try {
+    const rows = await withBranch(req.auth.branchId, async (c) => {
+      const { rows } = await c.query(
+        `update item_units u set printed = $3 from items i
+          where i.id = u.item_id and i.branch_id = $1 and upper(u.code) = any($2::text[])
+          returning u.code`, [req.auth.branchId, codes, printed]);
+      return rows;
+    });
+    res.json({ updated: rows.length });
+  } catch (err) { next(err); }
+});
+
+// إعادة طباعة ملصقٍ مطبوع أو استبدال رقاقته (migration 076) — بموافقة تُسجَّل
+router.post("/items/units/reprint", authenticate, requireAnyPage("printing", "addGoods", "inventory"), async (req, res, next) => {
+  const codes = [...new Set((Array.isArray(req.body?.codes) ? req.body.codes : []).map((c) => String(c || "").trim().toUpperCase()).filter(Boolean))].slice(0, 200);
+  const action = ["reprint", "replace", "unmark"].includes(req.body?.action) ? req.body.action : "reprint";
+  if (!codes.length) return res.status(400).json({ error: "codes_required" });
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows } = await c.query(
+        `select u.code from item_units u join items i on i.id = u.item_id
+          where i.branch_id = $1 and upper(u.code) = any($2::text[])`, [req.auth.branchId, codes]);
+      if (rows.length !== codes.length) return { error: "unit_not_found" };
+      const label = action === "replace" ? "استبدال رقاقة" : action === "unmark" ? "إلغاء علامة الطباعة" : "إعادة طباعة ملصق";
+      const gate = await approvalGate(c, req.auth, {
+        kind: "label_reprint", amount: 0, approvalId: req.body?.approvalId || null,
+        note: `${label}: ${codes.slice(0, 6).join(" · ")}${codes.length > 6 ? ` +${codes.length - 6}` : ""}${req.body?.reason ? ` — ${String(req.body.reason).slice(0, 80)}` : ""}`,
+        payload: { codes, action, reason: req.body?.reason || null },
+      });
+      if (gate.error) return gate;
+      if (gate.pending) return { approvalPending: gate.pending };
+      await c.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
+         values ($1,'update',$2,'item_units',null,$3)`,
+        [req.auth.branchId, req.auth.userId, JSON.stringify({ action: `label_${action}`, codes, approvalId: gate.approvalId || null })]);
+      return { ok: true, codes, action };
+    });
+    if (out.approvalPending) return res.status(202).json(out);
+    if (out.error) return res.status(out.error === "unit_not_found" ? 404 : 409).json(out);
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
+/// إلغاء تكويد قطعٍ (migration 078): وزنها يعود «لم يُكوَّد» في دفعتها المفتوحة، أو يخرج من الافتتاحي ما دام
+///   الفرع في فترة التجهيز ولم يُرحَّل الافتتاح. الرمز يُلغى نهائيًّا، وكل طلبٍ باعتمادٍ وسببٍ مكتوب.
+router.post("/items/units/uncode", authenticate, requireAnyPage("addGoods", "inventory"), async (req, res, next) => {
+  const codes = [...new Set((Array.isArray(req.body?.codes) ? req.body.codes : []).map((c) => String(c || "").trim().toUpperCase()).filter(Boolean))].slice(0, 100);
+  const reason = String(req.body?.reason || "").trim().slice(0, 200);
+  if (!codes.length) return res.status(400).json({ error: "codes_required" });
+  if (reason.length < 4) return res.status(400).json({ error: "reason_required" });
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows } = await c.query(
+        `select u.id as unit_id, u.code, u.sold, u.issued, u.held, u.printed, u.epc,
+                (u.transfer_id is not null and t.status = 'sent') as in_transfer,
+                i.id as item_id, i.ref, i.weight, i.karat, i.cost_per_gram, i.workmanship, i.lot_workmanship_share,
+                i.remnant, i.remnant_of, i.reserved_for, i.from_scrap,
+                l.id as lot_id, l.ref as lot_ref, l.status as lot_status, l.source as lot_source, l.coding_at, l.opening_posted
+           from item_units u join items i on i.id = u.item_id
+           left join lots l on l.id = i.lot_id
+           left join branch_transfers t on t.id = u.transfer_id
+          where i.branch_id = $1 and upper(u.code) = any($2::text[])
+          for update of u`, [req.auth.branchId, codes]);
+      if (rows.length !== codes.length) return { error: "unit_not_found" };
+      const { rows: lk } = await c.query("select locked from stocktake_locks where branch_id = $1", [req.auth.branchId]);
+      if (lk[0]?.locked) return { error: "stocktake_locked" };
+      const { rows: ls } = await c.query("select coalesce(ledger_state, 'live') as s from branch_settings where branch_id = $1", [req.auth.branchId]);
+      const inSetup = ls[0]?.s === "setup";
+      for (const r of rows) {
+        const bad = r.sold || r.issued || r.held ? "unit_not_available"
+          : r.in_transfer ? "unit_in_transfer"
+          : r.remnant || r.remnant_of || r.from_scrap ? "not_from_lot"
+          : r.reserved_for ? "item_reserved"
+          : !r.lot_id ? "not_from_lot"
+          : r.lot_status !== "open" ? "lot_closed"
+          : r.coding_at === "hq" ? "lot_at_hq"
+          : r.lot_source === "opening" && !(inSetup && r.opening_posted === false) ? "opening_posted"
+          : null;
+        if (bad) return { error: bad, code: r.code };
+      }
+      // ما عُدّل وزنه بإصلاحٍ أو تسويةٍ فيه ذهبٌ من غير دفعته
+      const itemIds = [...new Set(rows.map((r) => r.item_id))];
+      const { rows: adj } = await c.query("select 1 from weight_adjustments where item_id = any($1::uuid[]) limit 1", [itemIds]);
+      if (adj.length) return { error: "weight_adjusted" };
+      const { rows: stf } = await c.query("select 1 from stocktake_sold_found where unit_id = any($1::uuid[]) limit 1", [rows.map((r) => r.unit_id)]);
+      if (stf.length) return { error: "unit_in_stocktake" };
+
+      const weight = rows.reduce((a, r) => a + Number(r.weight), 0);
+      const cost = roundMoney(rows.reduce((a, r) => a + (Number(r.cost_per_gram) || 0) * Number(r.weight) + (Number(r.workmanship) || 0), 0));
+      const gate = await approvalGate(c, req.auth, {
+        kind: "item_uncode", amount: cost, approvalId: req.body?.approvalId || null,
+        note: `إلغاء تكويد ${codes.slice(0, 6).join(" · ")}${codes.length > 6 ? ` +${codes.length - 6}` : ""} — ${Math.round(weight * 1000) / 1000} جم — ${reason}`,
+        payload: { codes, reason },
+      });
+      if (gate.error) return gate;
+      if (gate.pending) return { approvalPending: gate.pending };
+
+      // الدفعة: حصّة الأجور تعود غير موزَّعة، والافتتاحي في التجهيز ينقص وزنه وقيمته
+      const byLot = new Map();
+      for (const r of rows) {
+        const g = byLot.get(r.lot_id) || { opening: r.lot_source === "opening", share: 0, weight: 0, gold: 0, total: 0 };
+        g.share += Number(r.lot_workmanship_share) || 0;
+        g.weight += Number(r.weight);
+        g.gold += (Number(r.cost_per_gram) || 0) * Number(r.weight);
+        g.total += (Number(r.cost_per_gram) || 0) * Number(r.weight) + (Number(r.workmanship) || 0);
+        byLot.set(r.lot_id, g);
+      }
+      for (const [lotId, g] of byLot) {
+        if (g.opening) await c.query(
+          `update lots set weight = greatest(0, coalesce(weight, 0) - $2), gold_cost = greatest(0, coalesce(gold_cost, 0) - $3),
+                           total_cost = greatest(0, coalesce(total_cost, 0) - $4) where id = $1`,
+          [lotId, g.weight, roundMoney(g.gold), roundMoney(g.total)]);
+        else if (g.share > 0) await c.query("update lots set workmanship_allocated = greatest(0, workmanship_allocated - $2) where id = $1", [lotId, roundMoney(g.share)]);
+      }
+      await c.query("delete from item_units where id = any($1::uuid[])", [rows.map((r) => r.unit_id)]);
+      // صنفٌ لم يبقَ له قطعةٌ ولا فاتورة يُحذف، وإلا بقي لسجلّ ما بِيع منه
+      await c.query(
+        `delete from items i where i.id = any($1::uuid[])
+            and not exists (select 1 from item_units u where u.item_id = i.id)
+            and not exists (select 1 from sale_lines s where s.item_id = i.id)`, [itemIds]);
+      await c.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
+         values ($1,'delete',$2,'item_units',null,$3)`,
+        [req.auth.branchId, req.auth.userId, JSON.stringify({ action: "item_uncode", codes, weight, reason, lots: rows.map((r) => r.lot_ref), approvalId: gate.approvalId || null })]);
+      return { ok: true, codes, weight: Math.round(weight * 1000) / 1000, pieces: rows.length, printed: rows.some((r) => r.printed), lots: [...new Set(rows.map((r) => r.lot_ref))] };
+    });
+    if (out.approvalPending) return res.status(202).json(out);
+    if (out.error) return res.status(out.error === "unit_not_found" ? 404 : 409).json(out);
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
 router.post("/lots/:id/send-to-hq", async (req, res, next) => {
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {

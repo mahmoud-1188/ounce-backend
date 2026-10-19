@@ -3,6 +3,8 @@ import { withBranch, withoutBranch } from "../db.js";
 import { hashPin, verifyPin } from "../auth/hashPin.js";
 import { isWeakPin } from "../auth/weakPins.js";
 import { isHiddenPin } from "../domain/hiddenMode.js";
+
+const HIDDEN_MODE_ON = false;
 import { signHiddenSession, signSession } from "../auth/jwt.js";
 import { authenticate, branchLockBody, storeBlockReason } from "../middleware/auth.js";
 import { findDevice, needsDevice } from "../domain/devices.js";
@@ -125,7 +127,8 @@ router.post("/auth/login", async (req, res, next) => {
     if (!ok) {
       // الوضع الخفي (migration 047): رقمه يُقبل على شاشة الدخول بعد أن يفشل رقم الموظّف —
       //   فيُفتح الجهاز على المخزون والجرد وحدهما. الاشتراك وقفل الفرع يسريان عليه كذلك.
-      if (await withoutBranch((c) => isHiddenPin(c, branchId, pin))) {
+      // ⚠ أُلغي الوضع الخفي (قرار المالك): رقمه لا يفتح جلسةً بعد اليوم — القطع المعلّقة القديمة تبقى تُقرأ وتُباع
+      if (HIDDEN_MODE_ON && await withoutBranch((c) => isHiddenPin(c, branchId, pin))) {
         const storeBlockH = storeBlockReason(user);
         if (storeBlockH) return res.status(403).json({ error: storeBlockH });
         const lockH = branchLockBody(user);

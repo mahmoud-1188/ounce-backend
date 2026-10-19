@@ -1,4 +1,5 @@
 import { isHiddenPin } from "../domain/hiddenMode.js";
+import { branchDelegation, branchSelfManaged } from "../domain/delegation.js";
 import { Router } from "express";
 import { provisionLocked } from "../domain/branchProvision.js";
 import crypto from "crypto";
@@ -197,14 +198,15 @@ router.patch("/settings/controls", authenticate, requirePage("settings"), requir
     const row = await withBranch(req.auth.branchId, async (client) => {
       const { rows: cur } = await client.query("select * from branch_settings where branch_id = $1", [req.auth.branchId]);
       const c = cur[0] || {};
-      // ⚠ فرعٌ مقفول الإعدادات من الإدارة: حدود الاعتماد لها — وقفل الفترات يبقى للفرع
-      const lock = await provisionLocked(client, req.auth.branchId);
+      // ⚠ حدود الاعتماد للإدارة وحدها في فرعٍ مرتبطٍ بها (ما لم تفوّضه كاملًا) — وقفل الفترات يبقى للفرع
+      const deleg = await branchDelegation(client, req.auth.branchId);
+      const lock = await provisionLocked(client, req.auth.branchId) || (branchSelfManaged(deleg) ? null : { by: "الإدارة", limits: true });
       if (lock) {
         const norm = (o) => JSON.stringify(Object.fromEntries(Object.entries(o || {}).map(([k, v]) => [k, Number(v)]).sort()));
         const changed =
           (b.approvalsEnabled != null && !!b.approvalsEnabled !== (c.approvals_enabled !== false)) ||
           (thresholds && norm(thresholds) !== norm(c.approval_thresholds));
-        if (changed) return { error: "settings_locked_by_hq", by: lock.by };
+        if (changed) return { error: lock.limits ? "approval_limits_by_hq" : "settings_locked_by_hq", by: lock.by };
       }
       const { rows } = await client.query(
         `insert into branch_settings (branch_id, approvals_enabled, approval_thresholds, lock_all, lock_posted)
