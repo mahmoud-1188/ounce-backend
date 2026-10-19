@@ -26,6 +26,66 @@ const router = Router();
 // "expense" معًا، لكن requirePage وحده لا يكفي لو أُضيف دور كذلك لاحقًا.
 router.use("/expenses", authenticate, requirePage("expenses"), requireNotDenied("expense"));
 router.use("/expense-names", authenticate, requirePage("expenses"), requireNotDenied("expense"));
+router.use("/fixed-expenses", authenticate, requirePage("expenses"), requireNotDenied("expense"));
+
+// ══ قوالب المصروفات الثابتة (migration 074) ══
+const fixedOf = (r) => ({ id: r.id, name: r.name, category: r.category, amount: Number(r.amount), day: r.day, fundingSource: r.funding_source,
+  note: r.note || "", active: !!r.active, lastPosted: r.last_posted || null, lastExpenseId: r.last_expense_id || null });
+const normName = (v) => String(v || "").replace(/[أإآ]/g, "ا").replace(/\s+/g, "").trim();
+function fixedRefusal(b) {
+  if (!String(b.name || "").trim()) return "name_required";
+  if (!(roundMoney(b.amount) > 0)) return "invalid_amount";
+  const day = Math.round(Number(b.day));
+  if (!(day >= 1 && day <= 28)) return "invalid_day";
+  if (!CATEGORY_ACCOUNTS[b.category] || ["salaries", "advance"].includes(b.category)) return "invalid_category";
+  if (!CASH_ACCOUNTS[b.fundingSource]) return "invalid_funding_source";
+  return null;
+}
+router.get("/fixed-expenses", async (req, res, next) => {
+  try {
+    const rows = await withBranch(req.auth.branchId, async (c) => (await c.query("select * from fixed_expenses where branch_id = $1 order by day, name", [req.auth.branchId])).rows);
+    res.json({ fixed: rows.map(fixedOf) });
+  } catch (err) { next(err); }
+});
+router.post("/fixed-expenses", async (req, res, next) => {
+  const b = req.body || {};
+  const why = fixedRefusal(b);
+  if (why) return res.status(400).json({ error: why });
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows: ex } = await c.query("select name from fixed_expenses where branch_id = $1", [req.auth.branchId]);
+      if (ex.some((r) => normName(r.name) === normName(b.name))) return { error: "duplicate_name" };
+      const { rows } = await c.query(
+        `insert into fixed_expenses (branch_id, name, category, amount, day, funding_source, note, created_by)
+         values ($1,$2,$3,$4,$5,$6,$7,$8) returning *`,
+        [req.auth.branchId, String(b.name).trim().slice(0, 60), b.category, roundMoney(b.amount), Math.round(Number(b.day)), b.fundingSource, String(b.note || "").slice(0, 200) || null, req.auth.userId]);
+      return { fixed: fixedOf(rows[0]) };
+    });
+    if (out.error) return res.status(409).json(out);
+    res.status(201).json(out);
+  } catch (err) { next(err); }
+});
+router.patch("/fixed-expenses/:id", async (req, res, next) => {
+  const b = req.body || {};
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows: cur } = await c.query("select * from fixed_expenses where id = $1 and branch_id = $2", [req.params.id, req.auth.branchId]);
+      if (!cur[0]) return { error: "not_found" };
+      const merged = { name: b.name ?? cur[0].name, amount: b.amount ?? cur[0].amount, day: b.day ?? cur[0].day, category: b.category ?? cur[0].category,
+        fundingSource: b.fundingSource ?? cur[0].funding_source };
+      const why = fixedRefusal(merged);
+      if (why) return { error: why };
+      const { rows } = await c.query(
+        `update fixed_expenses set name = $3, amount = $4, day = $5, category = $6, funding_source = $7, note = $8, active = $9
+          where id = $1 and branch_id = $2 returning *`,
+        [req.params.id, req.auth.branchId, String(merged.name).trim().slice(0, 60), roundMoney(merged.amount), Math.round(Number(merged.day)), merged.category,
+          merged.fundingSource, b.note !== undefined ? String(b.note || "").slice(0, 200) || null : cur[0].note, b.active != null ? !!b.active : cur[0].active]);
+      return { fixed: fixedOf(rows[0]) };
+    });
+    if (out.error) return res.status(out.error === "not_found" ? 404 : 400).json(out);
+    res.json(out);
+  } catch (err) { next(err); }
+});
 
 // ⚠ يطابق EXPENSE_CATEGORIES في core/constants.js وحساباتها في
 // core/chart.js سطرًا بسطر — أي تصنيف جديد هناك يحتاج سطرًا هنا أيضًا.
@@ -162,6 +222,12 @@ router.post("/expenses", async (req, res, next) => {
         ],
       });
 
+      // مصروفٌ من قالبٍ ثابت: يُعلَّم شهره مسجَّلًا بعد نجاح القيد وحده (المعلّق للاعتماد لا يُعلَّم حتى يُنفَّذ)
+      if (body.fixedId) {
+        await client.query(
+          `update fixed_expenses set last_posted = to_char(now(), 'YYYY-MM'), last_expense_id = $3 where id = $1 and branch_id = $2`,
+          [body.fixedId, req.auth.branchId, expense.id]);
+      }
       return { expense, cashTx: cashTxRows[0], journalEntryId };
     });
 
