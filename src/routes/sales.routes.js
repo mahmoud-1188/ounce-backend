@@ -262,6 +262,14 @@ router.post("/sales", async (req, res, next) => {
         ]
       );
       const sale = saleRows[0];
+      // اعتماد جهاز الدفع (migration 085): الحقول المعروفة وحدها
+      const ca = body.cardAuth && typeof body.cardAuth === "object" && (paymentMethod === "card" || paymentMethod === "split") ? {
+        approvalCode: String(body.cardAuth.approvalCode || "").slice(0, 12), last4: String(body.cardAuth.last4 || "").replace(/\D/g, "").slice(-4),
+        scheme: String(body.cardAuth.scheme || "").slice(0, 20), rrn: String(body.cardAuth.rrn || "").slice(0, 24), terminalId: String(body.cardAuth.terminalId || "").slice(0, 16),
+        intentId: String(body.cardAuth.intentId || "").slice(0, 64), amountMinor: Math.round(Number(body.cardAuth.amountMinor) || 0),
+        provider: String(body.cardAuth.provider || "").slice(0, 20), manual: !!body.cardAuth.manual, at: String(body.cardAuth.at || "").slice(0, 30),
+      } : null;
+      if (ca && (ca.approvalCode || ca.intentId)) await client.query("update sales set card_auth = $2 where id = $1", [sale.id, JSON.stringify(ca)]);
 
       // ── بدل بكسر: إنشاء قطع scrap_items فعلية (لا مستند منفصل مبسَّط) —
       // تدخل بنفس مراحل SCRAP_STAGES الموجودة أصلًا (pending_break/in_box)
