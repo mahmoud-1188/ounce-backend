@@ -82,6 +82,11 @@ async function reserveSaleLines(client, branchId, lines, { excludeUnitIds = [] }
     }
     // ⚠ بقايا طقمٍ بِيع جزءٌ منه لا تُباع طقمًا كاملًا حتى تُكوَّد قطعًا (migration 066)
     if (item.remnant) return { error: "item_is_set_remnant", itemId: line.itemId };
+    // ما كوّدته الإدارة يبقى عندها حتى تراجعه وترسله — لا يُباع في الفرع قبل وصوله
+    if (item.lot_id) {
+      const { rows: lr } = await client.query("select coding_at from lots where id = $1", [item.lot_id]);
+      if (lr[0]?.coding_at === "hq") return { error: "item_at_hq", itemId: line.itemId };
+    }
 
     // ⚠ issued=false: قطعة أُخرجت (تالفة/فاقد) لا تُباع وإن بقيت sold=false.
     // القطع الممسوحة نفسها تُباع (unitCodes)، وإلا أوّل المتاح من الصنف
