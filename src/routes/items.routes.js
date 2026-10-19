@@ -210,7 +210,11 @@ async function codeLotItems(client, { branchId, userId, lotId, rows, distributio
           where id = $4 returning weight, gold_cost, total_cost`,
         [weightNow, goldValue, value, lot.id]
       );
-      await client.query(
+      // ⚠ فترة التجهيز (migration 073): لا قيد ولا حركة وزن — يُرحَّل الافتتاح كلّه يوم «بدء التشغيل»
+      const { rows: ls } = await client.query("select coalesce(ledger_state, 'live') as s from branch_settings where branch_id = $1", [branchId]);
+      const inSetup = ls[0]?.s === "setup";
+      if (inSetup) await client.query("update lots set opening_posted = false where id = $1", [lot.id]);
+      else await client.query(
         `insert into gold_ledger_entries
            (branch_id, business_day_id, op_type, karat, weight, fine_weight,
             from_account, to_account, ref_table, ref_id, note, created_by)
@@ -219,7 +223,7 @@ async function codeLotItems(client, { branchId, userId, lotId, rows, distributio
           `افتتاحي ${lot.ref}`, userId]
       );
       let journalEntryId = null;
-      if (value > 0) {
+      if (value > 0 && !inSetup) {
         journalEntryId = await postJournalEntry(client, {
           branchId: branchId, businessDayId, opType: "opening_inventory",
           refTable: "lots", refId: lot.id,

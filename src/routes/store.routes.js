@@ -224,6 +224,10 @@ router.post("/store/branches", requireCanManageBranches, async (req, res, next) 
         [req.storeAuth.storeId, ref, name.trim()]
       );
       const branch = branchRows[0];
+      // الفرع الجديد يبدأ في فترة التجهيز: يكوّد ويدخل رصيده ثم يطلب «بدء التشغيل» من الإدارة (migration 073)
+      await client.query(
+        `insert into branch_settings (branch_id, ledger_state, opening_mode) values ($1, 'setup', true)
+         on conflict (branch_id) do update set ledger_state = 'setup', opening_mode = true`, [branch.id]);
 
       // ⚠ عبر createBranchUser المشتركة (لا INSERT يدوي منفصل كما كان
       // سابقًا) — نفس المسار الذي يستخدمه أي إنشاء موظفٍ آخر، فيحصل

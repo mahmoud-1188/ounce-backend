@@ -90,6 +90,9 @@ async function authenticateHidden(payload, req, res, next) {
   }
 }
 
+// ما يُرفض في فترة التجهيز: كل ما يحرّك النقد أو الدفاتر. يعمل: التكويد · الجرد · الإعدادات · الأشخاص · الرصيد الافتتاحي
+const SETUP_BLOCKED = /^\/api\/(sales|sale-drafts\/[^/]+\/convert|day|day-ask|safe|expenses|purchases|purchase-orders\/[^/]+\/receive|payroll|fixed-assets|custody|commissions|bank-fees|reservations|gift-cards|loyalty|custom-orders|taskirat|taskir-offices|price-fix|ledger|fiscal|hq-purchase|branch-transfers|scrap|inventory\/issue|journal)(\/|$)/;
+
 async function authenticate(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
@@ -128,6 +131,7 @@ async function authenticate(req, res, next) {
                 b.locked as branch_locked, b.lock_reason as branch_lock_reason,
                 b.locked_at as branch_locked_at, b.locked_by as branch_locked_by,
                 coalesce(bs.device_lock, 'off') as device_lock,
+                coalesce(bs.ledger_state, 'live') as ledger_state,
                 (select d.revoked_at is null and (d.user_id is null or d.user_id = u.id)
                    from devices d where d.id = $3 and d.branch_id = u.branch_id) as device_ok
            from users u
@@ -153,6 +157,10 @@ async function authenticate(req, res, next) {
     }
     const lock = branchLockBody(user);
     if (lock) return res.status(423).json(lock);
+    // ⚠ فترة التجهيز (migration 073): لا بيع ولا يوم ولا نقد ولا مصروف ولا شراء قبل «بدء التشغيل»
+    if (user.ledger_state === "setup" && req.method !== "GET" && SETUP_BLOCKED.test((req.originalUrl || "").split("?")[0])) {
+      return res.status(409).json({ error: "ledger_setup" });
+    }
 
     // ⚠ الأجهزة المربوطة (migration 062): جهازٌ أُلغي يُخرج صاحبه من أول طلب، والسياسة تُفرض هنا لا عند الدخول وحده
     if (payload.did && user.device_ok !== true) return res.status(401).json({ error: "device_revoked" });
