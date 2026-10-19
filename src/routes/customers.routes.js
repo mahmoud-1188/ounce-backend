@@ -13,7 +13,10 @@ const router = Router();
  */
 const guard = [authenticate, requireAnyPage("customers", "sales")];
 const validIdNumber = (v) => /^[12]\d{9}$/.test(String(v || "").trim()) || /^(?=.*[A-Z])[A-Z0-9]{6,12}$/i.test(String(v || "").trim());
+// الرقم الضريبي السعودي 15 رقمًا يبدأ وينتهي بـ3 (migration 081)
+const validVat = (v) => /^3\d{13}3$/.test(String(v || "").trim());
 const shape = (c) => ({ id: c.id, ref: c.ref, name: c.name, phone: c.phone || "", idNumber: c.id_number || "", note: c.note || "", createdAt: c.created_at,
+  vatNumber: c.vat_number || "", address: c.address || "",
   creditLimit: c.credit_limit != null ? Number(c.credit_limit) : null });
 
 router.post("/customers", ...guard, async (req, res, next) => {
@@ -22,15 +25,18 @@ router.post("/customers", ...guard, async (req, res, next) => {
   const idNumber = String(b.idNumber || "").trim().toUpperCase();
   if (!name) return res.status(400).json({ error: "name_required" });
   if (idNumber && !validIdNumber(idNumber)) return res.status(400).json({ error: "invalid_id_number" });
+  const vatNumber = String(b.vatNumber || "").trim();
+  if (vatNumber && !validVat(vatNumber)) return res.status(400).json({ error: "invalid_vat_number" });
   try {
     const result = await withBranch(req.auth.branchId, async (c) => {
       const { rows: dup } = await c.query("select 1 from customers where branch_id = $1 and lower(trim(name)) = lower($2)", [req.auth.branchId, name]);
       if (dup[0]) return { error: "customer_name_exists" };
       const { rows: n } = await c.query("select count(*)::int + 1 as n from customers where branch_id = $1", [req.auth.branchId]);
       const { rows } = await c.query(
-        "insert into customers (branch_id, ref, name, phone, id_number, note, created_by) values ($1,$2,$3,$4,$5,$6,$7) returning *",
+        "insert into customers (branch_id, ref, name, phone, id_number, note, created_by, vat_number, address) values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning *",
         [req.auth.branchId, `CUS-${String(n[0].n).padStart(6, "0")}-${Date.now().toString(36).slice(-3).toUpperCase()}`, name,
-         String(b.phone || "").trim().slice(0, 30) || null, idNumber || null, String(b.note || "").trim().slice(0, 200) || null, req.auth.userId]);
+         String(b.phone || "").trim().slice(0, 30) || null, idNumber || null, String(b.note || "").trim().slice(0, 200) || null, req.auth.userId,
+         vatNumber || null, String(b.address || "").trim().slice(0, 200) || null]);
       return { customer: shape(rows[0]) };
     });
     if (result.error) return res.status(409).json(result);
@@ -44,15 +50,20 @@ router.patch("/customers/:id", ...guard, async (req, res, next) => {
   const b = req.body || {};
   const idNumber = b.idNumber == null ? null : String(b.idNumber).trim().toUpperCase();
   if (idNumber && !validIdNumber(idNumber)) return res.status(400).json({ error: "invalid_id_number" });
+  const vatNumber = b.vatNumber == null ? null : String(b.vatNumber).trim();
+  if (vatNumber && !validVat(vatNumber)) return res.status(400).json({ error: "invalid_vat_number" });
   try {
     const rows = await withBranch(req.auth.branchId, async (c) => (await c.query(
       `update customers set name = coalesce($3, name), phone = coalesce($4, phone), id_number = coalesce($5, id_number), note = coalesce($6, note),
-              credit_limit = case when $7::boolean then $8::numeric else credit_limit end
+              credit_limit = case when $7::boolean then $8::numeric else credit_limit end,
+              vat_number = case when $9::text is null then vat_number else nullif($9, '') end,
+              address = case when $10::text is null then address else nullif($10, '') end
         where id = $1 and branch_id = $2 returning *`,
       [req.params.id, req.auth.branchId, b.name ? String(b.name).trim().slice(0, 120) : null, b.phone != null ? String(b.phone).trim() : null,
        idNumber, b.note != null ? String(b.note).slice(0, 200) : null,
        // حدّ الآجل (migration 069): رقمٌ موجب، أو فارغٌ يعيده إلى افتراضي الفرع
-       "creditLimit" in b, b.creditLimit === null || b.creditLimit === "" ? null : Math.max(0, Number(b.creditLimit) || 0)])).rows);
+       "creditLimit" in b, b.creditLimit === null || b.creditLimit === "" ? null : Math.max(0, Number(b.creditLimit) || 0),
+       vatNumber, b.address != null ? String(b.address).trim().slice(0, 200) : null])).rows);
     if (!rows[0]) return res.status(404).json({ error: "customer_not_found" });
     res.json({ customer: shape(rows[0]) });
   } catch (err) {
