@@ -88,6 +88,64 @@ router.post("/safe/transfer-to-safe", requireNotDenied("cashMove"), async (req, 
   }
 });
 
+// ── التحويل بين نقد الخزنة وشبكتها بالاتجاهين، وعكسه (1110 ↔ 1120) ──
+// toNetwork: من النقد إلى الشبكة (إيداعٌ بالبنك مثلًا) · وإلا من الشبكة إلى النقد (سحبٌ من البنك)
+async function safeNetTransfer(client, { branchId, toNetwork, amount, note, userId, reverseOf = null }) {
+  const from = toNetwork ? "cash" : "network", to = toNetwork ? "network" : "cash";
+  const businessDayId = await openDay(client, branchId);
+  const available = await poolBalance(client, branchId, "safe", from);
+  if (amount > available + 0.005) return { error: "insufficient_pool_balance", available };
+  const label = toNetwork ? "من نقد الخزنة إلى شبكتها" : "من شبكة الخزنة إلى نقدها";
+  const { rows: outRows } = await client.query(
+    `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, note, ref_table, ref_id, created_by)
+     values ($1,$2,'safe',$3,'out',$4,$5,$6,$7,$8,$9) returning *`,
+    [branchId, businessDayId, from, amount, reverseOf ? "safe_net_reverse" : "safe_net_transfer", note || (reverseOf ? `عكس تحويل — ${label}` : label),
+      reverseOf ? "cash_tx" : null, reverseOf, userId]);
+  const { rows: inRows } = await client.query(
+    `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, note, ref_table, ref_id, created_by)
+     values ($1,$2,'safe',$3,'in',$4,$5,$6,'cash_tx',$7,$8) returning *`,
+    [branchId, businessDayId, to, amount, reverseOf ? "safe_net_reverse" : "safe_net_transfer", note || (reverseOf ? `عكس تحويل — ${label}` : label), outRows[0].id, userId]);
+  const debit = to === "network" ? "1120" : "1110", credit = from === "network" ? "1120" : "1110";
+  await postJournalEntry(client, {
+    branchId, businessDayId, opType: "pool_transfer", refTable: "cash_tx", refId: outRows[0].id,
+    description: reverseOf ? `عكس تحويل الخزنة — ${label}` : `تحويل الخزنة — ${label}`, createdBy: userId,
+    lines: [{ account: debit, side: "debit", amount }, { account: credit, side: "credit", amount }],
+  });
+  return { ok: true, outTx: outRows[0], inTx: inRows[0] };
+}
+
+router.post("/safe/cash-network", requireNotDenied("safeMove"), async (req, res, next) => {
+  const amount = roundMoney(req.body?.amount);
+  if (!(amount > 0)) return res.status(400).json({ error: "invalid_amount" });
+  try {
+    const result = await withBranch(req.auth.branchId, (c) => safeNetTransfer(c, {
+      branchId: req.auth.branchId, toNetwork: req.body?.direction !== "to_cash", amount, note: String(req.body?.note || "").slice(0, 200) || null, userId: req.auth.userId,
+    }));
+    if (result.error) return res.status(409).json(result);
+    res.status(201).json(result);
+  } catch (err) { next(err); }
+});
+
+// العكس: تحويلٌ مقابلٌ بالمبلغ نفسه مربوطٌ بالأصل — مرّةً واحدة
+router.post("/safe/cash-network/:id/reverse", requireNotDenied("safeMove"), async (req, res, next) => {
+  try {
+    const result = await withBranch(req.auth.branchId, async (c) => {
+      const { rows } = await c.query(
+        `select * from cash_tx where id = $1 and branch_id = $2 and pool = 'safe' and direction = 'out' and category = 'safe_net_transfer' for update`,
+        [req.params.id, req.auth.branchId]);
+      const orig = rows[0];
+      if (!orig) return { error: "not_found" };
+      const { rows: done } = await c.query(
+        `select 1 from cash_tx where branch_id = $1 and category = 'safe_net_reverse' and ref_table = 'cash_tx' and ref_id = $2 and direction = 'out' limit 1`,
+        [req.auth.branchId, orig.id]);
+      if (done[0]) return { error: "already_reversed" };
+      return safeNetTransfer(c, { branchId: req.auth.branchId, toNetwork: orig.method === "network", amount: Number(orig.amount), note: null, userId: req.auth.userId, reverseOf: orig.id });
+    });
+    if (result.error) return res.status(result.error === "not_found" ? 404 : 409).json(result);
+    res.status(201).json(result);
+  } catch (err) { next(err); }
+});
+
 // ── تحويل من الخزنة إلى الصندوق اليومي ──
 router.post("/safe/transfer-to-daily", requireNotDenied("cashMove"), async (req, res, next) => {
   const amount = roundMoney(req.body?.amount);
