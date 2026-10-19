@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { branchDelegation } from "../domain/delegation.js";
 import { loadBranchApprovalRouting, shapeApproval } from "../domain/approvals.js";
 import { loadBranchNotices, loadBranchPricePolicy } from "../domain/pricePolicy.js";
 import { branchPolicyView } from "../domain/hqPolicy.js";
@@ -373,7 +374,10 @@ router.get("/bootstrap", async (req, res, next) => {
 
     // إقفالات السنة المالية على الخادم (migration 068) — أساس أرصدة السنة الجارية في الواجهة
     const fiscalClosures = await withBranch(branchId, (c) => listYearCloses(c, branchId)).catch(() => []);
+    // تحكّم الإدارة (migration 072): الواجهة تُخفي حدود الاعتماد وإدارة الموظفين حين تكون للإدارة
+    const hqControl = await withBranch(branchId, (c) => branchDelegation(c, branchId)).catch(() => ({ linked: false, full: false, noApprovals: false }));
     res.json({
+      hqControl,
       fiscalClosures,
       branch: branch.rows[0] || null,
       // باقة المحل (migration 070) — الواجهة تُخفي بها القسم المحاسبي (والخادم يرفضه بالصلاحيات)

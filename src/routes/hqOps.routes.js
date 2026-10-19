@@ -310,4 +310,31 @@ router.post("/store/branches/:branchId/coding-model", requireCanManageBranches, 
   }
 });
 
+// التفويض بضغطة (migration 072): «تفويض كامل للفرع» و«بلا موافقات» — ضغطةٌ تشغّل وضغطةٌ تُطفئ
+router.get("/store/branches/:branchId/delegation", requireCanManageBranches, async (req, res, next) => {
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const { rows } = await withoutBranch((c) => c.query("select delegation from branches where id = $1", [req.params.branchId]));
+    const d = rows[0]?.delegation || {};
+    res.json({ delegation: { full: d.full === true, noApprovals: d.noApprovals === true } });
+  } catch (err) { next(err); }
+});
+router.post("/store/branches/:branchId/delegation", requireCanManageBranches, async (req, res, next) => {
+  const b = req.body || {};
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const { rows } = await withoutBranch((c) => c.query("select delegation from branches where id = $1", [req.params.branchId]));
+    const cur = rows[0]?.delegation || {};
+    const next = { full: b.full != null ? !!b.full : cur.full === true, noApprovals: b.noApprovals != null ? !!b.noApprovals : cur.noApprovals === true };
+    await withBranch(req.params.branchId, async (c) => {
+      await c.query("update branches set delegation = $2 where id = $1", [req.params.branchId, JSON.stringify(next)]);
+      await c.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
+         values ($1,'update',null,'branches',$1,$2)`,
+        [req.params.branchId, JSON.stringify({ action: "delegation", by: req.storeAuth.name || "الإدارة", from: cur, to: next })]);
+    });
+    res.json({ delegation: next });
+  } catch (err) { next(err); }
+});
+
 export default router;

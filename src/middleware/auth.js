@@ -23,7 +23,9 @@ import { applyPackage } from "../domain/storePackage.js";
  */
 function branchLockBody(row) {
   if (!row.branch_locked) return null;
-  return { error: "branch_locked", reason: row.branch_lock_reason || null, lockedAt: row.branch_locked_at || null, lockedBy: row.branch_locked_by || null };
+  // ⚠ الإيقاف الصامت: الفرع يرى «النظام غير متاح حاليًا» وحده — بلا سببٍ ولا وقتٍ ولا جهة.
+  //   السبب والوقت للإدارة وحدها (تقرؤهما من مسارات الإدارة).
+  return { error: "branch_locked", unavailable: true };
 }
 
 function storeBlockReason(row) {
