@@ -1,6 +1,7 @@
 import { verifySession } from "../auth/jwt.js";
 import { withoutBranch } from "../db.js";
 import { hqRouteBlocked } from "../domain/storePackage.js";
+import { storePageBlocked } from "../domain/storePages.js";
 
 /**
  * ⚠ نظير authenticate في auth.js لكن للمستخدم المركزي (store_users) —
@@ -72,6 +73,9 @@ async function authenticateStore(req, res, next) {
     };
     // باقة «بدون محاسبة» (migration 070): مسارات الإدارة المحاسبية مرفوضة
     if (hqRouteBlocked(req.storeAuth.storePackage, req.originalUrl)) return res.status(403).json({ error: "package_no_accounting" });
+    // شاشات الموظف المقيَّد: لا يصل لمسارٍ لا تستدعيه شاشاته (الواجهة تُخفي، والخادم يمنع)
+    const pageBlock = storePageBlocked(req.storeAuth, req.method, req.originalUrl);
+    if (pageBlock) return res.status(403).json({ error: pageBlock });
     next();
   } catch (err) {
     next(err);

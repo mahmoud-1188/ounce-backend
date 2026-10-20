@@ -381,7 +381,7 @@ router.get("/store/users", requireStoreOwner, async (req, res, next) => {
       client.query(
         `select id, name, email, role, allowed_pages, can_manage_branches, can_send_coding, active, created_at, hq_role
            from store_users
-          where store_id = $1
+          where store_id = $1 and deleted_at is null
           order by created_at`,
         [req.storeAuth.storeId]
       )
@@ -400,6 +400,32 @@ router.get("/store/users", requireStoreOwner, async (req, res, next) => {
         hqRole: u.hq_role || null,
       }))
     );
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * DELETE /api/store/users/:id — حذف موظفٍ مركزي (owner فقط). حذفٌ منطقي: يخرج من القائمة ولا يدخل،
+ * واسمه يبقى على ما فعله في السجلّ، وبريده يتحرّر لحسابٍ جديد. لا يُحذف مالكٌ ولا الحساب نفسه.
+ */
+router.delete("/store/users/:id", requireStoreOwner, async (req, res, next) => {
+  try {
+    const out = await withoutBranch(async (client) => {
+      const { rows } = await client.query(
+        "select id, role, email from store_users where id = $1 and store_id = $2 and deleted_at is null for update",
+        [req.params.id, req.storeAuth.storeId]);
+      const u = rows[0];
+      if (!u) return { error: "not_found" };
+      if (u.id === req.storeAuth.storeUserId) return { error: "cannot_delete_self" };
+      if (u.role === "owner") return { error: "cannot_delete_owner" };
+      await client.query(
+        `update store_users set active = false, deleted_at = now(), email = email || '#deleted-' || substr(id::text, 1, 8)
+          where id = $1`, [u.id]);
+      return { ok: true };
+    });
+    if (out.error) return res.status(out.error === "not_found" ? 404 : 409).json(out);
+    res.json(out);
   } catch (err) {
     next(err);
   }
