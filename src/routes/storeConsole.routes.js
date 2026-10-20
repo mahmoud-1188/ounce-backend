@@ -3,7 +3,7 @@ import { withBranch, withoutBranch } from "../db.js";
 import { authenticateStore, requireCanManageBranches } from "../middleware/storeAuth.js";
 import { roundMoney } from "../domain/money.js";
 import { roundWeight } from "../domain/weight.js";
-import { shapeApproval } from "../domain/approvals.js";
+import { ROUTABLE_NONE, shapeApproval } from "../domain/approvals.js";
 import { monthRange, recordedNetworkFees, settleBankFeePeriod } from "../domain/bankFees.js";
 import { buildServerReviewQueue } from "../domain/reviewQueueServer.js";
 import { postManualAdjustment, reverseJournalEntry } from "../domain/journalOps.js";
@@ -416,7 +416,7 @@ router.patch("/store/branches/:branchId/target", requireCanManageBranches, async
 });
 
 // ══ ⑥ من يعتمد ماذا + صندوق الاعتمادات ═════════════════════════════════
-const ROUTABLE = ["expense", "refund", "supplier_settle", "asset_purchase", "asset_disposal", "payroll_run"];
+const ROUTABLE = ["expense", "refund", "supplier_settle", "asset_purchase", "asset_disposal", "payroll_run", "label_reprint"];
 
 router.get("/store/approval-routing", async (req, res, next) => {
   try {
@@ -426,8 +426,8 @@ router.get("/store/approval-routing", async (req, res, next) => {
     }));
     res.json({ rules: ROUTABLE.map((id) => {
       const r = rules.find((x) => x.id === id) || { id, label: id, threshold: 0 };
-      const approver = routing[id] === "hq" ? "hq" : routing[id] === "hq_above" ? "hq_above" : "branch";
-      return { id, label: r.label, threshold: Number(r.threshold) || 0, approver, hqAbove: Number(routing.hqAbove?.[id]) || 0 };
+      const approver = routing[id] === "hq" ? "hq" : routing[id] === "hq_above" ? "hq_above" : routing[id] === "none" && ROUTABLE_NONE.includes(id) ? "none" : "branch";
+      return { id, label: r.label, threshold: Number(r.threshold) || 0, approver, hqAbove: Number(routing.hqAbove?.[id]) || 0, allowNone: ROUTABLE_NONE.includes(id) };
     }) });
   } catch (err) {
     next(err);
@@ -438,7 +438,7 @@ router.put("/store/approval-routing", requireCanManageBranches, async (req, res,
   const body = req.body?.routing || {};
   const routing = { hqAbove: {} };
   for (const id of ROUTABLE) {
-    routing[id] = ["hq", "hq_above"].includes(body[id]) ? body[id] : "branch";
+    routing[id] = ["hq", "hq_above"].includes(body[id]) ? body[id] : body[id] === "none" && ROUTABLE_NONE.includes(id) ? "none" : "branch";
     if (routing[id] === "hq_above") {
       const lim = Number(body.hqAbove?.[id]);
       if (!(lim > 0)) return res.status(400).json({ error: "invalid_hq_above", kind: id });
