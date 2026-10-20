@@ -33,6 +33,7 @@ const RULES = [
   [null, /^\/store\/net-weight$/, ["netWeight"]],
   [null, /^\/store\/zakat$/, ["zakat"]],
   [null, /^\/store\/fiscal$/, ["fiscal"]],
+  [null, /^\/store\/group-vat(\/.*)?$/, ["fiscal", "consolidated"]],
   [null, /^\/store\/hq-policy$/, ["policy"]],
   [null, /^\/store\/ops-log$/, ["opsLog"]],
   [null, /^\/store\/client-errors(\/.*)?$/, ["clientErrors"]],

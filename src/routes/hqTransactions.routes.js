@@ -7,6 +7,7 @@ import {
   safeCashBalance, postCashFromHqSend, postCashFromHqReceipt,
 } from "../domain/hqTransactions.js";
 import { roundMoney } from "../domain/money.js";
+import { postJournalEntry } from "../domain/journal.js";
 
 const router = Router();
 
@@ -412,6 +413,7 @@ router.post("/store/hq-transactions/:id/receive", requireCanManageBranches, asyn
       if (!txn) return { notFound: true };
       if (RECEIVER_SIDE[txn.flow] !== "hq") return { error: "not_hq_receivable" };
       if (txn.status !== "approved") return { error: "not_approved_yet" };
+      if (txn.vat_settlement_id && Number(txn.amount) > 0) return { vat: txn };
 
       const { rows: updated } = await client.query(
         `update hq_transactions
@@ -425,10 +427,41 @@ router.post("/store/hq-transactions/:id/receive", requireCanManageBranches, asyn
 
     if (result.notFound) return res.status(404).json({ error: "transaction_not_found" });
     if (result.error) return res.status(409).json({ error: result.error });
+    if (result.vat) return res.json(serializeTxn(await receiveVatTransfer(req, result.vat)));
     res.json(serializeTxn(result.txn));
   } catch (err) {
+    if (err && err.code === "period_locked") return res.status(409).json({ error: "period_locked", why: err.why || null });
     next(err);
   }
 });
+
+// ضريبة فرعٍ للإقرار الموحّد (migration 092): تدخل خزنة الإدارة التزامًا للهيئة (2225) حتى يُسدَّد الموحّد —
+// الاستلام وقيده في معاملةٍ واحدة بسياق فرع الإدارة
+async function receiveVatTransfer(req, txn) {
+  const { rows: hq } = await withoutBranch((c) => c.query(
+    "select id from branches where store_id = $1 and is_hq and deleted_at is null limit 1", [req.storeAuth.storeId]));
+  if (!hq[0]) throw Object.assign(new Error("hq_branch_missing"), { status: 409 });
+  return withBranch(hq[0].id, async (c) => {
+    await c.query("select set_config('app.current_branch_id', $1, true)", [txn.branch_id]);
+    const { rows: up } = await c.query(
+      `update hq_transactions set status = 'received', received_at = now(), received_by_store_user_id = $2
+        where id = $1 and status = 'approved' returning *`, [txn.id, req.storeAuth.storeUserId]);
+    const { rows: br } = await c.query("select name from branches where id = $1", [txn.branch_id]);
+    await c.query("select set_config('app.current_branch_id', $1, true)", [hq[0].id]);
+    if (!up[0]) return up[0];
+    const { rows: day } = await c.query("select id from business_days where branch_id = $1 and status = 'open' order by opened_at desc limit 1", [hq[0].id]);
+    const label = `ضريبة ${br[0]?.name || "فرع"} للإقرار الموحّد${txn.note ? ` · ${txn.note}` : ""}`;
+    await c.query(
+      `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note)
+       values ($1,$2,'safe','cash','in',$3,'vat_from_branch','hq_transactions',$4,$5)`,
+      [hq[0].id, day[0]?.id || null, txn.amount, txn.id, label]);
+    await postJournalEntry(c, {
+      branchId: hq[0].id, businessDayId: day[0]?.id || null, opType: "vat_from_branch", refTable: "hq_transactions", refId: txn.id,
+      description: label, createdBy: null,
+      lines: [{ account: "1110", side: "debit", amount: Number(txn.amount) }, { account: "2225", side: "credit", amount: Number(txn.amount) }],
+    });
+    return up[0];
+  });
+}
 
 export default router;
