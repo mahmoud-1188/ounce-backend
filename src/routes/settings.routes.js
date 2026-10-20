@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { withBranch } from "../db.js";
 import { authenticate, requirePage, requireManager } from "../middleware/auth.js";
-import { provisionLocked } from "../domain/branchProvision.js";
+import { provisionLocked, saveBranchProfile } from "../domain/branchProvision.js";
 
 const router = Router();
 
@@ -134,6 +134,15 @@ router.patch("/settings/branch", requirePage("settings"), requireManager, async 
   } catch (err) {
     next(err);
   }
+});
+
+/// معلومات الفرع ورأس المستندات — المدير، ما لم تقفلها الإدارة
+router.post("/settings/branch-profile", requireManager, async (req, res, next) => {
+  try {
+    const out = await withBranch(req.auth.branchId, (c) => saveBranchProfile(c, req.auth.branchId, req.body?.profile));
+    if (out.error) return res.status(out.error === "settings_locked_by_hq" ? 409 : 400).json(out);
+    res.json(out);
+  } catch (err) { next(err); }
 });
 
 router.post("/settings/stocktake-lock", requirePage("stocktake"), async (req, res, next) => {
