@@ -113,6 +113,12 @@ router.patch("/settings/branch", requirePage("settings"), requireManager, async 
         if (body.salePrefs.postSaleSheet != null) p.postSaleSheet = !!body.salePrefs.postSaleSheet;
         if (body.salePrefs.sellDuringStocktake != null) p.sellDuringStocktake = !!body.salePrefs.sellDuringStocktake;
         if (body.salePrefs.quoteDays != null) p.quoteDays = Math.max(1, Math.min(60, Math.round(Number(body.salePrefs.quoteDays) || 7)));
+        // الهدر والفروق: المسموح الافتراضي للورشة وتسامح فرق التكويد ووزن الميزان
+        const w = body.salePrefs.wastage;
+        if (w && typeof w === "object") {
+          const num = (v, lo, hi, d) => { const n = Number(v); return v === "" || v == null || !Number.isFinite(n) ? d : Math.max(lo, Math.min(hi, n)); };
+          p.wastage = { defaultAllowPct: num(w.defaultAllowPct, 0, 20, 2), codingTolPct: num(w.codingTolPct, 0, 10, 0.1), receiveTolG: num(w.receiveTolG, 0, 5, 0.05) };
+        }
         const { rows: pr } = await client.query(
           "update branch_settings set sale_prefs = sale_prefs || $2::jsonb where branch_id = $1 returning sale_prefs",
           [req.auth.branchId, JSON.stringify(p)]);
