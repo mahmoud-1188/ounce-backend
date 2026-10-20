@@ -24,7 +24,7 @@ router.use("/store", authenticateStore);
 
 async function storeBranches(storeId) {
   const { rows } = await withoutBranch((c) => c.query(
-    "select id, name, ref from branches where store_id = $1 and deleted_at is null order by created_at", [storeId]));
+    "select id, name, ref, is_hq from branches where store_id = $1 and deleted_at is null order by created_at", [storeId]));
   return rows;
 }
 async function inStore(storeId, branchId) {
@@ -35,7 +35,7 @@ router.get("/store/fiscal", async (req, res, next) => {
   try {
     const branches = await storeBranches(req.storeAuth.storeId);
     const out = [];
-    for (const b of branches) out.push({ branchId: b.id, branchName: b.name, branchRef: b.ref, ...(await withBranch(b.id, (c) => fiscalStatus(c, b.id))) });
+    for (const b of branches) out.push({ branchId: b.id, branchName: b.name, branchRef: b.ref, isHq: !!b.is_hq, ...(await withBranch(b.id, (c) => fiscalStatus(c, b.id))) });
     res.json({ branches: out });
   } catch (err) {
     next(err);
@@ -45,9 +45,51 @@ router.get("/store/fiscal", async (req, res, next) => {
 router.post("/store/branches/:branchId/close-month", requireCanManageBranches, async (req, res, next) => {
   try {
     if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    // إقفال الشهر في دفتر الإدارة يُمنع حتى تُقفل الفروع شهرها — فلا تُقفل المجموعة على أرقامٍ تتحرّك
+    const period = String(req.body?.period || "");
+    const { rows: brs } = await withoutBranch((c) => c.query(
+      "select id, name, is_hq from branches where store_id = $1 and deleted_at is null", [req.storeAuth.storeId]));
+    if (brs.find((b) => b.id === req.params.branchId)?.is_hq) {
+      const open = [];
+      for (const b of brs.filter((x) => !x.is_hq)) {
+        const r = await withBranch(b.id, async (c) => {
+          const { rows: [m] } = await c.query(
+            `select exists (select 1 from journal_entries where branch_id = $1 and to_char(created_at at time zone 'Asia/Riyadh', 'YYYY-MM') = $2) as has,
+                    exists (select 1 from period_closes where branch_id = $1 and period = $2) as closed`, [b.id, period]);
+          return m;
+        });
+        if (r.has && !r.closed) open.push(b.name);
+      }
+      if (open.length) return res.status(409).json({ error: "branches_not_closed", branches: open });
+    }
     const r = await withBranch(req.params.branchId, (c) => closeMonth(c, req.params.branchId, String(req.body?.period || ""), { by: `الإدارة — ${req.storeAuth.name || ""}`.trim(), kind: "store" }));
     if (r.error) return res.status(r.error === "invalid_period" ? 400 : 409).json(r);
     res.status(201).json(r);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// قفل الفترات لكل الفروع من الإدارة: «نهائي» لا يُسجَّل شيءٌ بتاريخه أو قبله، «جزئي» ما قبله للمدير وحده.
+// يُحفظ قفلًا للإدارة بجانب قفل الفرع (النافذ أبعدهما)، وتفريغه يرفع قفل الإدارة وحده.
+router.post("/store/period-locks", requireCanManageBranches, async (req, res, next) => {
+  const d = (v) => (v == null || v === "" ? null : /^\d{4}-\d{2}-\d{2}$/.test(String(v)) ? String(v) : undefined);
+  const lockAll = d(req.body?.lockAll), lockPosted = d(req.body?.lockPosted);
+  if (lockAll === undefined || lockPosted === undefined) return res.status(400).json({ error: "invalid_lock_date" });
+  try {
+    const out = [];
+    for (const b of await storeBranches(req.storeAuth.storeId)) {
+      await withBranch(b.id, async (c) => {
+        await c.query(
+          `insert into branch_settings (branch_id, hq_lock_all, hq_lock_posted) values ($1,$2,$3)
+           on conflict (branch_id) do update set hq_lock_all = excluded.hq_lock_all, hq_lock_posted = excluded.hq_lock_posted`,
+          [b.id, lockAll, lockPosted]);
+        await c.query(`insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'update',null,'branch_settings',null,$2)`,
+          [b.id, JSON.stringify({ hqPeriodLock: { lockAll, lockPosted }, by: req.storeAuth.name || "الإدارة" })]);
+      });
+      out.push({ branchId: b.id, name: b.name, ok: true });
+    }
+    res.json({ lockAll, lockPosted, branches: out });
   } catch (err) {
     next(err);
   }

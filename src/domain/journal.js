@@ -32,7 +32,7 @@ async function postJournalEntry(
   //   lock_all نهائيٌّ للجميع، وlock_posted يستثني المدير. القيد يُؤرَّخ
   //   بلحظة ترحيله، فالقفل «حتى تاريخ» يمنع كل قيدٍ حتى نهاية ذلك اليوم.
   const { rows: lockRows } = await client.query(
-    "select lock_all::text as lock_all, lock_posted::text as lock_posted from branch_settings where branch_id = $1",
+    "select greatest(lock_all, hq_lock_all)::text as lock_all, greatest(lock_posted, hq_lock_posted)::text as lock_posted from branch_settings where branch_id = $1",
     [branchId]
   );
   const locks = lockRows[0];
