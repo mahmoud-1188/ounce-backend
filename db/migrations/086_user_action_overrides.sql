@@ -38,3 +38,6 @@ insert into posting_rules (op_type, label, rule) values
   ('vat_settlement', 'تسوية إقرار ضريبة القيمة المضافة وسدادها', '{"cash": {"debit": "2220", "credit": "1110"}}'),
   ('vat_settlement_reversal', 'إلغاء تسوية إقرار الضريبة', '{"cash": {"debit": "1110", "credit": "2220"}}')
 on conflict (op_type) do nothing;
+
+-- فاتورة المصروف أو إيصاله: معرّف المرفق المحفوظ على الجهاز الذي سجّله
+alter table expenses add column if not exists attach_id text;
