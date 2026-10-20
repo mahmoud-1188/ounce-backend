@@ -174,7 +174,8 @@ async function authenticate(req, res, next) {
     const role = {
       allowed_tabs: user.allowed_tabs,
       allowed_more: user.allowed_more,
-      deny_actions: [...new Set([...(user.deny_actions || []), ...hqDeny])],
+      // استثناء الشخص (migration 086): المنح يرفع منع الدور، والإغلاق يضيف منعًا — ومنع الإدارة فوقهما
+      deny_actions: [...new Set([...(user.deny_actions || []).filter((a) => !(user.action_grant || []).includes(a)), ...(user.action_revoke || []), ...hqDeny])],
       hq_deny_actions: hqDeny,
       can_manage_day: user.can_manage_day,
       can_break: user.can_break,

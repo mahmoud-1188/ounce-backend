@@ -9,7 +9,7 @@ import { roundMoney } from "./money.js";
  *               نفسه، فيفرضها الخادم على كل بيعٍ وقيد كما هي.
  *   • local   — هوامش العيارات ومن يفحص الكسر: إعداداتُ واجهة تُطبَّق عند الدخول.
  */
-const PROFILE_KEYS = ["storeName", "legalName", "crNumber", "vatNumber", "phone", "email", "city", "managerName", "address", "website"];
+const PROFILE_KEYS = ["storeName", "legalName", "crNumber", "vatNumber", "phone", "email", "city", "managerName", "address", "website", "branchNo", "footerNote"];
 const KARATS = ["24", "22", "21", "18", "14"];
 const LOGO_MAX = 300_000; // data:URL مصغَّر — لا صورٌ كاملة في كل bootstrap
 
@@ -139,4 +139,15 @@ async function provisionLocked(client, branchId) {
   return rows[0]?.settings_locked ? { by: rows[0].provisioned_by || "الإدارة" } : null;
 }
 
-export { PROFILE_KEYS, loadProvision, saveProvision, provisionLocked };
+// معلومات الفرع من الفرع نفسه (المدير): الاسم والسجلّ والرقم الضريبي والعنوان والشعار — ما لم تقفلها الإدارة
+async function saveBranchProfile(client, branchId, profile) {
+  const p = cleanProfile(profile || {});
+  if (p.error) return p;
+  if (p.profile.vatNumber && !/^3\d{13}3$/.test(p.profile.vatNumber)) return { error: "invalid_vat_number" };
+  if (p.profile.crNumber && !/^\d{10}$/.test(p.profile.crNumber)) return { error: "invalid_cr_number" };
+  if (await provisionLocked(client, branchId)) return { error: "settings_locked_by_hq" };
+  await client.query("update branches set profile = $2 where id = $1", [branchId, JSON.stringify(p.profile)]);
+  return { profile: p.profile };
+}
+
+export { PROFILE_KEYS, loadProvision, saveProvision, saveBranchProfile, provisionLocked };

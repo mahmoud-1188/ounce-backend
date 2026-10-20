@@ -7,8 +7,10 @@ import {
   renameBranchUser,
   setBranchUserAi,
   setBranchUserPermissions,
+  setBranchUserActions,
   removeBranchUser,
 } from "../domain/branchUsers.js";
+import { ACTION_GROUPS, HQ_ACTIONS, hqDeniedActions } from "../domain/hqPolicy.js";
 import { branchDelegation, branchSelfManaged } from "../domain/delegation.js";
 
 const router = Router();
@@ -44,8 +46,9 @@ router.get("/users", async (req, res, next) => {
       loadBranchUsersWithRoles(client, req.auth.branchId)
     );
     res.json(
-      users.map(({ id, name, ref, role, salary, can_use_ai, allowed_pages, allowed, active, created_at }) => ({
+      users.map(({ id, name, ref, role, salary, can_use_ai, allowed_pages, allowed, active, created_at, action_grant, action_revoke, must_change_pin }) => ({
         id, name, ref, role, salary, can_use_ai, allowed_pages, allowed, active, created_at,
+        action_grant: action_grant || [], action_revoke: action_revoke || [], must_change_pin: !!must_change_pin,
       }))
     );
   } catch (err) {
@@ -127,6 +130,38 @@ router.patch("/users/:id/permissions", staffByHq, async (req, res, next) => {
     );
     if (result.error === "not_found") return res.status(404).json({ error: result.error });
     if (result.error) return res.status(409).json(result);
+    res.json(result.user);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** GET /api/users/actions-meta — الأفعال المفروضة على الخادم، ومنع كل دورٍ وما أغلقته الإدارة. */
+router.get("/users/actions-meta", async (req, res, next) => {
+  try {
+    const out = await withBranch(req.auth.branchId, async (client) => {
+      const { rows: roles } = await client.query("select id, deny_actions from roles");
+      const { rows: st } = await client.query("select s.hq_policy from branches b left join stores s on s.id = b.store_id where b.id = $1", [req.auth.branchId]);
+      const pol = st[0]?.hq_policy || null;
+      return {
+        actions: HQ_ACTIONS, groups: ACTION_GROUPS,
+        roleDeny: Object.fromEntries(roles.map((r) => [r.id, r.deny_actions || []])),
+        hqDeny: Object.fromEntries(roles.map((r) => [r.id, hqDeniedActions(pol, req.auth.branchId, r.id)])),
+      };
+    });
+    res.json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** PATCH /api/users/:id/actions { grant, revoke } — استثناءات الشخص فوق دوره. */
+router.patch("/users/:id/actions", staffByHq, async (req, res, next) => {
+  try {
+    const result = await withBranch(req.auth.branchId, (client) =>
+      setBranchUserActions(client, req.auth.branchId, req.params.id, req.body || {}, { id: req.auth.userId, name: req.auth.user?.name, kind: "branch" })
+    );
+    if (result.error === "not_found") return res.status(404).json({ error: result.error });
     res.json(result.user);
   } catch (err) {
     next(err);

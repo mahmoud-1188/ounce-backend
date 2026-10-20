@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { withBranch } from "../db.js";
 import { authenticate, requirePage, requireManager } from "../middleware/auth.js";
-import { provisionLocked } from "../domain/branchProvision.js";
+import { provisionLocked, saveBranchProfile } from "../domain/branchProvision.js";
 
 const router = Router();
 
@@ -113,6 +113,12 @@ router.patch("/settings/branch", requirePage("settings"), requireManager, async 
         if (body.salePrefs.postSaleSheet != null) p.postSaleSheet = !!body.salePrefs.postSaleSheet;
         if (body.salePrefs.sellDuringStocktake != null) p.sellDuringStocktake = !!body.salePrefs.sellDuringStocktake;
         if (body.salePrefs.quoteDays != null) p.quoteDays = Math.max(1, Math.min(60, Math.round(Number(body.salePrefs.quoteDays) || 7)));
+        // الهدر والفروق: المسموح الافتراضي للورشة وتسامح فرق التكويد ووزن الميزان
+        const w = body.salePrefs.wastage;
+        if (w && typeof w === "object") {
+          const num = (v, lo, hi, d) => { const n = Number(v); return v === "" || v == null || !Number.isFinite(n) ? d : Math.max(lo, Math.min(hi, n)); };
+          p.wastage = { defaultAllowPct: num(w.defaultAllowPct, 0, 20, 2), codingTolPct: num(w.codingTolPct, 0, 10, 0.1), receiveTolG: num(w.receiveTolG, 0, 5, 0.05) };
+        }
         const { rows: pr } = await client.query(
           "update branch_settings set sale_prefs = sale_prefs || $2::jsonb where branch_id = $1 returning sale_prefs",
           [req.auth.branchId, JSON.stringify(p)]);
@@ -134,6 +140,15 @@ router.patch("/settings/branch", requirePage("settings"), requireManager, async 
   } catch (err) {
     next(err);
   }
+});
+
+/// معلومات الفرع ورأس المستندات — المدير، ما لم تقفلها الإدارة
+router.post("/settings/branch-profile", requireManager, async (req, res, next) => {
+  try {
+    const out = await withBranch(req.auth.branchId, (c) => saveBranchProfile(c, req.auth.branchId, req.body?.profile));
+    if (out.error) return res.status(out.error === "settings_locked_by_hq" ? 409 : 400).json(out);
+    res.json(out);
+  } catch (err) { next(err); }
 });
 
 router.post("/settings/stocktake-lock", requirePage("stocktake"), async (req, res, next) => {

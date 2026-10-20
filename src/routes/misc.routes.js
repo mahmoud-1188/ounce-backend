@@ -173,6 +173,16 @@ router.post("/reservations", async (req, res, next) => {
         );
         if (!itemRows[0]) return { error: "item_not_found" };
       }
+      // القطعة بعينها: رمزها من الصنف نفسه وعلى الرفّ (لا مباعة ولا خارجة)
+      let unitCodes = [];
+      if (body.itemId && body.unitCode) {
+        const { rows: uRows } = await client.query(
+          "select code from item_units where item_id = $1 and upper(code) = upper($2) and not sold and not issued",
+          [body.itemId, String(body.unitCode)]
+        );
+        if (!uRows[0]) return { error: "unit_not_available" };
+        unitCodes = [uRows[0].code];
+      }
 
       const businessDayId = await openDay(client, req.auth.branchId);
       const { rows: refRows } = await client.query(
@@ -183,13 +193,13 @@ router.post("/reservations", async (req, res, next) => {
 
       const { rows: rsvRows } = await client.query(
         `insert into reservations
-           (branch_id, ref, customer_id, item_id, total, deposit, remaining, description, method, business_day_id, created_by, hold_until, plan)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+           (branch_id, ref, customer_id, item_id, total, deposit, remaining, description, method, business_day_id, created_by, hold_until, plan, unit_codes)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
          returning *, hold_until::text as hold_until`,
         [
           req.auth.branchId, ref, body.customerId, body.itemId || null, total, deposit,
           roundMoney(total - deposit), body.description || null, method, businessDayId, req.auth.userId,
-          body.holdUntil || null, plan ? JSON.stringify(plan) : null,
+          body.holdUntil || null, plan ? JSON.stringify(plan) : null, unitCodes,
         ]
       );
       const reservation = rsvRows[0];
