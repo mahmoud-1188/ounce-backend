@@ -151,9 +151,19 @@ router.get("/vat-return", authenticate, requirePage("vatReturn"), async (req, re
         `select id, period_from::text as period_from, period_to::text as period_to, output_vat, input_vat, paid, source, created_at
            from vat_settlements where branch_id = $1 and reversed_at is null and period_from <= $3 and period_to >= $2
           order by created_at desc limit 1`, [req.auth.branchId, from, to]);
+      // ضريبة المدخلات (migration 089): حركة 1360 في الفترة، ورصيده المتراكم حتى نهايتها (يشمل المرحَّل)
+      const { rows: [iv] } = await c.query(
+        `select coalesce(sum(case when l.side = 'debit' then l.amount else -l.amount end) filter (where (e.created_at at time zone '${TZ}')::date between $2 and $3
+                  and e.op_type not in ('vat_settlement', 'vat_settlement_reversal')), 0)::numeric as period,
+                coalesce(sum(case when l.side = 'debit' then l.amount else -l.amount end) filter (where (e.created_at at time zone '${TZ}')::date <= $3), 0)::numeric as balance
+           from journal_entries e join journal_lines l on l.entry_id = e.id
+          where e.branch_id = $1 and l.account_code = '1360'`,
+        [req.auth.branchId, from, to]);
+      const inputVat = roundMoney(Number(iv.period));
+      const carriedIn = roundMoney(Math.max(0, Number(iv.balance) - inputVat));
       const outputVat = roundMoney(Number(s.std_vat));
       const adjVat = roundMoney(Number(r.vat));
-      const netDue = roundMoney(outputVat - adjVat);
+      const netDue = roundMoney(outputVat - adjVat - inputVat);
       const ledgerNet = roundMoney(Number(g.net));
       return {
         from, to,
@@ -162,9 +172,8 @@ router.get("/vat-return", authenticate, requirePage("vatReturn"), async (req, re
           returns: { base: roundMoney(Number(r.base)), vat: adjVat, count: r.n },
           exempt: { base: roundMoney(Number(s.exempt_base)), count: s.exempt_count },
         },
-        // ⚠ ضريبة المدخلات لا تُسجَّل في النظام بعد (لا حساب ضريبة مدخلات) — تُضاف يدويًّا عند الإقرار
-        purchases: { vat: 0, tracked: false },
-        netDue, ledgerNet, diff: roundMoney(ledgerNet - netDue),
+        purchases: { vat: inputVat, carried: carriedIn, tracked: true },
+        netDue, ledgerNet, diff: roundMoney(ledgerNet - (outputVat - adjVat)),
         settlement: st[0] ? { id: st[0].id, from: st[0].period_from, to: st[0].period_to, outputVat: Number(st[0].output_vat), inputVat: Number(st[0].input_vat),
           paid: Number(st[0].paid), source: st[0].source, at: st[0].created_at } : null,
       };
@@ -197,26 +206,43 @@ router.post("/vat-return/settle", authenticate, requirePage("vatReturn"), requir
             and e.op_type not in ('vat_settlement', 'vat_settlement_reversal')`,
         [req.auth.branchId, from, to]);
       const outVat = roundMoney(Number(g.net));
-      if (!(outVat > 0)) return { error: "vat_nothing_to_settle" };
+      // المدخلات المتاحة: رصيد 1360 حتى نهاية الفترة (ما بعد التسويات السابقة — يشمل المرحَّل)
+      const { rows: [ib] } = await c.query(
+        `select coalesce(sum(case when l.side = 'debit' then l.amount else -l.amount end), 0)::numeric as bal
+           from journal_entries e join journal_lines l on l.entry_id = e.id
+          where e.branch_id = $1 and l.account_code = '1360' and (e.created_at at time zone '${TZ}')::date <= $2`,
+        [req.auth.branchId, to]);
+      const inAvail = roundMoney(Math.max(0, Number(ib.bal)));
+      if (!(outVat > 0) && !(inAvail > 0)) return { error: "vat_nothing_to_settle" };
+      // المقاصّة: المدخلات تُطفئ المخرجات حتى قدرها، والفائض يبقى مرحَّلًا في 1360 للإقرار القادم
+      const offset = roundMoney(Math.min(Math.max(0, outVat), inAvail));
+      const pay = roundMoney(Math.max(0, outVat) - offset);
+      if (!(Math.max(0, outVat) > 0)) return { error: "vat_nothing_to_settle" };
       const { rows: [bal] } = await c.query(
         `select coalesce(sum(case when direction = 'in' then amount else -amount end), 0)::numeric as bal
            from cash_tx where branch_id = $1 and pool = 'safe' and method = $2`, [req.auth.branchId, VAT_CASH[source].method]);
-      if (Number(bal.bal) + 0.005 < outVat) return { error: "insufficient_safe_balance", available: roundMoney(Number(bal.bal)) };
+      if (pay > 0 && Number(bal.bal) + 0.005 < pay) return { error: "insufficient_safe_balance", available: roundMoney(Number(bal.bal)) };
       const { rows: [row] } = await c.query(
         `insert into vat_settlements (branch_id, period_from, period_to, output_vat, input_vat, paid, source, created_by)
-         values ($1, $2, $3, $4, 0, $4, $5, $6) returning id`, [req.auth.branchId, from, to, outVat, source, req.auth.userId]);
+         values ($1, $2, $3, $4, $7, $8, $5, $6) returning id`, [req.auth.branchId, from, to, outVat, source, req.auth.userId, offset, pay]);
       const { rows: [day] } = await c.query("select id from business_days where branch_id = $1 and status = 'open' order by opened_at desc limit 1", [req.auth.branchId]);
-      await c.query(
-        `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
-         values ($1, $2, 'safe', $3, 'out', $4, 'vat_payment', 'vat_settlements', $5, $6, $7)`,
-        [req.auth.branchId, day?.id || null, VAT_CASH[source].method, outVat, row.id, `سداد ضريبة القيمة المضافة ${from} ← ${to}`, req.auth.userId]);
+      if (pay > 0) {
+        await c.query(
+          `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
+           values ($1, $2, 'safe', $3, 'out', $4, 'vat_payment', 'vat_settlements', $5, $6, $7)`,
+          [req.auth.branchId, day?.id || null, VAT_CASH[source].method, pay, row.id, `سداد ضريبة القيمة المضافة ${from} ← ${to}`, req.auth.userId]);
+      }
       const entryId = await postJournalEntry(c, {
         branchId: req.auth.branchId, businessDayId: day?.id || null, opType: "vat_settlement", refTable: "vat_settlements", refId: row.id,
         description: `تسوية إقرار الضريبة ${from} ← ${to}`, createdBy: req.auth.userId,
-        lines: [{ account: "2220", side: "debit", amount: outVat }, { account: VAT_CASH[source].account, side: "credit", amount: outVat }],
+        lines: [
+          { account: "2220", side: "debit", amount: outVat },
+          { account: "1360", side: "credit", amount: offset },
+          { account: VAT_CASH[source].account, side: "credit", amount: pay },
+        ],
       });
       await c.query("update vat_settlements set entry_id = $2 where id = $1", [row.id, entryId]);
-      return { settlement: { id: row.id, from, to, outputVat: outVat, paid: outVat, source } };
+      return { settlement: { id: row.id, from, to, outputVat: outVat, inputVat: offset, paid: pay, source } };
     });
     if (out.error) return res.status(409).json(out);
     res.status(201).json(out);
@@ -240,16 +266,21 @@ router.post("/vat-return/settle/:id/undo", authenticate, requirePage("vatReturn"
       if (later[0]) return { error: "not_latest_settlement" };
       const src = VAT_CASH[s.source] ? s.source : "safe_cash";
       const amt = roundMoney(Number(s.paid));
+      const offset = roundMoney(Number(s.input_vat) || 0);
       const { rows: [day] } = await c.query("select id from business_days where branch_id = $1 and status = 'open' order by opened_at desc limit 1", [req.auth.branchId]);
-      if (amt > 0) {
-        await c.query(
+      if (amt > 0 || offset > 0) {
+        if (amt > 0) await c.query(
           `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
            values ($1, $2, 'safe', $3, 'in', $4, 'vat_payment', 'vat_settlements', $5, $6, $7)`,
           [req.auth.branchId, day?.id || null, VAT_CASH[src].method, amt, s.id, `إلغاء سداد الضريبة — ${reason}`, req.auth.userId]);
         const entryId = await postJournalEntry(c, {
           branchId: req.auth.branchId, businessDayId: day?.id || null, opType: "vat_settlement_reversal", refTable: "vat_settlements", refId: s.id,
           description: `إلغاء تسوية الضريبة ${String(s.period_from).slice(0, 10)} — ${reason}`, createdBy: req.auth.userId,
-          lines: [{ account: VAT_CASH[src].account, side: "debit", amount: amt }, { account: "2220", side: "credit", amount: amt }],
+          lines: [
+            { account: VAT_CASH[src].account, side: "debit", amount: amt },
+            { account: "1360", side: "debit", amount: offset },
+            { account: "2220", side: "credit", amount: roundMoney(amt + offset) },
+          ],
         });
         if (s.entry_id) await c.query("update journal_entries set reversed_of = $2 where id = $1", [entryId, s.entry_id]);
       }

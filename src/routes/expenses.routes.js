@@ -147,6 +147,9 @@ router.post("/expenses", async (req, res, next) => {
   if (!fundingSource) return res.status(400).json({ error: "invalid_funding_source" });
   if (!name) return res.status(400).json({ error: "name_required" });
   if (isPayroll && !body.employeeId) return res.status(400).json({ error: "employee_required" });
+  // ضريبة المدخلات داخل المبلغ (migration 089): تُطرح من المصروف وتُقيَّد على 1360 — لا للرواتب والسلف
+  const vatAmount = isPayroll ? 0 : roundMoney(body.vatAmount || 0);
+  if (vatAmount < 0 || vatAmount >= amount) return res.status(400).json({ error: "invalid_vat_amount" });
 
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
@@ -186,8 +189,8 @@ router.post("/expenses", async (req, res, next) => {
       const { rows: expRows } = await client.query(
         `insert into expenses
            (branch_id, ref, name, name_id, amount, business_day_id, category, note, recurring,
-            funding_source, employee_id, period_month, created_by, installments, attach_id)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            funding_source, employee_id, period_month, created_by, installments, attach_id, vat_amount)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
          returning *`,
         [
           req.auth.branchId, ref, name, nameId, amount, businessDayId, category,
@@ -195,6 +198,7 @@ router.post("/expenses", async (req, res, next) => {
           isPayroll ? body.periodMonth || null : null, req.auth.userId,
           category === "advance" ? Math.min(60, Math.max(1, Math.round(Number(body.installments) || 1))) : 1,
           typeof body.attachId === "string" && body.attachId.length <= 80 ? body.attachId : null,
+          vatAmount,
         ]
       );
       const expense = expRows[0];
@@ -218,7 +222,8 @@ router.post("/expenses", async (req, res, next) => {
         description: `${name} — ${ref}`,
         createdBy: req.auth.userId,
         lines: [
-          { account: debitAccount, side: "debit", amount },
+          { account: debitAccount, side: "debit", amount: roundMoney(amount - vatAmount) },
+          { account: "1360", side: "debit", amount: vatAmount },
           { account: cashAccount, side: "credit", amount },
         ],
       });
