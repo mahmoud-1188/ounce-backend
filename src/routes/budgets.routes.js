@@ -2,6 +2,7 @@ import { Router } from "express";
 import { withBranch } from "../db.js";
 import { authenticate, requireManager, requirePage } from "../middleware/auth.js";
 import { roundMoney } from "../domain/money.js";
+import { postJournalEntry } from "../domain/journal.js";
 
 const router = Router();
 
@@ -142,8 +143,14 @@ router.get("/vat-return", authenticate, requirePage("vatReturn"), async (req, re
       const { rows: [g] } = await c.query(
         `select coalesce(sum(case when l.side = 'credit' then l.amount else -l.amount end), 0)::numeric as net
            from journal_entries e join journal_lines l on l.entry_id = e.id
-          where e.branch_id = $1 and l.account_code = '2220' and (e.created_at at time zone '${TZ}')::date between $2 and $3`,
+          where e.branch_id = $1 and l.account_code = '2220' and (e.created_at at time zone '${TZ}')::date between $2 and $3
+            and e.op_type not in ('vat_settlement', 'vat_settlement_reversal')`,
         [req.auth.branchId, from, to]);
+      // تسويةٌ قائمة تغطّي الفترة أو تتقاطع معها — تُعرض ويُمنع تكرارها
+      const { rows: st } = await c.query(
+        `select id, period_from::text as period_from, period_to::text as period_to, output_vat, input_vat, paid, source, created_at
+           from vat_settlements where branch_id = $1 and reversed_at is null and period_from <= $3 and period_to >= $2
+          order by created_at desc limit 1`, [req.auth.branchId, from, to]);
       const outputVat = roundMoney(Number(s.std_vat));
       const adjVat = roundMoney(Number(r.vat));
       const netDue = roundMoney(outputVat - adjVat);
@@ -158,10 +165,101 @@ router.get("/vat-return", authenticate, requirePage("vatReturn"), async (req, re
         // ⚠ ضريبة المدخلات لا تُسجَّل في النظام بعد (لا حساب ضريبة مدخلات) — تُضاف يدويًّا عند الإقرار
         purchases: { vat: 0, tracked: false },
         netDue, ledgerNet, diff: roundMoney(ledgerNet - netDue),
+        settlement: st[0] ? { id: st[0].id, from: st[0].period_from, to: st[0].period_to, outputVat: Number(st[0].output_vat), inputVat: Number(st[0].input_vat),
+          paid: Number(st[0].paid), source: st[0].source, at: st[0].created_at } : null,
       };
     });
     res.json(out);
   } catch (err) {
+    next(err);
+  }
+});
+
+
+// ══ تسوية الإقرار وسداده (migration 086) ══
+// قيدٌ واحد: مدين 2220 بضريبة المخرجات للفترة، دائن الخزنة بالمسدَّد. الفترة لا تُسوّى مرتين ما لم تُلغَ
+// تسويتها، والإلغاء قيدٌ عكسي بسببٍ مكتوب ويعود المدفوع إلى الخزنة.
+const VAT_CASH = { safe_cash: { account: "1110", method: "cash" }, safe_network: { account: "1120", method: "network" } };
+router.post("/vat-return/settle", authenticate, requirePage("vatReturn"), requireManager, async (req, res, next) => {
+  const { from, to } = req.body || {};
+  const source = VAT_CASH[req.body?.source] ? req.body.source : "safe_cash";
+  if (!DAY.test(String(from || "")) || !DAY.test(String(to || "")) || from > to) return res.status(400).json({ error: "invalid_range" });
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows: dup } = await c.query(
+        "select 1 from vat_settlements where branch_id = $1 and reversed_at is null and period_from <= $3 and period_to >= $2 limit 1",
+        [req.auth.branchId, from, to]);
+      if (dup[0]) return { error: "vat_period_settled" };
+      const { rows: [g] } = await c.query(
+        `select coalesce(sum(case when l.side = 'credit' then l.amount else -l.amount end), 0)::numeric as net
+           from journal_entries e join journal_lines l on l.entry_id = e.id
+          where e.branch_id = $1 and l.account_code = '2220' and (e.created_at at time zone '${TZ}')::date between $2 and $3
+            and e.op_type not in ('vat_settlement', 'vat_settlement_reversal')`,
+        [req.auth.branchId, from, to]);
+      const outVat = roundMoney(Number(g.net));
+      if (!(outVat > 0)) return { error: "vat_nothing_to_settle" };
+      const { rows: [bal] } = await c.query(
+        `select coalesce(sum(case when direction = 'in' then amount else -amount end), 0)::numeric as bal
+           from cash_tx where branch_id = $1 and pool = 'safe' and method = $2`, [req.auth.branchId, VAT_CASH[source].method]);
+      if (Number(bal.bal) + 0.005 < outVat) return { error: "insufficient_safe_balance", available: roundMoney(Number(bal.bal)) };
+      const { rows: [row] } = await c.query(
+        `insert into vat_settlements (branch_id, period_from, period_to, output_vat, input_vat, paid, source, created_by)
+         values ($1, $2, $3, $4, 0, $4, $5, $6) returning id`, [req.auth.branchId, from, to, outVat, source, req.auth.userId]);
+      const { rows: [day] } = await c.query("select id from business_days where branch_id = $1 and status = 'open' order by opened_at desc limit 1", [req.auth.branchId]);
+      await c.query(
+        `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
+         values ($1, $2, 'safe', $3, 'out', $4, 'vat_payment', 'vat_settlements', $5, $6, $7)`,
+        [req.auth.branchId, day?.id || null, VAT_CASH[source].method, outVat, row.id, `سداد ضريبة القيمة المضافة ${from} ← ${to}`, req.auth.userId]);
+      const entryId = await postJournalEntry(c, {
+        branchId: req.auth.branchId, businessDayId: day?.id || null, opType: "vat_settlement", refTable: "vat_settlements", refId: row.id,
+        description: `تسوية إقرار الضريبة ${from} ← ${to}`, createdBy: req.auth.userId,
+        lines: [{ account: "2220", side: "debit", amount: outVat }, { account: VAT_CASH[source].account, side: "credit", amount: outVat }],
+      });
+      await c.query("update vat_settlements set entry_id = $2 where id = $1", [row.id, entryId]);
+      return { settlement: { id: row.id, from, to, outputVat: outVat, paid: outVat, source } };
+    });
+    if (out.error) return res.status(409).json(out);
+    res.status(201).json(out);
+  } catch (err) {
+    if (err.code === "period_locked") return res.status(409).json({ error: "period_locked", why: err.why });
+    next(err);
+  }
+});
+
+router.post("/vat-return/settle/:id/undo", authenticate, requirePage("vatReturn"), requireManager, async (req, res, next) => {
+  const reason = String(req.body?.reason || "").trim();
+  if (!reason) return res.status(400).json({ error: "reason_required" });
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows: [s] } = await c.query(
+        "select * from vat_settlements where id = $1 and branch_id = $2 and reversed_at is null for update", [req.params.id, req.auth.branchId]);
+      if (!s) return { error: "not_found" };
+      // آخر تسويةٍ وحدها تُلغى — إلغاء قديمةٍ تحت أحدث منها يُربك ترحيل الفترات
+      const { rows: later } = await c.query(
+        "select 1 from vat_settlements where branch_id = $1 and reversed_at is null and period_from > $2 limit 1", [req.auth.branchId, s.period_to]);
+      if (later[0]) return { error: "not_latest_settlement" };
+      const src = VAT_CASH[s.source] ? s.source : "safe_cash";
+      const amt = roundMoney(Number(s.paid));
+      const { rows: [day] } = await c.query("select id from business_days where branch_id = $1 and status = 'open' order by opened_at desc limit 1", [req.auth.branchId]);
+      if (amt > 0) {
+        await c.query(
+          `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
+           values ($1, $2, 'safe', $3, 'in', $4, 'vat_payment', 'vat_settlements', $5, $6, $7)`,
+          [req.auth.branchId, day?.id || null, VAT_CASH[src].method, amt, s.id, `إلغاء سداد الضريبة — ${reason}`, req.auth.userId]);
+        const entryId = await postJournalEntry(c, {
+          branchId: req.auth.branchId, businessDayId: day?.id || null, opType: "vat_settlement_reversal", refTable: "vat_settlements", refId: s.id,
+          description: `إلغاء تسوية الضريبة ${String(s.period_from).slice(0, 10)} — ${reason}`, createdBy: req.auth.userId,
+          lines: [{ account: VAT_CASH[src].account, side: "debit", amount: amt }, { account: "2220", side: "credit", amount: amt }],
+        });
+        if (s.entry_id) await c.query("update journal_entries set reversed_of = $2 where id = $1", [entryId, s.entry_id]);
+      }
+      await c.query("update vat_settlements set reversed_at = now(), reversed_by = $2, reverse_reason = $3 where id = $1", [s.id, req.auth.userId, reason]);
+      return { ok: true };
+    });
+    if (out.error) return res.status(out.error === "not_found" ? 404 : 409).json(out);
+    res.json(out);
+  } catch (err) {
+    if (err.code === "period_locked") return res.status(409).json({ error: "period_locked", why: err.why });
     next(err);
   }
 });

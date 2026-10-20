@@ -10,3 +10,31 @@ alter table permission_log add constraint permission_log_kind_check
 
 -- رمز القطعة المحجوزة بعينها (يُمسح عند الحجز) — يظهر على الحجز وعند التسليم
 alter table reservations add column if not exists unit_codes text[] not null default '{}';
+
+-- تسوية إقرار ضريبة القيمة المضافة: قيدٌ يُقفل 2220 للفترة ويسدّد من الخزنة، ويُلغى بقيدٍ عكسي وسببٍ مكتوب
+create table if not exists vat_settlements (
+  id uuid primary key default gen_random_uuid(),
+  branch_id uuid not null references branches(id),
+  period_from date not null,
+  period_to date not null,
+  output_vat numeric(14,2) not null default 0,
+  input_vat numeric(14,2) not null default 0,
+  paid numeric(14,2) not null default 0,
+  source text,
+  entry_id uuid,
+  created_by uuid references users(id),
+  created_at timestamptz not null default now(),
+  reversed_at timestamptz,
+  reversed_by uuid references users(id),
+  reverse_reason text
+);
+create index if not exists vat_settlements_branch_idx on vat_settlements (branch_id, period_from);
+alter table vat_settlements enable row level security;
+drop policy if exists branch_isolation_vat_settlements on vat_settlements;
+create policy branch_isolation_vat_settlements on vat_settlements
+  using (branch_id = (current_setting('app.current_branch_id', true))::uuid);
+
+insert into posting_rules (op_type, label, rule) values
+  ('vat_settlement', 'تسوية إقرار ضريبة القيمة المضافة وسدادها', '{"cash": {"debit": "2220", "credit": "1110"}}'),
+  ('vat_settlement_reversal', 'إلغاء تسوية إقرار الضريبة', '{"cash": {"debit": "1110", "credit": "2220"}}')
+on conflict (op_type) do nothing;
