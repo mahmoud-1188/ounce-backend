@@ -12,6 +12,7 @@ const RULES = [
   [null, /^\/store\/branches\/[^/]+\/remnants(\/[^/]+\/code)?$/, ["branches"], true],
   [null, /^\/store\/branches\/[^/]+\/coding-model$/, ["branches"], true],
   [null, /^\/store\/branches\/[^/]+\/hq-purchase$/, ["branches", "hqDocs"]],
+  [null, /^\/store\/branches\/[^/]+\/(stocktake-sheet|stocktake-lock|remote-stocktakes?)$/, ["branches", "stocktake"]],
   ["GET", /^\/store\/branches$/, [ANY]],
   [null, /^\/store\/branches(\/.*)?$/, ["branches"]],
   [null, /^\/store\/report$/, ["report", "home", "branches"]],

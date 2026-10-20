@@ -123,19 +123,64 @@ router.get("/store/branches/:branchId/stocktake-sheet", requireCanManageBranches
          from items i left join categories cat on cat.id = i.category_id left join item_units u on u.item_id = i.id
         where i.branch_id = $1 group by i.id, cat.name
        having count(u.id) filter (where not u.sold and not u.issued) > 0 order by cat.name, i.ref`, [req.params.branchId])).rows);
-    res.json({ items: rows.map((r) => ({ id: r.id, ref: r.ref, category: r.category, karat: r.karat, weight: Number(r.weight), expected: r.expected })) });
+    // رموز القطع الحرّة لكل صنف — العدّ بالمسح يطابقها، والقفل وآخر الجرود ليرى المسؤول حال الفرع
+    const extra = await withBranch(req.params.branchId, async (c) => ({
+      units: (await c.query(
+        `select u.item_id, u.code, u.epc, u.sold from item_units u join items i on i.id = u.item_id where i.branch_id = $1 and not u.issued`,
+        [req.params.branchId])).rows,
+      lock: (await c.query("select locked, locked_at, locked_by_name, by_hq from stocktake_locks where branch_id = $1", [req.params.branchId])).rows[0] || null,
+      audits: (await c.query(
+        `select created_at, details from audit_log where branch_id = $1 and ref_table = 'stocktake' order by created_at desc limit 8`, [req.params.branchId])).rows,
+    }));
+    const codesOf = new Map();
+    for (const u of extra.units.filter((x) => !x.sold)) codesOf.set(u.item_id, [...(codesOf.get(u.item_id) || []), u.code]);
+    res.json({
+      items: rows.map((r) => ({ id: r.id, ref: r.ref, category: r.category, karat: r.karat, weight: Number(r.weight), expected: r.expected, codes: codesOf.get(r.id) || [] })),
+      sold: extra.units.filter((x) => x.sold).map((x) => x.code),
+      epcs: Object.fromEntries(extra.units.filter((x) => x.epc).map((x) => [String(x.epc).toUpperCase(), x.code])),
+      lock: extra.lock && extra.lock.locked ? { at: extra.lock.locked_at, by: extra.lock.locked_by_name || "الفرع", byHq: !!extra.lock.by_hq } : null,
+      audits: extra.audits.map((a) => ({ at: a.created_at, ...(a.details || {}) })),
+    });
   } catch (err) {
     next(err);
   }
 });
 
 const shapeRst = (r) => ({ id: r.id, ref: r.ref, counts: r.counts || [], note: r.note || "", status: r.status, requestedBy: r.requested_by, requestedAt: r.requested_at,
-  decidedAt: r.decided_at, decidedBy: r.decided_by_name || null, result: r.result || null });
+  decidedAt: r.decided_at, decidedBy: r.decided_by_name || null, result: r.result || null, scan: r.scan || null, applyMode: r.apply_mode || "apply", unlock: r.unlock !== false });
+
+// قفل مخزون الفرع للجرد من الإدارة: يتوقّف بيعه وتحويله حتى يُطبَّق الجرد أو يُفتح القفل
+router.post("/store/branches/:branchId/stocktake-lock", requireCanManageBranches, async (req, res, next) => {
+  const on = !!req.body?.on;
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const by = req.storeAuth.name || "الإدارة";
+    const r = await withBranch(req.params.branchId, async (c) => {
+      const { rows } = await c.query(
+        `insert into stocktake_locks (branch_id, locked, locked_by, locked_at, locked_by_name, by_hq) values ($1,$2,null,$3,$4,$2)
+         on conflict (branch_id) do update set locked = excluded.locked, locked_by = null, locked_at = excluded.locked_at,
+           locked_by_name = excluded.locked_by_name, by_hq = excluded.by_hq
+         returning locked, locked_at, locked_by_name`, [req.params.branchId, on, on ? new Date() : null, on ? `الإدارة — ${by}` : null]);
+      await c.query(`insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'update',null,'stocktake_locks',null,$2)`,
+        [req.params.branchId, JSON.stringify({ hqStocktakeLock: on, by })]);
+      return rows[0];
+    });
+    res.json({ lock: r.locked ? { at: r.locked_at, by: r.locked_by_name, byHq: true } : null });
+  } catch (err) {
+    next(err);
+  }
+});
 
 router.post("/store/branches/:branchId/remote-stocktake", requireCanManageBranches, async (req, res, next) => {
   const counts = (Array.isArray(req.body?.counts) ? req.body.counts : [])
-    .map((x) => ({ itemId: String(x.itemId || ""), countedQty: Number(x.countedQty) }))
+    .map((x) => ({ itemId: String(x.itemId || ""), countedQty: Number(x.countedQty),
+      ...(Array.isArray(x.missingCodes) && x.missingCodes.length ? { missingCodes: x.missingCodes.map((c) => String(c).toUpperCase()).slice(0, 500) } : {}) }))
     .filter((x) => x.itemId);
+  const applyMode = req.body?.applyMode === "report" ? "report" : "apply";
+  const unlock = req.body?.unlock !== false;
+  const sc = req.body?.scan && typeof req.body.scan === "object" ? req.body.scan : null;
+  const scan = sc ? { matched: Number(sc.matched) || 0, missing: (sc.missing || []).map(String).slice(0, 500), unknown: (sc.unknown || []).map(String).slice(0, 200),
+    soldFound: (sc.soldFound || []).map(String).slice(0, 200), expected: Number(sc.expected) || 0 } : null;
   if (!counts.length) return res.status(400).json({ error: "no_entries" });
   if (counts.some((x) => !Number.isInteger(x.countedQty) || x.countedQty < 0)) return res.status(400).json({ error: "invalid_entry" });
   try {
@@ -146,8 +191,9 @@ router.post("/store/branches/:branchId/remote-stocktake", requireCanManageBranch
       if (ok.length !== new Set(counts.map((x) => x.itemId)).size) return { error: "item_not_found" };
       const { rows: [n] } = await c.query("select count(*)::int + 1 as n from remote_stocktakes where branch_id = $1", [req.params.branchId]);
       const { rows } = await c.query(
-        `insert into remote_stocktakes (branch_id, ref, counts, note, requested_by) values ($1,$2,$3,$4,$5) returning *`,
-        [req.params.branchId, `RST-${String(n.n).padStart(4, "0")}`, JSON.stringify(counts), String(req.body?.note || "").slice(0, 300) || null, by]);
+        `insert into remote_stocktakes (branch_id, ref, counts, note, requested_by, scan, apply_mode, unlock) values ($1,$2,$3,$4,$5,$6,$7,$8) returning *`,
+        [req.params.branchId, `RST-${String(n.n).padStart(4, "0")}`, JSON.stringify(counts), String(req.body?.note || "").slice(0, 300) || null, by,
+         scan ? JSON.stringify(scan) : null, applyMode, unlock]);
       await c.query(
         `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'create',null,'remote_stocktakes',$2,$3)`,
         [req.params.branchId, rows[0].id, JSON.stringify({ kind: "remote_stocktake", by, byKind: "store", items: counts.length })]);
