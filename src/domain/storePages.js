@@ -31,6 +31,7 @@ const RULES = [
   [null, /^\/store\/bank-fees(\/.*)?$/, ["expenses", "branches"]],
   [null, /^\/store\/expenses-matrix$/, ["expenses"]],
   [null, /^\/store\/net-weight$/, ["netWeight"]],
+  [null, /^\/store\/wastage$/, ["netWeight", "report", "consolidated"]],
   [null, /^\/store\/zakat$/, ["zakat"]],
   [null, /^\/store\/fiscal$/, ["fiscal"]],
   [null, /^\/store\/period-locks$/, ["fiscal"]],

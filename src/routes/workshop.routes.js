@@ -538,5 +538,75 @@ router.post("/workshop/pay-fees", async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// «كم ضاع في التصنيع؟» (المرجع wastageReportOf): الأوامر المقفلة في الفترة بنسبة هدرها ومسموحها وزائدها ومصيره،
+// وكم من أوزانها كُتب باليد، وما يزال قيد الاستلام، والمطالبات المفتوحة بعمرها — ومجاميع لكل ورشة ولكل عيار.
+async function wastageReport(c, branchId, { from = null, to = null, claimDays = 30 } = {}) {
+  const { rows } = await c.query(
+    `select * from workshop_jobs where branch_id = $1 order by created_at`, [branchId]);
+  // تاريخ الإقفال بيوم الرياض لا بـUTC — كي لا يقع إقفال منتصف الليل في يومٍ آخر
+  const dayOf = (d) => new Date(new Date(d).getTime() + 3 * 3600000).toISOString().slice(0, 10);
+  const inRange = (d) => (!from || dayOf(d) >= from) && (!to || dayOf(d) <= to);
+  const manualOf = (j) => {
+    const evs = [...(j.issues || []).map((x) => x.evidence), ...liveReceipts(j).map((r) => r.evidence), j.evidence?.worked, j.evidence?.returned].filter(Boolean);
+    return { weighed: evs.length, manual: evs.filter((e) => e.source === "manual").length };
+  };
+  const closed = rows.filter((j) => j.status === "closed" && j.closed_at && inRange(j.closed_at));
+  const out = closed.map((j) => {
+    const t = calcOf(j);
+    const legacy = !(j.issues || []).length || !(j.receipts || []).length;
+    const issued = legacy ? fineWeight(Number(j.issued_weight), j.karat) : t.issuedFine;
+    const back = legacy ? fineWeight(Number(j.returned_weight) || 0, j.karat) : t.returnedFine;
+    const made = legacy ? fineWeight(Number(j.worked_weight) || 0, j.karat) : t.outFine;
+    const loss = Number(j.wastage_fine) || 0, allowed = Number(j.allowed_fine) || 0, over = Number(j.excess_fine) || 0;
+    const m = manualOf(j);
+    return {
+      id: j.id, ref: j.ref, workshop: j.workshop_name, workshopId: j.workshop_id, karat: j.karat,
+      issued: roundWeight(issued), out: roundWeight(made), returned: roundWeight(back), loss: roundWeight(loss),
+      lossPct: issued > 0 ? Math.round(loss / issued * 10000) / 100 : 0, allowPct: Number(j.allowed_pct), allowed: roundWeight(allowed),
+      over: roundWeight(over), overValue: roundMoney(over * (Number(j.price24) || 0)),
+      fate: over > 0.0005 ? (j.settlement?.kind === "claim" ? "claim" : "writeoff") : null, closedAt: j.closed_at, ...m,
+    };
+  });
+  const sum = (arr, k) => arr.reduce((a, x) => a + (Number(x[k]) || 0), 0);
+  const agg = (arr) => {
+    const issued = sum(arr, "issued"), loss = sum(arr, "loss");
+    return { jobs: arr.length, issued: roundWeight(issued), loss: roundWeight(loss), lossPct: issued > 0 ? Math.round(loss / issued * 10000) / 100 : 0,
+      allowed: roundWeight(sum(arr, "allowed")), over: roundWeight(sum(arr, "over")), overValue: roundMoney(sum(arr, "overValue")),
+      weighed: sum(arr, "weighed"), manual: sum(arr, "manual") };
+  };
+  const total = agg(out);
+  total.manualPct = total.weighed ? Math.round(total.manual / total.weighed * 100) : 0;
+  const group = (keyOf, labelOf) => [...new Set(out.map(keyOf))].map((k) => ({ key: k, label: labelOf(k), ...agg(out.filter((x) => keyOf(x) === k)) }))
+    .sort((a, b) => b.lossPct - a.lossPct);
+  const receiving = rows.filter((j) => j.status === "open" || j.status === "received" || j.status === "pending").map((j) => {
+    const t = calcOf(j);
+    return { id: j.id, ref: j.ref, workshop: j.workshop_name, issued: t.issuedFine, received: roundWeight(t.outFine + t.returnedFine),
+      left: roundWeight(t.issuedFine - t.outFine - t.returnedFine), manual: manualOf(j).manual };
+  });
+  const now = Date.now();
+  const claimRows = rows.filter((j) => j.settlement?.kind === "claim" && !j.settlement.settledAt).map((j) => {
+    const age = Math.floor((now - new Date(j.settlement.openedAt).getTime()) / 86400000);
+    return { id: j.id, ref: j.ref, workshop: j.workshop_name, grams: Number(j.settlement.fine), age, overdue: age > claimDays,
+      value: roundMoney(Number(j.settlement.fine) * (Number(j.settlement.price24) || 0)) };
+  });
+  return {
+    from, to, rows: out, total, receiving,
+    byWorkshop: group((x) => x.workshop, (k) => k), byKarat: group((x) => x.karat, (k) => `عيار ${k}`),
+    claims: { rows: claimRows, fine: roundWeight(sum(claimRows, "grams")), value: roundMoney(sum(claimRows, "value")), overdue: claimRows.filter((x) => x.overdue).length },
+  };
+}
+
+router.get("/workshop/report", async (req, res, next) => {
+  const day = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || "")) ? String(v) : null);
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows } = await c.query("select sale_prefs from branch_settings where branch_id = $1", [req.auth.branchId]);
+      const claimDays = Number(rows[0]?.sale_prefs?.wastage?.claimDays) || 30;
+      return wastageReport(c, req.auth.branchId, { from: day(req.query.from), to: day(req.query.to), claimDays });
+    });
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
 export default router;
-export { wastageOf, totalsOf };
+export { wastageOf, totalsOf, wastageReport };

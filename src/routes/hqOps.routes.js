@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { withBranch, withoutBranch } from "../db.js";
+import { wastageReport } from "./workshop.routes.js";
 import { authenticateStore, requireCanManageBranches, requireCanSendCoding, requireStoreOwner } from "../middleware/storeAuth.js";
 import { closeMonth, fiscalStatus } from "../domain/periodClose.js";
 import { issueEnrollCode } from "../domain/enroll.js";
@@ -90,6 +91,24 @@ router.post("/store/period-locks", requireCanManageBranches, async (req, res, ne
       out.push({ branchId: b.id, name: b.name, ok: true });
     }
     res.json({ lockAll, lockPosted, branches: out });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// هدر التصنيع لكل فرع (المرجع WastageReportView للإدارة): نسبة الهدر ومسموحها والزائد وأعلى ورشة، والمطالبات المفتوحة
+router.get("/store/wastage", async (req, res, next) => {
+  const day = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || "")) ? String(v) : null);
+  try {
+    const out = [];
+    for (const b of await storeBranches(req.storeAuth.storeId)) {
+      const r = await withBranch(b.id, (c) => wastageReport(c, b.id, { from: day(req.query.from), to: day(req.query.to) }));
+      if (!r.total.jobs && !r.claims.rows.length && !r.receiving.length) continue;
+      out.push({ branchId: b.id, name: b.name, ref: b.ref, ...r.total, top: r.byWorkshop[0] ? { name: r.byWorkshop[0].label, lossPct: r.byWorkshop[0].lossPct } : null,
+        claims: r.claims, receiving: r.receiving.length,
+        allowPct: r.rows.length ? Math.round(r.rows.reduce((a, x) => a + x.allowPct, 0) / r.rows.length * 100) / 100 : 0 });
+    }
+    res.json({ branches: out });
   } catch (err) {
     next(err);
   }
