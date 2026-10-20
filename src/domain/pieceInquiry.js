@@ -18,7 +18,7 @@ async function buildPieceInquiry(client, branchId, codes, { showCost = false } =
   const { rows } = await client.query(
     `select u.id as unit_id, u.code, u.epc, u.sold, u.issued, u.issued_at, u.printed, u.sale_id, u.held, u.held_at, u.held_by, u.held_ref, u.held_note,
             i.id as item_id, i.ref as item_ref, i.karat, i.weight, i.stones_weight, i.cost_per_gram, i.workmanship,
-            i.from_scrap, i.photo_url, i.attrs, i.date_added, i.reserved_for, i.lot_id,
+            i.from_scrap, i.photo_url, i.attrs, i.date_added, coalesce(u.reserved_for, i.reserved_for) as reserved_for, i.lot_id,
             c.name as category, cu.name as coded_by,
             (select count(*)::int from item_units x where x.item_id = i.id) as units_total,
             (select count(*)::int from item_units x where x.item_id = i.id and not x.sold and not x.issued) as units_available,
@@ -40,7 +40,7 @@ async function buildPieceInquiry(client, branchId, codes, { showCost = false } =
        left join customers cust on cust.id = sa.customer_id
        left join gold_issues gi on gi.id = u.issue_id
        left join users gu on gu.id = coalesce(u.issued_by, gi.created_by)
-       left join reservations r on r.id = i.reserved_for
+       left join reservations r on r.id = coalesce(u.reserved_for, i.reserved_for)
        left join customers rc on rc.id = r.customer_id
       where i.branch_id = $1 and (upper(u.code) = any($2::text[]) or upper(u.epc) = any($2::text[]))`,
     [branchId, asked]

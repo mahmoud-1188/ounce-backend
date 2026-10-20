@@ -308,7 +308,7 @@ router.post("/items/units/uncode", authenticate, requireAnyPage("addGoods", "inv
         `select u.id as unit_id, u.code, u.sold, u.issued, u.held, u.printed, u.epc,
                 (u.transfer_id is not null and t.status = 'sent') as in_transfer,
                 i.id as item_id, i.ref, i.weight, i.karat, i.cost_per_gram, i.workmanship, i.lot_workmanship_share,
-                i.remnant, i.remnant_of, i.reserved_for, i.from_scrap,
+                i.remnant, i.remnant_of, coalesce(u.reserved_for, i.reserved_for) as reserved_for, i.from_scrap,
                 l.id as lot_id, l.ref as lot_ref, l.status as lot_status, l.source as lot_source, l.coding_at, l.opening_posted
            from item_units u join items i on i.id = u.item_id
            left join lots l on l.id = i.lot_id

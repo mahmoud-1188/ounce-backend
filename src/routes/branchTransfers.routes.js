@@ -75,7 +75,7 @@ router.post("/branch-transfers", authenticate, requireAnyPage("branchTransfers",
       if (!tb[0]) return { error: "invalid_target_branch" };
       const { rows } = await c.query(
         `select u.id, u.code, u.sold, u.issued, u.held, u.printed, i.id as item_id, i.ref as item_ref, i.karat, i.weight, i.stones_weight,
-                coalesce(i.cost_per_gram, 0) as cpg, coalesce(i.workmanship, 0) as wm, i.reserved_for, i.photo_url, c.name as category, c.sale_mode,
+                coalesce(i.cost_per_gram, 0) as cpg, coalesce(i.workmanship, 0) as wm, coalesce(u.reserved_for, i.reserved_for) as reserved_for, i.photo_url, c.name as category, c.sale_mode,
                 (l.coding_at = 'hq') as at_hq
            from item_units u join items i on i.id = u.item_id join categories c on c.id = i.category_id left join lots l on l.id = i.lot_id
           where i.branch_id = $1 and upper(u.code) = any($2::text[]) for update of u`, [me, codes]);

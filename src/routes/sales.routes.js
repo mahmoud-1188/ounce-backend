@@ -162,12 +162,12 @@ router.post("/sales", async (req, res, next) => {
       // المصدر: حجز القطعة نفسها تلقائيًّا، أو حجزٌ يختاره البائع (reservationId) لهذا العميل.
       const itemIds = [...new Set(resolvedLines.map((l) => l.itemId).filter(Boolean))];
       const { rows: rsvRows } = await client.query(
-        `select r.*, exists (select 1 from items i where i.reserved_for = r.id and i.id = any($1::uuid[])) as item_in_sale
+        `select r.*, (exists (select 1 from items i where i.reserved_for = r.id and i.id = any($1::uuid[])) or r.id = any($4::uuid[])) as item_in_sale
            from reservations r
           where r.branch_id = $2 and r.status = 'open'
-            and (r.id in (select reserved_for from items where id = any($1::uuid[]) and reserved_for is not null) or r.id = $3)
+            and (r.id in (select reserved_for from items where id = any($1::uuid[]) and reserved_for is not null) or r.id = $3 or r.id = any($4::uuid[]))
           for update of r`,
-        [itemIds, req.auth.branchId, body.reservationId || null]
+        [itemIds, req.auth.branchId, body.reservationId || null, reserved.unitReservations || []]
       );
       if (body.reservationId && !rsvRows.some((r) => r.id === body.reservationId)) return { error: "reservation_not_open" };
       for (const r of rsvRows) {
@@ -453,7 +453,10 @@ router.post("/sales", async (req, res, next) => {
             where id = $1`,
           [r.id, use, done, sale.id]
         );
-        if (done) await client.query("update items set reserved_for = null where reserved_for = $1", [r.id]);
+        if (done) {
+          await client.query("update items set reserved_for = null where reserved_for = $1", [r.id]);
+          await client.query("update item_units set reserved_for = null where reserved_for = $1", [r.id]);
+        }
       }
       if (rsvUse.length) {
         await client.query("update sales set reservation_id = $1, deposit_applied = $2 where id = $3", [rsvUse[0].r.id, depositApplied, sale.id]);

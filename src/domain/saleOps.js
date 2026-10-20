@@ -66,6 +66,8 @@ async function reserveSaleLines(client, branchId, lines, { excludeUnitIds = [] }
   const resolvedLines = [];
   let subtotal = 0;
   const weightByKarat = new Map();
+  // حجوزات القطع المباعة بعينها — البيع يتحقق أنها لصاحبها ويخصم عربونها
+  const unitReservations = new Set();
 
   for (const line of lines) {
     const { rows: itemRows } = await client.query(
@@ -96,15 +98,16 @@ async function reserveSaleLines(client, branchId, lines, { excludeUnitIds = [] }
     }
     const { rows: unsoldRows } = codes.length
       ? await client.query(
-        `select id from item_units
+        `select id, reserved_for from item_units
           where item_id = $1 and sold = false and issued = false
             and upper(code) = any($2::text[])
             and not (id = any($3::uuid[]))`,
         [item.id, codes.map((c) => c.toUpperCase()), excludeUnitIds]
       )
       : await client.query(
+        // القطعة المحجوزة بعينها لا تُختار تلقائيًّا — تُباع لصاحب حجزها بمسح رمزها (migration 088)
         `select id from item_units
-          where item_id = $1 and sold = false and issued = false
+          where item_id = $1 and sold = false and issued = false and reserved_for is null
             and not (id = any($3::uuid[]))
           order by held desc, code limit $2`,
         [item.id, line.quantity, excludeUnitIds]
@@ -122,6 +125,7 @@ async function reserveSaleLines(client, branchId, lines, { excludeUnitIds = [] }
     }
     // القطعة المعلّقة من الوضع الخفي تُباع أولًا — البيع يُكمِلها (migration 047)، ويبقى أثرها (held_ref)
     await client.query(`update item_units set sold = true, held = false where id = any($1::uuid[])`, [unsoldRows.map((r) => r.id)]);
+    unsoldRows.forEach((r) => { if (r.reserved_for) unitReservations.add(r.reserved_for); });
 
     subtotal += Number(line.unitPrice) * Number(line.quantity);
     const lineWeight = Number(item.weight) * Number(line.quantity);
@@ -140,7 +144,7 @@ async function reserveSaleLines(client, branchId, lines, { excludeUnitIds = [] }
       unitIds: unsoldRows.map((r) => r.id),
     });
   }
-  return { resolvedLines, subtotal, weightByKarat };
+  return { resolvedLines, subtotal, weightByKarat, unitReservations: [...unitReservations] };
 }
 
 // ⚠ line_no صريح (migration 013): الفهرس عند الإرجاع يطابق ترتيب الشاشة.
