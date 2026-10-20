@@ -193,8 +193,9 @@ async function removeBranchUser(client, branchId, userId, actor = {}) {
   if (wouldRemoveLastManager(existing, userId)) {
     return { error: "would_remove_last_manager" };
   }
+  // حذفٌ حقيقي (منطقي): يخرج من القوائم كلها ولا يُعاد تفعيله — التعطيل في setBranchUserActive
   const { rowCount } = await client.query(
-    `update users set active = false where id = $1 and branch_id = $2`,
+    `update users set active = false, deleted_at = now() where id = $1 and branch_id = $2 and deleted_at is null`,
     [userId, branchId]
   );
   if (!rowCount) return { error: "not_found" };
@@ -235,7 +236,7 @@ async function resetBranchUserPin(client, branchId, userId, pin, actor = {}) {
  */
 async function setBranchUserActive(client, branchId, userId, active, actor = {}) {
   const { rows } = await client.query(
-    "select id, name, role, active from users where id = $1 and branch_id = $2",
+    "select id, name, role, active from users where id = $1 and branch_id = $2 and deleted_at is null",
     [userId, branchId]
   );
   const u = rows[0];

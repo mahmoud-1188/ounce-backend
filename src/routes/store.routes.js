@@ -589,7 +589,7 @@ router.get("/store/branches/:branchId/users", requireCanManageBranches, async (r
       const { rows } = await withBranch(req.params.branchId, (client) =>
         client.query(
           `select id, name, ref, role, salary, can_use_ai, allowed_pages, active, created_at
-             from users where branch_id = $1 and active = false order by name`,
+             from users where branch_id = $1 and active = false and deleted_at is null order by name`,
           [req.params.branchId]
         )
       );
