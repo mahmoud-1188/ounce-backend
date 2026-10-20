@@ -7,3 +7,6 @@ alter table users add column if not exists action_revoke text[] not null default
 alter table permission_log drop constraint if exists permission_log_kind_check;
 alter table permission_log add constraint permission_log_kind_check
   check (kind in ('create','delete','role','pages','reset','ai','rename','enroll','pin','activate','actions','device_revoke'));
+
+-- رمز القطعة المحجوزة بعينها (يُمسح عند الحجز) — يظهر على الحجز وعند التسليم
+alter table reservations add column if not exists unit_codes text[] not null default '{}';
