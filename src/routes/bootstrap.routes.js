@@ -215,6 +215,7 @@ router.get("/bootstrap", async (req, res, next) => {
       (client) =>
         client.query(
           `select u.id, u.name, u.ref, u.role, u.can_use_ai, u.allowed_pages, u.active, u.created_at,
+                  u.action_grant, u.action_revoke, u.must_change_pin,
                   r.allowed_tabs, r.allowed_more
              from users u join roles r on r.id = u.role
             where u.branch_id = $1 and u.active = true

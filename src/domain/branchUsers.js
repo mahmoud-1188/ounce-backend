@@ -16,10 +16,14 @@
 // تفتح معاملتها الخاصة) — لتبقى قابلة للتركيب مع أي معاملة أعلى مستقبلًا.
 
 import { isHiddenPin } from "./hiddenMode.js";
+import { HQ_ACTIONS } from "./hqPolicy.js";
 import { hashPin, verifyPin } from "../auth/hashPin.js";
 import { diffPages, logPermission } from "./permissionLog.js";
 import { normalizeName } from "../auth/normalizeName.js";
 import { currentAllowed, wouldLockOutAccess, wouldRemoveLastManager } from "../auth/permissions.js";
+
+// الأفعال التي تقبل استثناءً للشخص — ما يفرضه الخادم وحده (requireNotDenied)
+const ACTION_IDS = new Set(HQ_ACTIONS.map((a) => a.id));
 
 // ⚠ رمز موظف قصير (4 محارف) ليُقال ويُكتب بسهولة على أرض المحل — أقصر
 // عمدًا من رمز الفرع (BR-XXXXXXXX، ثماني محارف): الفرع يُنشأ نادرًا
@@ -165,6 +169,24 @@ async function setBranchUserPermissions(client, branchId, userId, allowedPages, 
   return { user: rows[0] };
 }
 
+/** PATCH .../actions — استثناءات الأفعال لهذا الشخص فوق دوره (migration 086). */
+async function setBranchUserActions(client, branchId, userId, { grant = [], revoke = [] } = {}, actor = {}) {
+  const clean = (xs) => [...new Set((Array.isArray(xs) ? xs : []).map(String).filter((a) => ACTION_IDS.has(a)))];
+  const g = clean(grant), r = clean(revoke).filter((a) => !g.includes(a));
+  const { rows: cur } = await client.query("select id, name, action_grant, action_revoke from users where id = $1 and branch_id = $2 and active = true", [userId, branchId]);
+  if (!cur[0]) return { error: "not_found" };
+  const { rows } = await client.query(
+    `update users set action_grant = $1, action_revoke = $2 where id = $3 and branch_id = $4
+     returning id, action_grant, action_revoke`,
+    [g, r, userId, branchId]
+  );
+  await logPermission(client, branchId, {
+    targetId: userId, targetName: cur[0].name, kind: "actions",
+    before: { grant: cur[0].action_grant, revoke: cur[0].action_revoke }, after: { grant: g, revoke: r }, actor,
+  });
+  return { user: rows[0] };
+}
+
 /** DELETE — يُطابق remove() حرفيًّا (يرفض حذف آخر manager، تعطيلٌ منطقي لا حذف). */
 async function removeBranchUser(client, branchId, userId, actor = {}) {
   const existing = await loadBranchUsersWithRoles(client, branchId);
@@ -236,6 +258,7 @@ export {
   renameBranchUser,
   setBranchUserAi,
   setBranchUserPermissions,
+  setBranchUserActions,
   removeBranchUser,
   resetBranchUserPin,
   setBranchUserActive,
