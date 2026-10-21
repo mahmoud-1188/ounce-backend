@@ -27,6 +27,9 @@ function cleanProfile(p) {
   return { profile: out };
 }
 
+// حدود الاعتماد التي تُجهَّز للفرع من الإدارة (من المبلغ فأكثر يحتاج اعتمادًا)
+const PROVISION_THRESHOLD_KINDS = ["expense", "refund", "supplier_settle", "asset_purchase", "payroll_run", "journal_reverse", "count_variance", "safe_audit", "workshop_wastage"];
+
 function cleanSettings(s = {}) {
   const server = {};
   if (s.taxEnabled != null) server.taxEnabled = !!s.taxEnabled;
@@ -42,7 +45,7 @@ function cleanSettings(s = {}) {
   if (s.approvalsEnabled != null) server.approvalsEnabled = !!s.approvalsEnabled;
   if (s.approvalThresholds != null) {
     const t = {};
-    for (const k of ["expense", "refund", "supplier_settle"]) {
+    for (const k of PROVISION_THRESHOLD_KINDS) {
       if (s.approvalThresholds[k] == null || s.approvalThresholds[k] === "") continue;
       const n = Number(s.approvalThresholds[k]);
       if (!Number.isFinite(n) || n < 0) return { error: "invalid_thresholds", kind: k };
