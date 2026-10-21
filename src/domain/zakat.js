@@ -115,7 +115,9 @@ function computeZakat(x, { price24 = 0, year = "gregorian" } = {}) {
   const goldH = toH(goldFine * p), recvGoldH = toH(recvFine * p), owedH = toH(owedFine * p);
   const cashH = toH(x.cash), recvH = toH(Math.max(0, num(x.receivables))), liabH = toH(Math.max(0, num(x.liabilities)));
   const wkH = toH(Math.max(0, num(x.workmanship)));
-  const baseH = Math.max(0, cashH + recvH + goldH + wkH + recvGoldH - liabH - owedH);
+  // الوعاء قبل حدّه بالصفر — يحتاجه الإقرار الموحّد: دفترٌ عليه أكثر ممّا له يُنقص وعاء المجموعة
+  const rawH = cashH + recvH + goldH + wkH + recvGoldH - liabH - owedH;
+  const baseH = Math.max(0, rawH);
   const rate = year === "hijri" ? ZAKAT_RATE_HIJRI : ZAKAT_RATE_GREGORIAN;
   return {
     asOf: x.asOf || null, year: year === "hijri" ? "hijri" : "gregorian", rate, price24: p,
@@ -125,7 +127,7 @@ function computeZakat(x, { price24 = 0, year = "gregorian" } = {}) {
     workmanship: fromH(wkH), pieces: Math.max(0, Math.round(num(x.pieces))),
     goldRecvFine: recvFine, goldRecvValue: fromH(recvGoldH),
     liabilities: fromH(liabH), goldOwedFine: owedFine, goldOwedValue: fromH(owedH),
-    base: fromH(baseH), due: fromH(Math.round(baseH * rate)),
+    base: fromH(baseH), due: fromH(Math.round(baseH * rate)), rawBase: fromH(rawH),
   };
 }
 

@@ -1,7 +1,7 @@
 import { Router } from "express";
 import crypto from "node:crypto";
 import { withoutBranch, withBranch } from "../db.js";
-import { computeZakat, zakatInputs } from "../domain/zakat.js";
+import { ZAKAT_RATE_GREGORIAN, ZAKAT_RATE_HIJRI, computeZakat, zakatInputs } from "../domain/zakat.js";
 import { authenticateStore, requireStoreOwner, requireCanManageBranches, requireCanSendCoding } from "../middleware/storeAuth.js";
 import { buildConsolidatedReport } from "../domain/consolidatedReport.js";
 import { branchNetWeights } from "../domain/netWeight.js";
@@ -117,14 +117,15 @@ router.get("/store/net-weight", async (req, res, next) => {
 /**
  * GET /api/store/zakat?price24=… — زكاة الفروع الموحّدة (المرجع 5.2.0: HqZakatReport · قرار المالك 2026-09-29).
  * كل فرعٍ على سطره بالدالّة نفسها التي في الفرع، من سجلّاته على الخادم وبسعر الإدارة اليوم،
- * ثم إجمالي المجموعة. فرعٌ أطفأ الزكاة «متوقفة» خارج المجموع. المجموع جمع زكاة كل دفتر —
- * لا زكاة وعاءٍ موحّد: فرعٌ التزاماته أكبر من أصوله لا يُنقص زكاة غيره.
+ * ثم إجمالي المجموعة. فرعٌ أطفأ الزكاة «متوقفة» خارج المجموع. الزكاة على المنشأة كلّها (المرجع الجديد —
+ * قرار المالك 2026-10-21): وعاء المجموعة = مجموع أوعية الدفاتر قبل حدّها بالصفر (فرعٌ عليه أكثر ممّا له يُنقصه)،
+ * ثم الزكاة من هذا الوعاء الواحد. أرقام كل فرعٍ للعرض وحده، ومجموع زكاة الدفاتر منفردةً يُعرض للمقارنة.
  */
 router.get("/store/zakat", async (req, res, next) => {
   const price24 = Math.max(0, Number(req.query.price24) || 0);
   try {
     const branches = await withoutBranch(async (client) => (await client.query(
-      `select id, ref, name from branches where store_id = $1 and deleted_at is null order by name`, [req.storeAuth.storeId])).rows);
+      `select id, ref, name, is_hq from branches where store_id = $1 and deleted_at is null order by name`, [req.storeAuth.storeId])).rows);
     const lines = [];
     for (const b of branches) {
       try {
@@ -134,7 +135,7 @@ router.get("/store/zakat", async (req, res, next) => {
           const year = rows[0]?.zakat_year === "hijri" ? "hijri" : "gregorian";
           if (!on) return { branchId: b.id, ref: b.ref, name: b.name, status: "off", year };
           const z = computeZakat(await zakatInputs(client, b.id), { price24, year });
-          return { branchId: b.id, ref: b.ref, name: b.name, status: "ok", year, z };
+          return { branchId: b.id, ref: b.ref, name: b.name, status: "ok", year, z, isHq: !!b.is_hq };
         }));
       } catch (err) {
         console.error("store zakat branch failed", b.id, err.message);
@@ -150,7 +151,15 @@ router.get("/store/zakat", async (req, res, next) => {
         goldFine: Math.round(counted.reduce((a, l) => a + l.z.goldFine, 0) * 1000) / 1000,
         workmanship: sumH((z) => z.workmanship), goldRecvValue: sumH((z) => z.goldRecvValue),
         liabilities: sumH((z) => z.liabilities), goldOwedValue: sumH((z) => z.goldOwedValue),
-        base: sumH((z) => z.base), due: sumH((z) => z.due),
+        ...(() => {
+          // سنة الإدارة (الفرع الرئيسي)، وبلاها سنة الدفاتر إن اتّفقت وإلا الميلادية — فلا تتغيّر النسبة بترتيب الفروع
+          const hq = counted.find((l) => l.isHq);
+          const years = new Set(counted.map((l) => l.year));
+          const year = hq ? hq.year : years.size === 1 ? [...years][0] : "gregorian";
+          const rate = year === "hijri" ? ZAKAT_RATE_HIJRI : ZAKAT_RATE_GREGORIAN;
+          const base = Math.max(0, sumH((z) => z.rawBase));
+          return { base, due: Math.round(base * rate * 100) / 100, rate, year, perBookBase: sumH((z) => z.base), perBookDue: sumH((z) => z.due) };
+        })(),
       },
       counted: counted.length, off: lines.filter((l) => l.status === "off").length, errors: lines.filter((l) => l.status === "error").length,
     });
