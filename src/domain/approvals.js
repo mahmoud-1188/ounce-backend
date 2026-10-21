@@ -17,6 +17,8 @@ import { branchDelegation } from "./delegation.js";
 //   ومن هو أعلى معتمِدٍ في الفرع (المدير) يُرفع طلبه إلى الإدارة.
 // وهدر الورشة فوق المسموح: يعتمده غير من سجّله (والمدير يرفعه للإدارة)
 const NO_SELF_KINDS = ["count_variance", "workshop_wastage"];
+// ما يجوز للإدارة أن تجعله «بلا موافقة» من «من يعتمد ماذا»
+const ROUTABLE_NONE = ["label_reprint"];
 // مهلة الطلب المعلّق (المرجع ت٢): بعدها يُعلَّم «انتهت مهلته» ولا يُقرَّر ولا يُنفَّذ
 const APPROVAL_EXPIRY_HOURS = 72;
 
@@ -68,12 +70,18 @@ async function approvalGate(client, auth, { kind, amount, payload = null, approv
     "select s.approval_routing from branches b join stores s on s.id = b.store_id where b.id = $1",
     [branchId]
   );
+  // «بلا موافقة» (للأنواع التي تسمح بها الإدارة — إعادة طباعة الملصق): يمضي ويُدوَّن في سجلّ العملية نفسها
+  if (rt[0]?.approval_routing?.[kind] === "none" && ROUTABLE_NONE.includes(kind)) return { proceed: true };
   // «تفويض كامل للفرع»: لا شيء يصعد للإدارة، والمعتمِد في الفرع يعتمد ما يطلبه
   const noSelf = NO_SELF_KINDS.includes(kind) && !deleg.full;
   // من لا يعتمد نفسه وهو أعلى معتمِدٍ في الفرع: طلبه للإدارة
   const byHq = !deleg.full && (routesToHq(rt[0]?.approval_routing, kind, amt) || (noSelf && auth.role === (rule.approver_role || "manager")));
-  const approverKind = byHq ? "hq" : rule.approver_role || "manager";
-  const selfApprove = !byHq && !noSelf && auth.role === (rule.approver_role || "manager");
+  // حدّ الاعتماد الذاتي (سياسة الإدارة): ما فوقه لا يعتمده صاحبه لنفسه — يصعد لشخصٍ ثانٍ في الإدارة
+  const selfMax = Number(rt[0]?.approval_routing?.selfMax) || 0;
+  const overSelf = selfMax > 0 && amt > selfMax && auth.role === (rule.approver_role || "manager") && !deleg.full;
+  const toHq = byHq || overSelf;
+  const approverKind = toHq ? "hq" : rule.approver_role || "manager";
+  const selfApprove = !toHq && !noSelf && auth.role === (rule.approver_role || "manager");
   const { rows: apRows } = await client.query(
     `insert into approvals
        (branch_id, rule_id, status, requested_by, ref, amount, payload, note,
@@ -141,12 +149,21 @@ async function loadBranchApprovalRouting(client, branchId) {
 }
 
 /** يُعلّم المعلّق الذي تجاوز مهلته — يُستدعى قبل القراءة والقرار، فلا حاجة لمهمّةٍ دورية. */
+// مهلة الطلب بالساعات: من سياسة الإدارة («من يعتمد ماذا») وإلا 72
+async function approvalExpiryHours(client, branchId) {
+  const { rows } = await client.query(
+    "select s.approval_routing from branches b join stores s on s.id = b.store_id where b.id = $1", [branchId]);
+  const h = Number(rows[0]?.approval_routing?.expiryHours);
+  return h >= 1 && h <= 720 ? h : APPROVAL_EXPIRY_HOURS;
+}
+
 async function expireStaleApprovals(client, branchId) {
+  const hours = await approvalExpiryHours(client, branchId);
   await client.query(
     `update approvals set status = 'expired', decision_note = coalesce(decision_note, 'انتهت مهلة الطلب')
       where branch_id = $1 and status = 'pending' and created_at < now() - ($2 || ' hours')::interval`,
-    [branchId, String(APPROVAL_EXPIRY_HOURS)]
+    [branchId, String(hours)]
   );
 }
 
-export { APPROVAL_EXPIRY_HOURS, NO_SELF_KINDS, expireStaleApprovals, approvalGate, shapeApproval, loadBranchApprovalRouting, routesToHq };
+export { ROUTABLE_NONE, APPROVAL_EXPIRY_HOURS, approvalExpiryHours, NO_SELF_KINDS, expireStaleApprovals, approvalGate, shapeApproval, loadBranchApprovalRouting, routesToHq };

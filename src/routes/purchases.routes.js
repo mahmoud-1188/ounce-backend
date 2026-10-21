@@ -149,6 +149,9 @@ async function handleCreatePurchase(req, res, next) {
       const subtotal = roundMoney(built.reduce((a, l) => a + l.goldCost, 0));
       const workmanshipTotalSum = roundMoney(built.reduce((a, l) => a + l.workmanshipTotal, 0));
       const grandTotal = roundMoney(subtotal + workmanshipTotalSum);
+      // ضريبة المدخلات على فاتورة المورد (migration 089) — فوق الإجمالي، تُقيَّد على 1360 من مصدر السداد نفسه
+      const inputVat = roundMoney(body.inputVat || 0);
+      if (inputVat < 0) return { error: "invalid_input_vat" };
       const totalWeight = built.reduce((a, l) => a + l.weight, 0);
       const totalFineWeight = built.reduce((a, l) => a + fineWeight(l.weight, l.karat), 0);
 
@@ -164,14 +167,14 @@ async function handleCreatePurchase(req, res, next) {
            (branch_id, ref, supplier_id, business_day_id, payment_method, office_id,
             scrap_karat, scrap_weight, pay_fees_now, invoice_pending, notes,
             subtotal, workmanship_total, grand_total, total_weight, total_fine_weight,
-            created_by)
-         values ($1,$2,$3,$4,$5,$6, $7,$8,$9,$10,$11, $12,$13,$14,$15,$16, $17)
+            created_by, input_vat)
+         values ($1,$2,$3,$4,$5,$6, $7,$8,$9,$10,$11, $12,$13,$14,$15,$16, $17, $18)
          returning id, ref`,
         [
           req.auth.branchId, ref, supplierId, businessDayId, paymentMethod, officeId || null,
           scrapKarat, scrapWeight, payFeesNow, body.invoicePending !== false, notes || null,
           subtotal, workmanshipTotalSum, grandTotal, totalWeight, totalFineWeight,
-          req.auth.userId,
+          req.auth.userId, inputVat,
         ]
       );
       const purchase = purchaseRows[0];
@@ -384,6 +387,39 @@ async function handleCreatePurchase(req, res, next) {
         }
       }
 
+      // ── ضريبة المدخلات: قيدٌ منفصل من مصدر السداد — نقدٌ يخرج، أو آجلٌ على المورد/المكتب ──
+      let inputVatJournalEntryId = null;
+      if (inputVat > 0) {
+        const vatCredit = { safe_cash: "1110", safe_network: "1120", deferred: "2120", office: "2130", scrap: "1110" }[paymentMethod];
+        if (paymentMethod === "safe_cash" || paymentMethod === "safe_network" || paymentMethod === "scrap") {
+          const method = paymentMethod === "safe_network" ? "network" : "cash";
+          const avail = await poolBalance(client, req.auth.branchId, "safe", method);
+          if (inputVat > avail + 0.005) return { error: "insufficient_safe_balance", method, available: avail, requested: inputVat };
+          await client.query(
+            `insert into cash_tx
+               (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
+             values ($1,$2,'safe',$3,'out',$4,'purchase_vat','purchases',$5,$6,$7)`,
+            [req.auth.branchId, businessDayId, method, inputVat, purchase.id, `${label} — ضريبة المدخلات`, req.auth.userId]);
+        } else if (paymentMethod === "deferred") {
+          await client.query(
+            `insert into supplier_ledger
+               (branch_id, supplier_id, business_day_id, direction, gold_fine_grams, fees_amount, ref_table, ref_id, note, created_by)
+             values ($1,$2,$3,'increase',0,$4,'purchases',$5,$6,$7)`,
+            [req.auth.branchId, supplierId, businessDayId, inputVat, purchase.id, `${label} — ضريبة المدخلات`, req.auth.userId]);
+        } else if (paymentMethod === "office") {
+          await client.query(
+            `insert into taskir_office_tx
+               (branch_id, office_id, business_day_id, direction, amount, kind, ref_table, ref_id, note, created_by)
+             values ($1,$2,$3,'in',$4,'cash','purchases',$5,$6,$7)`,
+            [req.auth.branchId, officeId, businessDayId, inputVat, purchase.id, `${label} — ضريبة المدخلات`, req.auth.userId]);
+        }
+        inputVatJournalEntryId = await postJournalEntry(client, {
+          branchId: req.auth.branchId, businessDayId, opType: "purchase_input_vat", refTable: "purchases", refId: purchase.id,
+          description: `${label} — ضريبة المدخلات ${purchase.ref}`, createdBy: req.auth.userId,
+          lines: [{ account: "1360", side: "debit", amount: inputVat }, { account: vatCredit, side: "credit", amount: inputVat }],
+        });
+      }
+
       await client.query(
         `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details)
          values ($1,'create',$2,'purchases',$3,$4)`,
@@ -394,6 +430,7 @@ async function handleCreatePurchase(req, res, next) {
         purchase: { id: purchase.id, ref: purchase.ref, grandTotal, totalWeight, totalFineWeight, paymentMethod },
         purchaseJournalEntryId,
         workmanshipJournalEntryId,
+        inputVatJournalEntryId,
       };
     });
 

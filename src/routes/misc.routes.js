@@ -177,7 +177,7 @@ router.post("/reservations", async (req, res, next) => {
       let unitCodes = [];
       if (body.itemId && body.unitCode) {
         const { rows: uRows } = await client.query(
-          "select code from item_units where item_id = $1 and upper(code) = upper($2) and not sold and not issued",
+          "select code from item_units where item_id = $1 and upper(code) = upper($2) and not sold and not issued and reserved_for is null",
           [body.itemId, String(body.unitCode)]
         );
         if (!uRows[0]) return { error: "unit_not_available" };
@@ -214,8 +214,10 @@ router.post("/reservations", async (req, res, next) => {
         });
       }
 
-      // القطعة تُحجز فلا تُباع لغيره.
-      if (body.itemId) {
+      // القطعة الممسوحة تُحجز وحدها وباقي الصنف يُباع؛ وبلا قطعةٍ بعينها يُحجز الصنف كما كان
+      if (body.itemId && unitCodes.length) {
+        await client.query(`update item_units set reserved_for = $1 where item_id = $2 and code = any($3::text[])`, [reservation.id, body.itemId, unitCodes]);
+      } else if (body.itemId) {
         await client.query(`update items set reserved_for = $1 where id = $2`, [reservation.id, body.itemId]);
       }
 
@@ -331,6 +333,7 @@ router.post("/reservations/:id/cancel", async (req, res, next) => {
 
       if (reservation.item_id) {
         await client.query(`update items set reserved_for = null where id = $1`, [reservation.item_id]);
+        await client.query(`update item_units set reserved_for = null where reserved_for = $1`, [reservation.id]);
       }
 
       return { ok: true, refunded: refund, forfeited: !refund ? depositLeft : 0, forfeitEntryId, cashTx: cashResult?.cashTx || null };
@@ -803,6 +806,7 @@ router.post(
         if (restocked.error) return restocked;
         const reserved = await reserveSaleLines(client, req.auth.branchId, newLines, { excludeUnitIds: restocked.unitIds });
         if (reserved.error) return reserved;
+        if ((reserved.unitReservations || []).length) return { error: "item_reserved_for_other" };
 
         const { rows: settingsRows } = await client.query(
           "select tax_rate from branch_settings where branch_id = $1",

@@ -3,7 +3,7 @@ import { withBranch, withoutBranch } from "../db.js";
 import { authenticateStore, requireCanManageBranches } from "../middleware/storeAuth.js";
 import { roundMoney } from "../domain/money.js";
 import { roundWeight } from "../domain/weight.js";
-import { shapeApproval } from "../domain/approvals.js";
+import { ROUTABLE_NONE, shapeApproval } from "../domain/approvals.js";
 import { monthRange, recordedNetworkFees, settleBankFeePeriod } from "../domain/bankFees.js";
 import { buildServerReviewQueue } from "../domain/reviewQueueServer.js";
 import { postManualAdjustment, reverseJournalEntry } from "../domain/journalOps.js";
@@ -248,8 +248,33 @@ router.get("/store/consolidated", async (req, res, next) => {
       .sort((a, b) => a.code.localeCompare(b.code));
     const goldBy = new Map(out.gold.map((g) => [g.branch_id, roundWeight(g.net)]));
     const statBy = new Map(out.stats.map((s) => [s.branch_id, s]));
+    // النتيجة بالريال — الفروع ثم الإدارة (المرجع HqConsolidatedView): الإيراد 4 ناقص التكلفة والمصروف 5 و6 لكل دفتر،
+    // ثم ربح الفروع قبل مصروفات الإدارة، ومصروفات الإدارة المركزية، وربح المجموعة. الأرقام تراكمية حتى «إلى».
+
+    const plOf = (bid) => {
+      let rev = 0, exp = 0;
+      for (const r of out.bal.filter((x) => x.branch_id === bid)) {
+        const cr = Number(r.credit) - Number(r.debit);
+        if (String(r.code).startsWith("4")) rev += cr;
+        else if (/^[56]/.test(String(r.code))) exp -= cr;
+      }
+      return { revenue: roundMoney(rev), expenses: roundMoney(exp), profit: roundMoney(rev - exp) };
+    };
+    const plRows = branches.map((b) => ({ id: b.id, name: b.name, isHq: !!b.is_hq, ...plOf(b.id) }));
+    const sum = (arr, k) => roundMoney(arr.reduce((a, x) => a + x[k], 0));
+    const brRows = plRows.filter((r) => !r.isHq), hqRow = plRows.find((r) => r.isHq) || null;
+    const pl = {
+      rows: plRows, branchesProfit: sum(brRows, "profit"),
+      hqExpenses: hqRow ? hqRow.expenses : 0, hqRevenue: hqRow ? hqRow.revenue : 0,
+      groupProfit: sum(plRows, "profit"), withHq: !!hqRow,
+    };
+    // ما بين الإدارة والفروع — يُستبعد من الموحّد: ما أرسله دفترٌ واستلمه آخر يتقابل، والباقي «في الطريق» فعلًا
+    const ic = ["1170", "1350", "2140"].map((code) => {
+      const a = byAcc.get(code);
+      return a ? { code, name: a.name, total: a.total, branches: a.branches } : null;
+    }).filter(Boolean);
     res.json({
-      to,
+      to, pl, intercompany: ic,
       branches: branches.map((b) => ({ id: b.id, name: b.name, goldNet: goldBy.get(b.id) || 0,
         entries: statBy.get(b.id)?.entries || 0, lastAt: statBy.get(b.id)?.last_at || null })),
       accounts,
@@ -416,7 +441,7 @@ router.patch("/store/branches/:branchId/target", requireCanManageBranches, async
 });
 
 // ══ ⑥ من يعتمد ماذا + صندوق الاعتمادات ═════════════════════════════════
-const ROUTABLE = ["expense", "refund", "supplier_settle", "asset_purchase", "asset_disposal", "payroll_run"];
+const ROUTABLE = ["expense", "refund", "supplier_settle", "asset_purchase", "asset_disposal", "payroll_run", "label_reprint"];
 
 router.get("/store/approval-routing", async (req, res, next) => {
   try {
@@ -424,10 +449,10 @@ router.get("/store/approval-routing", async (req, res, next) => {
       routing: (await c.query("select approval_routing from stores where id = $1", [req.storeAuth.storeId])).rows[0]?.approval_routing || {},
       rules: (await c.query("select id, label, threshold from approval_rules where id = any($1::text[])", [ROUTABLE])).rows,
     }));
-    res.json({ rules: ROUTABLE.map((id) => {
+    res.json({ selfMax: Number(routing.selfMax) || 0, expiryHours: Number(routing.expiryHours) || 72, rules: ROUTABLE.map((id) => {
       const r = rules.find((x) => x.id === id) || { id, label: id, threshold: 0 };
-      const approver = routing[id] === "hq" ? "hq" : routing[id] === "hq_above" ? "hq_above" : "branch";
-      return { id, label: r.label, threshold: Number(r.threshold) || 0, approver, hqAbove: Number(routing.hqAbove?.[id]) || 0 };
+      const approver = routing[id] === "hq" ? "hq" : routing[id] === "hq_above" ? "hq_above" : routing[id] === "none" && ROUTABLE_NONE.includes(id) ? "none" : "branch";
+      return { id, label: r.label, threshold: Number(r.threshold) || 0, approver, hqAbove: Number(routing.hqAbove?.[id]) || 0, allowNone: ROUTABLE_NONE.includes(id) };
     }) });
   } catch (err) {
     next(err);
@@ -437,8 +462,13 @@ router.get("/store/approval-routing", async (req, res, next) => {
 router.put("/store/approval-routing", requireCanManageBranches, async (req, res, next) => {
   const body = req.body?.routing || {};
   const routing = { hqAbove: {} };
+  // حدّ الاعتماد الذاتي (0 = بلا حدّ) ومهلة الطلب بالساعات
+  const selfMax = Number(req.body?.selfMax ?? 0), expiryHours = Number(req.body?.expiryHours ?? 72);
+  if (!(selfMax >= 0) || !(expiryHours >= 1 && expiryHours <= 720)) return res.status(400).json({ error: "invalid_limits" });
+  routing.selfMax = Math.round(selfMax * 100) / 100;
+  routing.expiryHours = Math.round(expiryHours);
   for (const id of ROUTABLE) {
-    routing[id] = ["hq", "hq_above"].includes(body[id]) ? body[id] : "branch";
+    routing[id] = ["hq", "hq_above"].includes(body[id]) ? body[id] : body[id] === "none" && ROUTABLE_NONE.includes(id) ? "none" : "branch";
     if (routing[id] === "hq_above") {
       const lim = Number(body.hqAbove?.[id]);
       if (!(lim > 0)) return res.status(400).json({ error: "invalid_hq_above", kind: id });

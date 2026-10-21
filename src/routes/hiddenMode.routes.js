@@ -27,7 +27,7 @@ router.post("/hidden/hold", authenticate, async (req, res, next) => {
     const result = await withBranch(req.auth.branchId, async (client) => {
       if (await isStocktakeLocked(client, req.auth.branchId)) return { error: "stocktake_locked" };
       const { rows } = await client.query(
-        `select u.id, u.code, u.sold, u.issued, u.held, i.weight, i.reserved_for
+        `select u.id, u.code, u.sold, u.issued, u.held, i.weight, coalesce(u.reserved_for, i.reserved_for) as reserved_for
            from item_units u join items i on i.id = u.item_id
           where i.branch_id = $1 and upper(u.code) = any($2::text[]) for update of u`,
         [req.auth.branchId, codes]

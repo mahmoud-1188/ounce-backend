@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { withBranch, withoutBranch } from "../db.js";
+import { wastageReport } from "./workshop.routes.js";
 import { authenticateStore, requireCanManageBranches, requireCanSendCoding, requireStoreOwner } from "../middleware/storeAuth.js";
 import { closeMonth, fiscalStatus } from "../domain/periodClose.js";
 import { issueEnrollCode } from "../domain/enroll.js";
@@ -24,7 +25,7 @@ router.use("/store", authenticateStore);
 
 async function storeBranches(storeId) {
   const { rows } = await withoutBranch((c) => c.query(
-    "select id, name, ref from branches where store_id = $1 and deleted_at is null order by created_at", [storeId]));
+    "select id, name, ref, is_hq from branches where store_id = $1 and deleted_at is null order by created_at", [storeId]));
   return rows;
 }
 async function inStore(storeId, branchId) {
@@ -35,7 +36,7 @@ router.get("/store/fiscal", async (req, res, next) => {
   try {
     const branches = await storeBranches(req.storeAuth.storeId);
     const out = [];
-    for (const b of branches) out.push({ branchId: b.id, branchName: b.name, branchRef: b.ref, ...(await withBranch(b.id, (c) => fiscalStatus(c, b.id))) });
+    for (const b of branches) out.push({ branchId: b.id, branchName: b.name, branchRef: b.ref, isHq: !!b.is_hq, ...(await withBranch(b.id, (c) => fiscalStatus(c, b.id))) });
     res.json({ branches: out });
   } catch (err) {
     next(err);
@@ -45,9 +46,69 @@ router.get("/store/fiscal", async (req, res, next) => {
 router.post("/store/branches/:branchId/close-month", requireCanManageBranches, async (req, res, next) => {
   try {
     if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    // إقفال الشهر في دفتر الإدارة يُمنع حتى تُقفل الفروع شهرها — فلا تُقفل المجموعة على أرقامٍ تتحرّك
+    const period = String(req.body?.period || "");
+    const { rows: brs } = await withoutBranch((c) => c.query(
+      "select id, name, is_hq from branches where store_id = $1 and deleted_at is null", [req.storeAuth.storeId]));
+    if (brs.find((b) => b.id === req.params.branchId)?.is_hq) {
+      const open = [];
+      for (const b of brs.filter((x) => !x.is_hq)) {
+        const r = await withBranch(b.id, async (c) => {
+          const { rows: [m] } = await c.query(
+            `select exists (select 1 from journal_entries where branch_id = $1 and to_char(created_at at time zone 'Asia/Riyadh', 'YYYY-MM') = $2) as has,
+                    exists (select 1 from period_closes where branch_id = $1 and period = $2) as closed`, [b.id, period]);
+          return m;
+        });
+        if (r.has && !r.closed) open.push(b.name);
+      }
+      if (open.length) return res.status(409).json({ error: "branches_not_closed", branches: open });
+    }
     const r = await withBranch(req.params.branchId, (c) => closeMonth(c, req.params.branchId, String(req.body?.period || ""), { by: `الإدارة — ${req.storeAuth.name || ""}`.trim(), kind: "store" }));
     if (r.error) return res.status(r.error === "invalid_period" ? 400 : 409).json(r);
     res.status(201).json(r);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// قفل الفترات لكل الفروع من الإدارة: «نهائي» لا يُسجَّل شيءٌ بتاريخه أو قبله، «جزئي» ما قبله للمدير وحده.
+// يُحفظ قفلًا للإدارة بجانب قفل الفرع (النافذ أبعدهما)، وتفريغه يرفع قفل الإدارة وحده.
+router.post("/store/period-locks", requireCanManageBranches, async (req, res, next) => {
+  const d = (v) => (v == null || v === "" ? null : /^\d{4}-\d{2}-\d{2}$/.test(String(v)) ? String(v) : undefined);
+  const lockAll = d(req.body?.lockAll), lockPosted = d(req.body?.lockPosted);
+  if (lockAll === undefined || lockPosted === undefined) return res.status(400).json({ error: "invalid_lock_date" });
+  try {
+    const out = [];
+    for (const b of await storeBranches(req.storeAuth.storeId)) {
+      await withBranch(b.id, async (c) => {
+        await c.query(
+          `insert into branch_settings (branch_id, hq_lock_all, hq_lock_posted) values ($1,$2,$3)
+           on conflict (branch_id) do update set hq_lock_all = excluded.hq_lock_all, hq_lock_posted = excluded.hq_lock_posted`,
+          [b.id, lockAll, lockPosted]);
+        await c.query(`insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'update',null,'branch_settings',null,$2)`,
+          [b.id, JSON.stringify({ hqPeriodLock: { lockAll, lockPosted }, by: req.storeAuth.name || "الإدارة" })]);
+      });
+      out.push({ branchId: b.id, name: b.name, ok: true });
+    }
+    res.json({ lockAll, lockPosted, branches: out });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// هدر التصنيع لكل فرع (المرجع WastageReportView للإدارة): نسبة الهدر ومسموحها والزائد وأعلى ورشة، والمطالبات المفتوحة
+router.get("/store/wastage", async (req, res, next) => {
+  const day = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || "")) ? String(v) : null);
+  try {
+    const out = [];
+    for (const b of await storeBranches(req.storeAuth.storeId)) {
+      const r = await withBranch(b.id, (c) => wastageReport(c, b.id, { from: day(req.query.from), to: day(req.query.to) }));
+      if (!r.total.jobs && !r.claims.rows.length && !r.receiving.length) continue;
+      out.push({ branchId: b.id, name: b.name, ref: b.ref, ...r.total, top: r.byWorkshop[0] ? { name: r.byWorkshop[0].label, lossPct: r.byWorkshop[0].lossPct } : null,
+        claims: r.claims, receiving: r.receiving.length,
+        allowPct: r.rows.length ? Math.round(r.rows.reduce((a, x) => a + x.allowPct, 0) / r.rows.length * 100) / 100 : 0 });
+    }
+    res.json({ branches: out });
   } catch (err) {
     next(err);
   }
@@ -62,19 +123,64 @@ router.get("/store/branches/:branchId/stocktake-sheet", requireCanManageBranches
          from items i left join categories cat on cat.id = i.category_id left join item_units u on u.item_id = i.id
         where i.branch_id = $1 group by i.id, cat.name
        having count(u.id) filter (where not u.sold and not u.issued) > 0 order by cat.name, i.ref`, [req.params.branchId])).rows);
-    res.json({ items: rows.map((r) => ({ id: r.id, ref: r.ref, category: r.category, karat: r.karat, weight: Number(r.weight), expected: r.expected })) });
+    // رموز القطع الحرّة لكل صنف — العدّ بالمسح يطابقها، والقفل وآخر الجرود ليرى المسؤول حال الفرع
+    const extra = await withBranch(req.params.branchId, async (c) => ({
+      units: (await c.query(
+        `select u.item_id, u.code, u.epc, u.sold from item_units u join items i on i.id = u.item_id where i.branch_id = $1 and not u.issued`,
+        [req.params.branchId])).rows,
+      lock: (await c.query("select locked, locked_at, locked_by_name, by_hq from stocktake_locks where branch_id = $1", [req.params.branchId])).rows[0] || null,
+      audits: (await c.query(
+        `select created_at, details from audit_log where branch_id = $1 and ref_table = 'stocktake' order by created_at desc limit 8`, [req.params.branchId])).rows,
+    }));
+    const codesOf = new Map();
+    for (const u of extra.units.filter((x) => !x.sold)) codesOf.set(u.item_id, [...(codesOf.get(u.item_id) || []), u.code]);
+    res.json({
+      items: rows.map((r) => ({ id: r.id, ref: r.ref, category: r.category, karat: r.karat, weight: Number(r.weight), expected: r.expected, codes: codesOf.get(r.id) || [] })),
+      sold: extra.units.filter((x) => x.sold).map((x) => x.code),
+      epcs: Object.fromEntries(extra.units.filter((x) => x.epc).map((x) => [String(x.epc).toUpperCase(), x.code])),
+      lock: extra.lock && extra.lock.locked ? { at: extra.lock.locked_at, by: extra.lock.locked_by_name || "الفرع", byHq: !!extra.lock.by_hq } : null,
+      audits: extra.audits.map((a) => ({ at: a.created_at, ...(a.details || {}) })),
+    });
   } catch (err) {
     next(err);
   }
 });
 
 const shapeRst = (r) => ({ id: r.id, ref: r.ref, counts: r.counts || [], note: r.note || "", status: r.status, requestedBy: r.requested_by, requestedAt: r.requested_at,
-  decidedAt: r.decided_at, decidedBy: r.decided_by_name || null, result: r.result || null });
+  decidedAt: r.decided_at, decidedBy: r.decided_by_name || null, result: r.result || null, scan: r.scan || null, applyMode: r.apply_mode || "apply", unlock: r.unlock !== false });
+
+// قفل مخزون الفرع للجرد من الإدارة: يتوقّف بيعه وتحويله حتى يُطبَّق الجرد أو يُفتح القفل
+router.post("/store/branches/:branchId/stocktake-lock", requireCanManageBranches, async (req, res, next) => {
+  const on = !!req.body?.on;
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const by = req.storeAuth.name || "الإدارة";
+    const r = await withBranch(req.params.branchId, async (c) => {
+      const { rows } = await c.query(
+        `insert into stocktake_locks (branch_id, locked, locked_by, locked_at, locked_by_name, by_hq) values ($1,$2,null,$3,$4,$2)
+         on conflict (branch_id) do update set locked = excluded.locked, locked_by = null, locked_at = excluded.locked_at,
+           locked_by_name = excluded.locked_by_name, by_hq = excluded.by_hq
+         returning locked, locked_at, locked_by_name`, [req.params.branchId, on, on ? new Date() : null, on ? `الإدارة — ${by}` : null]);
+      await c.query(`insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'update',null,'stocktake_locks',null,$2)`,
+        [req.params.branchId, JSON.stringify({ hqStocktakeLock: on, by })]);
+      return rows[0];
+    });
+    res.json({ lock: r.locked ? { at: r.locked_at, by: r.locked_by_name, byHq: true } : null });
+  } catch (err) {
+    next(err);
+  }
+});
 
 router.post("/store/branches/:branchId/remote-stocktake", requireCanManageBranches, async (req, res, next) => {
   const counts = (Array.isArray(req.body?.counts) ? req.body.counts : [])
-    .map((x) => ({ itemId: String(x.itemId || ""), countedQty: Number(x.countedQty) }))
+    .map((x) => ({ itemId: String(x.itemId || ""), countedQty: Number(x.countedQty),
+      ...(Array.isArray(x.missingCodes) && x.missingCodes.length ? { missingCodes: x.missingCodes.map((c) => String(c).toUpperCase()).slice(0, 500) } : {}) }))
     .filter((x) => x.itemId);
+  const applyMode = req.body?.applyMode === "report" ? "report" : "apply";
+  const unlock = req.body?.unlock !== false;
+  const sc = req.body?.scan && typeof req.body.scan === "object" ? req.body.scan : null;
+  const scan = sc ? { matched: Number(sc.matched) || 0, missing: (sc.missing || []).map(String).slice(0, 500), unknown: (sc.unknown || []).map(String).slice(0, 200),
+    soldFound: (sc.soldFound || []).map(String).slice(0, 200), expected: Number(sc.expected) || 0 } : null;
   if (!counts.length) return res.status(400).json({ error: "no_entries" });
   if (counts.some((x) => !Number.isInteger(x.countedQty) || x.countedQty < 0)) return res.status(400).json({ error: "invalid_entry" });
   try {
@@ -85,8 +191,9 @@ router.post("/store/branches/:branchId/remote-stocktake", requireCanManageBranch
       if (ok.length !== new Set(counts.map((x) => x.itemId)).size) return { error: "item_not_found" };
       const { rows: [n] } = await c.query("select count(*)::int + 1 as n from remote_stocktakes where branch_id = $1", [req.params.branchId]);
       const { rows } = await c.query(
-        `insert into remote_stocktakes (branch_id, ref, counts, note, requested_by) values ($1,$2,$3,$4,$5) returning *`,
-        [req.params.branchId, `RST-${String(n.n).padStart(4, "0")}`, JSON.stringify(counts), String(req.body?.note || "").slice(0, 300) || null, by]);
+        `insert into remote_stocktakes (branch_id, ref, counts, note, requested_by, scan, apply_mode, unlock) values ($1,$2,$3,$4,$5,$6,$7,$8) returning *`,
+        [req.params.branchId, `RST-${String(n.n).padStart(4, "0")}`, JSON.stringify(counts), String(req.body?.note || "").slice(0, 300) || null, by,
+         scan ? JSON.stringify(scan) : null, applyMode, unlock]);
       await c.query(
         `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'create',null,'remote_stocktakes',$2,$3)`,
         [req.params.branchId, rows[0].id, JSON.stringify({ kind: "remote_stocktake", by, byKind: "store", items: counts.length })]);

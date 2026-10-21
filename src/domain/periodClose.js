@@ -49,12 +49,13 @@ async function fiscalStatus(client, branchId) {
     `select to_char(created_at at time zone '${TZ}', 'YYYY-MM') as p, count(*)::int as n
        from journal_entries where branch_id = $1 group by 1 order by 1`, [branchId]);
   const { rows: closes } = await client.query("select * from period_closes where branch_id = $1 order by period", [branchId]);
-  const { rows: [st] } = await client.query("select lock_all::text as lock_all, lock_posted::text as lock_posted from branch_settings where branch_id = $1", [branchId]);
+  const { rows: [st] } = await client.query("select greatest(lock_all, hq_lock_all)::text as lock_all, greatest(lock_posted, hq_lock_posted)::text as lock_posted, hq_lock_all::text as hq_lock_all, hq_lock_posted::text as hq_lock_posted from branch_settings where branch_id = $1", [branchId]);
   const cur = currentPeriod();
   const closed = new Set(closes.map((c) => c.period));
   return {
     current: cur,
     lockAll: st?.lock_all || null, lockPosted: st?.lock_posted || null,
+    hqLockAll: st?.hq_lock_all || null, hqLockPosted: st?.hq_lock_posted || null,
     months: months.filter((m) => m.p < cur).map((m) => ({ period: m.p, entries: m.n, closed: closed.has(m.p) })),
     closes: closes.map(shapeClose),
   };

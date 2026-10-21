@@ -473,17 +473,18 @@ router.post("/taskir-offices/:officeId/hold/buy", requireManager, async (req, re
           `insert into cash_tx (branch_id, business_day_id, pool, method, direction, amount, category, ref_table, ref_id, note, created_by)
            values ($1,$2,'safe',$3,'out',$4,'office_hold_buy','taskir_offices',$5,$6,$7)`,
           [req.auth.branchId, ctx.businessDayId, method, cost, ctx.office.id, label, req.auth.userId]);
-      } else {
-        // الآجل دَينٌ للمكتب في دفتره بالوزن الصافي — يُسدَّد من «سداد المكتب»
-        await c.query(
-          `insert into taskir_office_tx (branch_id, office_id, business_day_id, direction, kind, amount, weight, karat, ref_table, note, created_by)
-           values ($1,$2,$3,'in','gold',$4,$5,24,'taskir_offices',$6,$7)`,
-          [req.auth.branchId, ctx.office.id, ctx.businessDayId, cost, fine, `${label} — آجل`, req.auth.userId]);
       }
       const { rows: tx } = await c.query(
         `insert into taskir_office_tx (branch_id, office_id, business_day_id, direction, kind, amount, weight, karat, ref_table, note, created_by)
          values ($1,$2,$3,'in','hold',$4,$5,$6,'taskir_offices',$7,$8) returning id`,
         [req.auth.branchId, ctx.office.id, ctx.businessDayId, cost, weight, karat, label, req.auth.userId]);
+      if (source === "deferred") {
+        // الآجل دَينٌ للمكتب في دفتره بالوزن الصافي — مربوطٌ بسطر الإيداع، ويُسدَّد من «سداد المكتب» عامًّا أو بعينه
+        await c.query(
+          `insert into taskir_office_tx (branch_id, office_id, business_day_id, direction, kind, amount, weight, karat, ref_table, ref_id, note, created_by)
+           values ($1,$2,$3,'in','gold',$4,$5,24,'taskir_office_tx',$6,$7,$8)`,
+          [req.auth.branchId, ctx.office.id, ctx.businessDayId, cost, fine, tx[0].id, `${label} — آجل`, req.auth.userId]);
+      }
       await c.query(
         `insert into gold_ledger_entries (branch_id, business_day_id, op_type, karat, weight, fine_weight, from_account, to_account, ref_table, ref_id, note, created_by)
          values ($1,$2,'office_hold_buy',$3,$4,$5,null,'1240','taskir_office_tx',$6,$7,$8)`,
@@ -500,14 +501,14 @@ router.post("/taskir-offices/:officeId/hold/buy", requireManager, async (req, re
 });
 
 // يخرج من المحفوظ بمتوسّط تكلفته: سحبٌ إلى الخزنة أو سدادٌ لمورد
-async function takeFromHolding(c, req, ctx, { karat, weight, note }) {
+async function takeFromHolding(c, req, ctx, { karat, weight, note, supplierId = null }) {
   const hold = (await officeHoldings(c, req.auth.branchId, ctx.office.id)).find((h) => h.karat === karat);
   if (!hold || weight > hold.weight + 0.0005) return { error: "insufficient_holding", available: hold?.weight || 0, requested: weight };
   const cost = roundMoney(weight >= hold.weight - 0.0005 ? hold.cost : hold.costPerGram * weight);
   const { rows: tx } = await c.query(
-    `insert into taskir_office_tx (branch_id, office_id, business_day_id, direction, kind, amount, weight, karat, ref_table, note, created_by)
-     values ($1,$2,$3,'out','hold',$4,$5,$6,'taskir_offices',$7,$8) returning id`,
-    [req.auth.branchId, ctx.office.id, ctx.businessDayId, cost, weight, karat, note, req.auth.userId]);
+    `insert into taskir_office_tx (branch_id, office_id, business_day_id, direction, kind, amount, weight, karat, ref_table, ref_id, note, created_by)
+     values ($1,$2,$3,'out','hold',$4,$5,$6,$7,$8,$9,$10) returning id`,
+    [req.auth.branchId, ctx.office.id, ctx.businessDayId, cost, weight, karat, supplierId ? "suppliers" : "taskir_offices", supplierId, note, req.auth.userId]);
   return { txId: tx[0].id, cost };
 }
 
@@ -552,7 +553,7 @@ router.post("/taskir-offices/:officeId/hold/to-supplier", requireManager, async 
       if (!sp[0]) return { error: "supplier_not_found" };
       const fine = fineWeight(weight, karat);
       const label = `سداد المورد ${sp[0].name} من ذهبنا عند مكتب ${ctx.office.name} — ${weight} جم عيار ${karat}`;
-      const t = await takeFromHolding(c, req, ctx, { karat, weight, note: label });
+      const t = await takeFromHolding(c, req, ctx, { karat, weight, note: label, supplierId });
       if (t.error) return t;
       // دين المورد بالوزن ينخفض بالصافي المسلَّم، والذهب يخرج من 1240 بتكلفته
       await c.query(
@@ -652,16 +653,32 @@ router.post("/taskir-offices/:officeId/settle", requireManager, async (req, res,
       } else {
         const poolMethod = fundingToPoolMethod(source) || (source === "safe_cash" ? { pool: "safe", method: "cash" } : { pool: "safe", method: "network" });
         const priceAtSettle = Number(body.priceAtSettle) || 0;
-        const fine = priceAtSettle > 0 ? roundWeight(amount / priceAtSettle) : 0;
+        let fine = priceAtSettle > 0 ? roundWeight(amount / priceAtSettle) : 0;
+        // سدادُ شراءٍ آجلٍ بعينه: يُطفئ من وزنه بنسبة المبلغ إلى ثمنه — لا بسعر اليوم
+        let forTx = null;
+        if (body.forTxId) {
+          const { rows: ft } = await client.query(
+            `select id, amount, weight from taskir_office_tx where id = $1 and branch_id = $2 and office_id = $3 and direction = 'in' and kind = 'gold' and amount > 0`,
+            [body.forTxId, req.auth.branchId, officeId]);
+          forTx = ft[0];
+          if (!forTx) return { error: "deferred_tx_not_found" };
+          const { rows: paid } = await client.query(
+            `select coalesce(sum(amount), 0) as a from taskir_office_tx where branch_id = $1 and ref_table = 'taskir_office_tx' and ref_id = $2 and direction = 'out'`,
+            [req.auth.branchId, forTx.id]);
+          const left = roundMoney(Number(forTx.amount) - Number(paid[0].a));
+          if (amount > left + 0.005) return { error: "amount_exceeds_deferred", left };
+          fine = roundWeight(Number(forTx.weight) * amount / Number(forTx.amount));
+        }
+        if (!(fine > 0)) return { error: "price_required" };
         // ⚠ سداد المكتب لا يُنزل صندوقه تحت الصفر (المرجع 5.2.0)
         const available = await poolBalance(client, req.auth.branchId, poolMethod.pool, poolMethod.method);
         if (amount > available + 0.005) return { error: "insufficient_pool_balance", available, requested: amount };
         await client.query(
           `insert into taskir_office_tx
              (branch_id, office_id, business_day_id, direction, kind, amount, weight, karat,
-              ref_table, note, created_by)
-           values ($1,$2,$3,'out','cash',$4,$5,24,'taskir_offices',$6,$7)`,
-          [req.auth.branchId, officeId, businessDayId, amount, fine, label, req.auth.userId]
+              ref_table, ref_id, note, created_by)
+           values ($1,$2,$3,'out','cash',$4,$5,24,$6,$7,$8,$9)`,
+          [req.auth.branchId, officeId, businessDayId, amount, fine, forTx ? "taskir_office_tx" : "taskir_offices", forTx?.id || null, label, req.auth.userId]
         );
         // الحساب النقدي بحسب الوعاء: الخزنة 1110/1120 · الصندوق اليومي 1130/1140
         const creditAccount = poolMethod.pool === "daily"

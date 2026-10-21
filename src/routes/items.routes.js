@@ -308,7 +308,7 @@ router.post("/items/units/uncode", authenticate, requireAnyPage("addGoods", "inv
         `select u.id as unit_id, u.code, u.sold, u.issued, u.held, u.printed, u.epc,
                 (u.transfer_id is not null and t.status = 'sent') as in_transfer,
                 i.id as item_id, i.ref, i.weight, i.karat, i.cost_per_gram, i.workmanship, i.lot_workmanship_share,
-                i.remnant, i.remnant_of, i.reserved_for, i.from_scrap,
+                i.remnant, i.remnant_of, coalesce(u.reserved_for, i.reserved_for) as reserved_for, i.from_scrap,
                 l.id as lot_id, l.ref as lot_ref, l.status as lot_status, l.source as lot_source, l.coding_at, l.opening_posted
            from item_units u join items i on i.id = u.item_id
            left join lots l on l.id = i.lot_id
@@ -401,6 +401,111 @@ router.post("/lots/:id/send-to-hq", async (req, res, next) => {
       await client.query(`insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'update',$2,'lots',$3,$4)`,
         [req.auth.branchId, req.auth.userId, lot.id, JSON.stringify({ sentToHq: lot.ref })]);
       return { lot: up[0] };
+    });
+    if (result.error) return res.status(result.error === "lot_not_found" ? 404 : 409).json(result);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/// تكويدٌ بالجرام بلا مورد (باقة «بدون محاسبة»): كل قطعةٍ بعيارها ووزنها وعددها فقط — لا دفعة ولا تكلفة ولا مصنعية
+/// ولا قيدٌ مالي. وزنها يدخل 1210 فتظهر في الجرد ورصيد الجرام.
+router.post("/items/direct", authenticate, requirePage("addGoods"), requireNotDenied("addGoods"), async (req, res, next) => {
+  if (req.auth.storePackage !== "no_accounting") return res.status(403).json({ error: "direct_coding_needs_inventory_package" });
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  const KAR = [24, 22, 21, 18, 14];
+  if (!rows.length || rows.length > 100) return res.status(400).json({ error: "invalid_rows" });
+  for (const r of rows) {
+    if (!KAR.includes(Number(r.karat)) || !(Number(r.weight) > 0) || !r.categoryId) return res.status(400).json({ error: "invalid_row" });
+    if ((Number(r.stonesWeight) || 0) < 0 || Math.max(1, Math.floor(Number(r.quantity) || 1)) > 500) return res.status(400).json({ error: "invalid_row" });
+  }
+  try {
+    const out = await withBranch(req.auth.branchId, async (client) => {
+      const { rows: day } = await client.query("select id from business_days where branch_id = $1 and status = 'open' order by opened_at desc limit 1", [req.auth.branchId]);
+      const dayId = day[0]?.id || null;
+      let n = await nextItemRefNum(client, req.auth.branchId);
+      const created = [];
+      for (const r of rows) {
+        const karat = Number(r.karat), weight = Number(r.weight), qty = Math.max(1, Math.floor(Number(r.quantity) || 1));
+        const ref = `ITM-${String(n++).padStart(6, "0")}`;
+        const { rows: it } = await client.query(
+          `insert into items (branch_id, ref, category_id, karat, weight, stones_weight, cost_per_gram, workmanship, lot_workmanship_share, from_scrap, business_day_id, created_by, set_parts)
+           values ($1,$2,$3,$4,$5,$6,0,0,0,false,$7,$8,$9) returning id, ref, karat, weight, stones_weight, date_added`,
+          [req.auth.branchId, ref, r.categoryId, karat, weight, Number(r.stonesWeight) || 0, dayId, req.auth.userId, JSON.stringify(cleanSetParts(r.setParts))]);
+        const units = [];
+        for (let i = 0; i < qty; i++) units.push(await insertUnit(client, it[0].id, qty > 1 ? `${ref}-${i + 1}` : ref));
+        await client.query(
+          `insert into gold_ledger_entries (branch_id, business_day_id, op_type, karat, weight, fine_weight, from_account, to_account, ref_table, ref_id, note, created_by)
+           values ($1,$2,'direct_coding',$3,$4,$5,null,'1210','items',$6,$7,$8)`,
+          [req.auth.branchId, dayId, karat, weight * qty, fineWeight(weight * qty, karat), it[0].id, `تكويد بالجرام ${ref}`, req.auth.userId]);
+        created.push({
+          id: it[0].id, ref: it[0].ref, lotId: null, categoryId: r.categoryId, karat, weight: Number(it[0].weight), stonesWeight: Number(it[0].stones_weight) || 0,
+          costPerGram: 0, workmanship: 0, lotWorkmanshipShare: 0, dateAdded: it[0].date_added,
+          units: units.map((u) => ({ id: u.id, code: u.code, printed: !!u.printed, sold: !!u.sold })),
+        });
+      }
+      return { items: created };
+    });
+    res.status(201).json(out);
+  } catch (err) {
+    if (err.code === "23503") return res.status(400).json({ error: "category_not_found" });
+    next(err);
+  }
+});
+
+/// إقفال دفعة المورد: المكوَّد يُقارن بالمشترى بالميزان. داخل تسامح الميزان «مطابق»، وفوق تسامح فرق التكويد
+/// يلزم سبب. العجز يخرج من 1210 وزنًا ويُبوَّب 5330 بتكلفة الدفعة، والزيادة تدخل 1210 وتُبوَّب 4320 —
+/// والمخزون دوريّ، فالقيد إعادة تبويبٍ من المشتريات (5110) لا يغيّر الربح مرّتين.
+router.post("/lots/:id/close", async (req, res, next) => {
+  const note = String(req.body?.note || "").trim().slice(0, 300);
+  try {
+    const result = await withBranch(req.auth.branchId, async (client) => {
+      const { rows } = await client.query("select * from lots where id = $1 and branch_id = $2 for update", [req.params.id, req.auth.branchId]);
+      const lot = rows[0];
+      if (!lot) return { error: "lot_not_found" };
+      if (lot.status !== "open") return { error: "lot_not_open" };
+      if (lot.source === "opening") return { error: "opening_lot_closes_with_opening" };
+      if (lot.coding_at === "hq") return { error: "lot_at_hq" };
+      const { rows: cw } = await client.query(
+        `select coalesce(sum(i.weight * (select count(*) from item_units u where u.item_id = i.id)), 0) as w
+           from items i where i.lot_id = $1`, [lot.id]);
+      const received = Number(lot.weight) || 0, coded = Math.round(Number(cw[0].w) * 1000) / 1000;
+      const diff = Math.round((received - coded) * 1000) / 1000;   // موجب عجز، سالب زيادة
+      const { rows: st } = await client.query("select sale_prefs from branch_settings where branch_id = $1", [req.auth.branchId]);
+      const w = st[0]?.sale_prefs?.wastage || {};
+      const tolG = Math.max(0.005, Number.isFinite(Number(w.receiveTolG)) ? Number(w.receiveTolG) : 0.05);
+      const tolPct = Number.isFinite(Number(w.codingTolPct)) ? Number(w.codingTolPct) : 0.1;
+      const pct = received > 0 ? Math.round(Math.abs(diff) / received * 10000) / 100 : 0;
+      const state = Math.abs(diff) <= tolG + 1e-9 ? "match" : diff > 0 ? "shortage" : "surplus";
+      if (state !== "match" && pct > tolPct && note.length < 3) return { error: "reason_required", diff, pct };
+      const { rows: day } = await client.query("select id from business_days where branch_id = $1 and status = 'open' order by opened_at desc limit 1", [req.auth.branchId]);
+      const dayId = day[0]?.id || null;
+      let journalEntryId = null;
+      // كل فرقٍ فوق نصف ملّيغرام يُرحَّل ولو داخل التسامح، وإلا انجرف وزن 1210 عن وزن القطع
+      if (Math.abs(diff) > 0.0005) {
+        const short = diff > 0, wt = Math.abs(diff);
+        const op = short ? "coding_variance" : "coding_surplus";
+        const label = `${lot.ref} — فرق التكويد ${short ? "عجز" : "زيادة"} ${wt} جم${note ? ` — ${note}` : ""}`;
+        await client.query(
+          `insert into gold_ledger_entries (branch_id, business_day_id, op_type, karat, weight, fine_weight, from_account, to_account, ref_table, ref_id, note, created_by)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,'lots',$9,$10,$11)`,
+          [req.auth.branchId, dayId, op, lot.karat, wt, fineWeight(wt, lot.karat), short ? "1210" : null, short ? null : "1210", lot.id, label, req.auth.userId]);
+        const value = roundMoney(wt * (Number(lot.cost_per_gram) || 0));
+        if (value > 0) journalEntryId = await postJournalEntry(client, {
+          branchId: req.auth.branchId, businessDayId: dayId, opType: op, refTable: "lots", refId: lot.id, description: label, createdBy: req.auth.userId,
+          lines: short
+            ? [{ account: "5330", side: "debit", amount: value }, { account: "5110", side: "credit", amount: value }]
+            : [{ account: "5110", side: "debit", amount: value }, { account: "4320", side: "credit", amount: value }],
+        });
+      }
+      const { rows: up } = await client.query(
+        `update lots set status = 'closed', closed_at = now(), closed_by = $2, entered_weight = $3, wastage_weight = $4, surplus_weight = $5, close_note = $6
+          where id = $1 returning *`,
+        [lot.id, req.auth.userId, coded, diff > 0.0005 ? diff : 0, diff < -0.0005 ? -diff : 0, note || null]);
+      await client.query(`insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'update',$2,'lots',$3,$4)`,
+        [req.auth.branchId, req.auth.userId, lot.id, JSON.stringify({ closed: lot.ref, received, coded, diff, note })]);
+      return { lot: up[0], received, coded, diff, state, pct, journalEntryId };
     });
     if (result.error) return res.status(result.error === "lot_not_found" ? 404 : 409).json(result);
     res.json(result);

@@ -166,7 +166,8 @@ router.get("/stocktake/remote", authenticate, requirePage("stocktake"), async (r
       `select r.*, u.name as decided_by_name from remote_stocktakes r left join users u on u.id = r.decided_by
         where r.branch_id = $1 order by (r.status = 'pending') desc, r.requested_at desc limit 30`, [req.auth.branchId])).rows);
     res.json({ stocktakes: rows.map((r) => ({ id: r.id, ref: r.ref, counts: r.counts || [], note: r.note || "", status: r.status,
-      requestedBy: r.requested_by, requestedAt: r.requested_at, decidedBy: r.decided_by_name || null, decidedAt: r.decided_at, result: r.result || null })) });
+      requestedBy: r.requested_by, requestedAt: r.requested_at, decidedBy: r.decided_by_name || null, decidedAt: r.decided_at, result: r.result || null,
+      scan: r.scan || null, applyMode: r.apply_mode || "apply" })) });
   } catch (err) {
     next(err);
   }
@@ -179,10 +180,19 @@ router.post("/stocktake/remote/:id/apply", authenticate, requirePage("stocktake"
       const r = rows[0];
       if (!r) return { error: "not_found" };
       if (r.status !== "pending") return { error: "already_decided" };
-      const entries = (r.counts || []).map((x) => ({ itemId: x.itemId, countedQty: Number(x.countedQty) }));
-      const out = await applyStocktake(client, { branchId: req.auth.branchId, userId: req.auth.userId, entries,
-        price24: Number(req.body?.price24) || 0, extra: { remote: r.ref, countedBy: r.requested_by } });
+      const entries = (r.counts || []).map((x) => ({ itemId: x.itemId, countedQty: Number(x.countedQty), ...(x.missingCodes ? { missingCodes: x.missingCodes } : {}) }));
+      // «تقريرٌ فقط»: يُحفظ الجرد بفروقه في السجل ولا يُعدَّل المخزون ولا الدفتر
+      const out = r.apply_mode === "report"
+        ? { reportOnly: true, changed: [] }
+        : await applyStocktake(client, { branchId: req.auth.branchId, userId: req.auth.userId, entries,
+          price24: Number(req.body?.price24) || 0, extra: { remote: r.ref, countedBy: r.requested_by, scan: r.scan || null } });
       if (out.error) return out;
+      if (r.apply_mode === "report") {
+        await client.query(`insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'update',$2,'stocktake',null,$3)`,
+          [req.auth.branchId, req.auth.userId, JSON.stringify({ entries: entries.length, reportOnly: true, remote: r.ref, countedBy: r.requested_by, scan: r.scan || null })]);
+      }
+      // قفل الإدارة للجرد يُفتح عند تطبيق نتيجتها
+      if (r.unlock !== false) await client.query("update stocktake_locks set locked = false, locked_at = null, locked_by = null, locked_by_name = null, by_hq = false where branch_id = $1 and by_hq", [req.auth.branchId]);
       await client.query("update remote_stocktakes set status = 'applied', decided_by = $2, decided_at = now(), result = $3 where id = $1",
         [r.id, req.auth.userId, JSON.stringify(out)]);
       return { ...out, ref: r.ref };

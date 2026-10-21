@@ -117,7 +117,7 @@ router.patch("/settings/branch", requirePage("settings"), requireManager, async 
         const w = body.salePrefs.wastage;
         if (w && typeof w === "object") {
           const num = (v, lo, hi, d) => { const n = Number(v); return v === "" || v == null || !Number.isFinite(n) ? d : Math.max(lo, Math.min(hi, n)); };
-          p.wastage = { defaultAllowPct: num(w.defaultAllowPct, 0, 20, 2), codingTolPct: num(w.codingTolPct, 0, 10, 0.1), receiveTolG: num(w.receiveTolG, 0, 5, 0.05) };
+          p.wastage = { defaultAllowPct: num(w.defaultAllowPct, 0, 20, 2), codingTolPct: num(w.codingTolPct, 0, 10, 0.1), receiveTolG: num(w.receiveTolG, 0, 5, 0.05), claimDays: num(w.claimDays, 1, 365, 30) };
         }
         const { rows: pr } = await client.query(
           "update branch_settings set sale_prefs = sale_prefs || $2::jsonb where branch_id = $1 returning sale_prefs",
