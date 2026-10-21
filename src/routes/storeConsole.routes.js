@@ -248,8 +248,33 @@ router.get("/store/consolidated", async (req, res, next) => {
       .sort((a, b) => a.code.localeCompare(b.code));
     const goldBy = new Map(out.gold.map((g) => [g.branch_id, roundWeight(g.net)]));
     const statBy = new Map(out.stats.map((s) => [s.branch_id, s]));
+    // النتيجة بالريال — الفروع ثم الإدارة (المرجع HqConsolidatedView): الإيراد 4 ناقص التكلفة والمصروف 5 و6 لكل دفتر،
+    // ثم ربح الفروع قبل مصروفات الإدارة، ومصروفات الإدارة المركزية، وربح المجموعة. الأرقام تراكمية حتى «إلى».
+
+    const plOf = (bid) => {
+      let rev = 0, exp = 0;
+      for (const r of out.bal.filter((x) => x.branch_id === bid)) {
+        const cr = Number(r.credit) - Number(r.debit);
+        if (String(r.code).startsWith("4")) rev += cr;
+        else if (/^[56]/.test(String(r.code))) exp -= cr;
+      }
+      return { revenue: roundMoney(rev), expenses: roundMoney(exp), profit: roundMoney(rev - exp) };
+    };
+    const plRows = branches.map((b) => ({ id: b.id, name: b.name, isHq: !!b.is_hq, ...plOf(b.id) }));
+    const sum = (arr, k) => roundMoney(arr.reduce((a, x) => a + x[k], 0));
+    const brRows = plRows.filter((r) => !r.isHq), hqRow = plRows.find((r) => r.isHq) || null;
+    const pl = {
+      rows: plRows, branchesProfit: sum(brRows, "profit"),
+      hqExpenses: hqRow ? hqRow.expenses : 0, hqRevenue: hqRow ? hqRow.revenue : 0,
+      groupProfit: sum(plRows, "profit"), withHq: !!hqRow,
+    };
+    // ما بين الإدارة والفروع — يُستبعد من الموحّد: ما أرسله دفترٌ واستلمه آخر يتقابل، والباقي «في الطريق» فعلًا
+    const ic = ["1170", "1350", "2140"].map((code) => {
+      const a = byAcc.get(code);
+      return a ? { code, name: a.name, total: a.total, branches: a.branches } : null;
+    }).filter(Boolean);
     res.json({
-      to,
+      to, pl, intercompany: ic,
       branches: branches.map((b) => ({ id: b.id, name: b.name, goldNet: goldBy.get(b.id) || 0,
         entries: statBy.get(b.id)?.entries || 0, lastAt: statBy.get(b.id)?.last_at || null })),
       accounts,
