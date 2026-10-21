@@ -424,7 +424,7 @@ router.get("/store/approval-routing", async (req, res, next) => {
       routing: (await c.query("select approval_routing from stores where id = $1", [req.storeAuth.storeId])).rows[0]?.approval_routing || {},
       rules: (await c.query("select id, label, threshold from approval_rules where id = any($1::text[])", [ROUTABLE])).rows,
     }));
-    res.json({ rules: ROUTABLE.map((id) => {
+    res.json({ selfMax: Number(routing.selfMax) || 0, expiryHours: Number(routing.expiryHours) || 72, rules: ROUTABLE.map((id) => {
       const r = rules.find((x) => x.id === id) || { id, label: id, threshold: 0 };
       const approver = routing[id] === "hq" ? "hq" : routing[id] === "hq_above" ? "hq_above" : routing[id] === "none" && ROUTABLE_NONE.includes(id) ? "none" : "branch";
       return { id, label: r.label, threshold: Number(r.threshold) || 0, approver, hqAbove: Number(routing.hqAbove?.[id]) || 0, allowNone: ROUTABLE_NONE.includes(id) };
@@ -437,6 +437,11 @@ router.get("/store/approval-routing", async (req, res, next) => {
 router.put("/store/approval-routing", requireCanManageBranches, async (req, res, next) => {
   const body = req.body?.routing || {};
   const routing = { hqAbove: {} };
+  // حدّ الاعتماد الذاتي (0 = بلا حدّ) ومهلة الطلب بالساعات
+  const selfMax = Number(req.body?.selfMax ?? 0), expiryHours = Number(req.body?.expiryHours ?? 72);
+  if (!(selfMax >= 0) || !(expiryHours >= 1 && expiryHours <= 720)) return res.status(400).json({ error: "invalid_limits" });
+  routing.selfMax = Math.round(selfMax * 100) / 100;
+  routing.expiryHours = Math.round(expiryHours);
   for (const id of ROUTABLE) {
     routing[id] = ["hq", "hq_above"].includes(body[id]) ? body[id] : body[id] === "none" && ROUTABLE_NONE.includes(id) ? "none" : "branch";
     if (routing[id] === "hq_above") {

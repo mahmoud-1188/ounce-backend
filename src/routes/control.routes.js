@@ -9,7 +9,7 @@ import { hashPin, verifyPin } from "../auth/hashPin.js";
 import { postJournalEntry } from "../domain/journal.js";
 import { roundMoney } from "../domain/money.js";
 import { getOpenBusinessDay } from "../domain/saleOps.js";
-import { APPROVAL_EXPIRY_HOURS, NO_SELF_KINDS, expireStaleApprovals, shapeApproval } from "../domain/approvals.js";
+import { approvalExpiryHours, NO_SELF_KINDS, expireStaleApprovals, shapeApproval } from "../domain/approvals.js";
 import { logPermission } from "../domain/permissionLog.js";
 import { ENROLL_TTL_MIN, codeHash, issueEnrollCode } from "../domain/enroll.js";
 import { branchDevices, createDevice, deviceLabel, revokeDevice } from "../domain/devices.js";
@@ -147,7 +147,7 @@ router.post("/approvals/:id/decide", authenticate, requirePage("approvals"), req
       );
       const ap = rows[0];
       if (!ap) return { error: "approval_not_found" };
-      if (ap.status === "pending" && new Date(ap.created_at).getTime() < Date.now() - APPROVAL_EXPIRY_HOURS * 3600000) {
+      if (ap.status === "pending" && new Date(ap.created_at).getTime() < Date.now() - (await approvalExpiryHours(client, ap.branch_id)) * 3600000) {
         await client.query("update approvals set status = 'expired', decision_note = 'انتهت مهلة الطلب' where id = $1", [ap.id]);
         return { expired: true };
       }
