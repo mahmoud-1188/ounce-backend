@@ -302,13 +302,13 @@ router.post("/safe/gold", requireCanManageDay, requireNotDenied("safeMove"), asy
     }
   }
 
-  // الحساب المستهدَف: 1220 للذهب الخام، 1210 للمشغول — مطابقةً لكون 1210
-  // هو حساب "ذهب مشغول جاهز للبيع" الوحيد في الشجرة، وهو نفس ما تفترضه
-  // WEIGHT_ACCOUNTS (تقبل 1210 و1220 معًا). المرجع لا يميّز الحسابين
-  // إطلاقًا في posting_rules (safe_gold_in/out تستهدف 1220 دائمًا بلا
-  // شرط kind) — هذا امتداد طبيعي لتغطية kind='crafted' الذي كان موجودًا
-  // في الشكل لكن بلا ترحيل فعلي في المرجع أصلًا.
-  const account = kind === "raw" ? "1220" : "1210";
+  // الحساب المستهدَف: 1220 للكسر، و1215 للمشغول غير المكوَّد (migration 095) —
+  // لا 1210: ذاك المخزون المكوَّد الجاهز للبيع، وخلطه بمشغول الخزنة يجعل رصيده
+  // بالجرام غير ما على الرفّ. لكلّ نوعٍ قاعدته (safe_gold_* · safe_crafted_*).
+  const account = kind === "raw" ? "1220" : "1215";
+  const opType = kind === "raw"
+    ? (type === "in" ? "safe_gold_in" : "safe_gold_out")
+    : (type === "in" ? "safe_crafted_in" : "safe_crafted_out");
 
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
@@ -325,6 +325,19 @@ router.post("/safe/gold", requireCanManageDay, requireNotDenied("safeMove"), asy
           [officeId, req.auth.branchId]
         );
         if (!rows[0]) return { error: "office_not_found" };
+      }
+
+      // السحب لا يتجاوز رصيد النوع نفسه بعياره: كسر عيار 21 لا يُسحب من مشغوله ولا من عيارٍ آخر
+      if (type === "out") {
+        const { rows: balRows } = await client.query(
+          `select coalesce(sum(case when direction = 'in' then weight else -weight end), 0)::float8 as w
+             from safe_gold_tx where branch_id = $1 and karat = $2 and coalesce(kind, 'raw') = $3`,
+          [req.auth.branchId, karat, kind]
+        );
+        const have = roundWeight(balRows[0]?.w || 0);
+        if (weight > have + 0.0005) {
+          return { error: "safe_gold_insufficient", kind, karat, have, requested: weight, status: 409 };
+        }
       }
 
       const businessDayId = await openDay(client, req.auth.branchId);
@@ -344,7 +357,7 @@ router.post("/safe/gold", requireCanManageDay, requireNotDenied("safeMove"), asy
             from_account, to_account, ref_table, ref_id, note, created_by)
          values ($1,$2,$3,$4,$5,$6, $7,$8, 'safe_gold_tx',$9,$10,$11)`,
         [
-          req.auth.branchId, businessDayId, type === "in" ? "safe_gold_in" : "safe_gold_out",
+          req.auth.branchId, businessDayId, opType,
           karat, weight, fineWeight(weight, karat),
           type === "in" ? null : account, type === "in" ? account : null,
           txId, note || (type === "in" ? "إيداع ذهب بالخزنة" : "سحب ذهب من الخزنة"), req.auth.userId,
@@ -377,7 +390,10 @@ router.post("/safe/gold", requireCanManageDay, requireNotDenied("safeMove"), asy
 
       return { safeGoldTx: { id: txId, type, kind, karat, weight, destination }, supplierLedgerId, officeLedgerId };
     });
-    if (result.error) return res.status(404).json(result);
+    if (result.error) {
+      const { status, ...body } = result;
+      return res.status(status || 404).json(body);
+    }
     res.status(201).json(result);
   } catch (err) {
     next(err);
