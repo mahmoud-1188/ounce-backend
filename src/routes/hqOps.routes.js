@@ -7,6 +7,7 @@ import { issueEnrollCode } from "../domain/enroll.js";
 import { branchDevices, revokeDevice } from "../domain/devices.js";
 import { codeRemnant, listRemnants } from "../domain/remnants.js";
 import { codeLotItems } from "./items.routes.js";
+import { openingStats } from "./opening.routes.js";
 
 const router = Router();
 
@@ -216,6 +217,55 @@ router.get("/store/branches/:branchId/remote-stocktakes", requireCanManageBranch
   } catch (err) {
     next(err);
   }
+});
+
+// ══ تكويد الافتتاح من الإدارة (المرجع HqOpeningPhaseForm) ══════════════════════════
+// الإدارة والمالك وحدهما يُنهيان مرحلة «بضاعة افتتاحية بلا مورد» في الفرع أو يعيدان فتحها بسببٍ يُسجَّل.
+// الإنهاء يُقفل الدفعات الافتتاحية المفتوحة (كإنهاء الفرع)، وإعادة الفتح تُتيحها من جديد.
+async function storeBranch(req) {
+  const rows = await storeBranches(req.storeAuth.storeId);
+  return rows.find((b) => b.id === req.params.branchId) || null;
+}
+router.get("/store/branches/:branchId/opening", async (req, res, next) => {
+  try {
+    if (!(await storeBranch(req))) return res.status(404).json({ error: "branch_not_found" });
+    const out = await withBranch(req.params.branchId, async (c) => {
+      const { rows } = await c.query("select opening_mode, opening_finished_at from branch_settings where branch_id = $1", [req.params.branchId]);
+      const { rows: byK } = await c.query(
+        `select i.karat, count(u.id)::int as pieces, coalesce(sum(i.weight), 0)::float8 as weight
+           from lots l join items i on i.lot_id = l.id join item_units u on u.item_id = i.id
+          where l.branch_id = $1 and l.source = 'opening' group by i.karat order by i.karat desc`, [req.params.branchId]);
+      return { open: !!rows[0]?.opening_mode, finishedAt: rows[0]?.opening_finished_at || null, stats: await openingStats(c, req.params.branchId), byKarat: byK };
+    });
+    res.json(out);
+  } catch (err) { next(err); }
+});
+router.post("/store/branches/:branchId/opening", requireCanManageBranches, async (req, res, next) => {
+  const to = req.body?.to === "open" ? "open" : req.body?.to === "closed" ? "closed" : null;
+  const reason = String(req.body?.reason || "").trim().slice(0, 200);
+  if (!to) return res.status(400).json({ error: "invalid_opening_target" });
+  if (to === "open" && reason.length < 3) return res.status(400).json({ error: "reason_required" });
+  try {
+    if (!(await storeBranch(req))) return res.status(404).json({ error: "branch_not_found" });
+    const out = await withBranch(req.params.branchId, async (c) => {
+      let closedLots = 0;
+      if (to === "closed") {
+        const { rows } = await c.query(
+          `update lots set status = 'closed', closed_at = now(), entered_weight = weight
+            where branch_id = $1 and source = 'opening' and status = 'open' returning id`, [req.params.branchId]);
+        closedLots = rows.length;
+      }
+      await c.query(
+        `insert into branch_settings (branch_id, opening_mode, opening_finished_at) values ($1, $2, case when $2 then null else now() end)
+         on conflict (branch_id) do update set opening_mode = excluded.opening_mode, opening_finished_at = excluded.opening_finished_at`,
+        [req.params.branchId, to === "open"]);
+      await c.query(
+        `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'update',null,'branch_settings',null,$2)`,
+        [req.params.branchId, JSON.stringify({ byKind: "store", by: req.storeAuth.name || "الإدارة", kind: "opening_phase", to, reason: reason || null, closedLots })]);
+      return { open: to === "open", closedLots, stats: await openingStats(c, req.params.branchId) };
+    });
+    res.json(out);
+  } catch (err) { next(err); }
 });
 
 router.get("/store/ops-log", async (req, res, next) => {
