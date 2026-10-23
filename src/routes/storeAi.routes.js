@@ -60,7 +60,7 @@ router.post("/store/ai/chat", async (req, res, next) => {
 
     const ctx = await hqContext(req.storeAuth.storeId);
     const { ok, status, payload } = await aiMessages(cfg, {
-      model: cfg.chatModel,
+      model: cfg.hqModel || cfg.chatModel,
       max_tokens: 1200,
       system: `${SYSTEM}\n\nالبيانات (JSON):\n${JSON.stringify(ctx).slice(0, 60000)}`,
       messages,
