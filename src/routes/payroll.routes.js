@@ -363,6 +363,15 @@ async function buildPayrollSlips(client, branchId, period) {
     unpaidLeaveByUser[l.user_id] = (unpaidLeaveByUser[l.user_id] || 0) + Math.max(1, days);
   }
 
+  // الإضافي والمكافآت والجزاءات لهذا الشهر (migration 099) — الجزاء لا يتجاوز أجر خمسة أيام (نظام العمل م67)
+  const { rows: adjRows } = await client.query(
+    `select user_id, kind, coalesce(sum(amount), 0)::float8 as amount from payroll_adjustments
+      where branch_id = $1 and period = to_char($2::date, 'YYYY-MM') and cancelled_at is null group by user_id, kind`,
+    [branchId, period]
+  );
+  const adjByUser = {};
+  for (const r of adjRows) (adjByUser[r.user_id] ||= { overtime: 0, bonus: 0, penalty: 0 })[r.kind] = Number(r.amount) || 0;
+
   const { rows: commissionRules } = await client.query(
     `select * from commissions where branch_id = $1`,
     [branchId]
@@ -418,16 +427,19 @@ async function buildPayrollSlips(client, branchId, period) {
       commission = roundMoney(Math.max(0, pct) + flat);
     }
 
-    const deductions = roundMoney(gosiEmployee + advances + absenceDeduction);
-    const net = roundMoney(gross + commission - deductions);
+    const adj = adjByUser[emp.id] || { overtime: 0, bonus: 0, penalty: 0 };
+    const overtime = roundMoney(adj.overtime), bonus = roundMoney(adj.bonus);
+    const penalty = roundMoney(Math.min(adj.penalty, dayRate * 5));
+    const deductions = roundMoney(gosiEmployee + advances + absenceDeduction + penalty);
+    const net = roundMoney(gross + commission + overtime + bonus - deductions);
 
     const years = emp.hire_date ? (Date.now() - new Date(emp.hire_date).getTime()) / (365.25 * 86400000) : 0;
     const eosAccrual = roundMoney(years <= 5 ? gross / 24 : gross / 12);
-    const employerCost = roundMoney(gross + commission + gosiEmployer + eosAccrual);
+    const employerCost = roundMoney(gross + commission + overtime + bonus - penalty + gosiEmployer + eosAccrual);
 
     return {
       employeeId: emp.id, employeeName: emp.name, nationality: emp.nationality || "saudi",
-      basic, housing, transport, other, gross, commission,
+      basic, housing, transport, other, gross, commission, overtime, bonus, penalty,
       gosiEmployee, gosiEmployer, advances, absentDays, unpaidLeaveDays, absenceDeduction,
       deductions, net, eosAccrual, employerCost,
       advanceIds: advanceParts.map((p) => p.id),
@@ -505,6 +517,7 @@ router.post("/payroll/runs", requireManager, async (req, res, next) => {
       push("6720", "debit", roundMoney(slips.reduce((a, s) => a + s.housing, 0)));
       push("6730", "debit", roundMoney(slips.reduce((a, s) => a + s.transport + s.other, 0)));
       push("6760", "debit", roundMoney(slips.reduce((a, s) => a + s.commission, 0)));
+      push("6710", "debit", roundMoney(slips.reduce((a, s) => a + (s.overtime || 0) + (s.bonus || 0), 0)));
       push("6740", "debit", roundMoney(slips.reduce((a, s) => a + s.gosiEmployer, 0)));
       push("6750", "debit", roundMoney(slips.reduce((a, s) => a + s.eosAccrual, 0)));
       push("2320", "credit", gosiDue);
@@ -514,6 +527,7 @@ router.post("/payroll/runs", requireManager, async (req, res, next) => {
       // ⚠ خصم الغياب يُنقص المصروف لا يزيد الإيراد — دائن على نفس حساب
       // الرواتب الأساسية (6710)، يطابق buildPayrollJournal.js حرفيًا.
       push("6710", "credit", absent);
+      push("6710", "credit", roundMoney(slips.reduce((a, s) => a + (s.penalty || 0), 0)));
 
       const ref = `PAY-${period}`;
 
@@ -541,12 +555,13 @@ router.post("/payroll/runs", requireManager, async (req, res, next) => {
           `insert into payroll_lines
              (payroll_run_id, user_id, base_salary, housing, transport, other_allowance,
               gosi_employee, gosi_employer, commission, advances, absent_days,
-              unpaid_leave_days, absence_deduction, eos_accrual, employer_cost, net_pay)
-           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+              unpaid_leave_days, absence_deduction, eos_accrual, employer_cost, net_pay, overtime, bonus, penalty)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
           [
             run.id, s.employeeId, s.basic, s.housing, s.transport, s.other,
             s.gosiEmployee, s.gosiEmployer, s.commission, s.advances, s.absentDays,
             s.unpaidLeaveDays, s.absenceDeduction, s.eosAccrual, s.employerCost, s.net,
+            s.overtime || 0, s.bonus || 0, s.penalty || 0,
           ]
         );
       }
