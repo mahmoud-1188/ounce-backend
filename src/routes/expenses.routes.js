@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { withBranch } from "../db.js";
-import { authenticate, requirePage, requireNotDenied } from "../middleware/auth.js";
+import { authenticate, requirePage, requireNotDenied, requireManager } from "../middleware/auth.js";
 import { roundMoney } from "../domain/money.js";
 import { postJournalEntry } from "../domain/journal.js";
 import { approvalGate } from "../domain/approvals.js";
@@ -27,6 +27,7 @@ const router = Router();
 router.use("/expenses", authenticate, requirePage("expenses"), requireNotDenied("expense"));
 router.use("/expense-names", authenticate, requirePage("expenses"), requireNotDenied("expense"));
 router.use("/fixed-expenses", authenticate, requirePage("expenses"), requireNotDenied("expense"));
+router.use("/expense-accounts", authenticate, requirePage("expenses"));
 
 // ══ قوالب المصروفات الثابتة (migration 074) ══
 const fixedOf = (r) => ({ id: r.id, name: r.name, category: r.category, amount: Number(r.amount), day: r.day, fundingSource: r.funding_source,
@@ -37,7 +38,7 @@ function fixedRefusal(b) {
   if (!(roundMoney(b.amount) > 0)) return "invalid_amount";
   const day = Math.round(Number(b.day));
   if (!(day >= 1 && day <= 28)) return "invalid_day";
-  if (!CATEGORY_ACCOUNTS[b.category] || ["salaries", "advance"].includes(b.category)) return "invalid_category";
+  if ((!CATEGORY_ACCOUNTS[b.category] && !CUSTOM_CATEGORY.test(b.category || "")) || ["salaries", "advance"].includes(b.category)) return "invalid_category";
   if (!CASH_ACCOUNTS[b.fundingSource]) return "invalid_funding_source";
   return null;
 }
@@ -101,6 +102,70 @@ const CATEGORY_ACCOUNTS = {
   other: "6900",
 };
 
+// حسابٌ مخصّص للمتجر: الفئة «acc_<رمزه>» (migration 096)
+const CUSTOM_CATEGORY = /^acc_69\d{5}$/;
+
+/** حساب المدين لفئة المصروف: القياسية من الجدول أعلاه، والمخصّصة من حسابات متجر الفرع الظاهرة وحدها. */
+async function expenseAccountOf(client, branchId, category) {
+  if (CATEGORY_ACCOUNTS[category]) return CATEGORY_ACCOUNTS[category];
+  if (!CUSTOM_CATEGORY.test(category || "")) return null;
+  const { rows } = await client.query(
+    `select a.code from accounts a join branches b on b.store_id = a.store_id
+      where a.code = $1 and b.id = $2 and not a.hidden`, [category.slice(4), branchId]);
+  return rows[0]?.code || null;
+}
+
+const accountOf = (r) => ({ code: r.code, name: r.name, hidden: !!r.hidden, category: `acc_${r.code}`, createdAt: r.created_at });
+
+// ── حسابات المصروف المخصّصة: الكلّ يقرأ، والإضافة والإخفاء للمدير (فعل chartEdit — تمنعه الإدارة من سياستها) ──
+router.get("/expense-accounts", async (req, res, next) => {
+  try {
+    const rows = await withBranch(req.auth.branchId, async (c) => (await c.query(
+      `select a.* from accounts a join branches b on b.store_id = a.store_id where b.id = $1 order by a.created_at, a.code`,
+      [req.auth.branchId])).rows);
+    res.json({ accounts: rows.map(accountOf) });
+  } catch (err) { next(err); }
+});
+
+router.post("/expense-accounts", requireManager, requireNotDenied("chartEdit"), async (req, res, next) => {
+  const name = String(req.body?.name || "").trim().replace(/\s+/g, " ").slice(0, 60);
+  if (name.length < 2) return res.status(400).json({ error: "name_required" });
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows: st } = await c.query("select store_id from branches where id = $1", [req.auth.branchId]);
+      const storeId = st[0]?.store_id;
+      if (!storeId) return { error: "no_store" };
+      const { rows: dup } = await c.query(
+        "select code from accounts where name = $1 and (store_id is null or store_id = $2) limit 1", [name, storeId]);
+      if (dup[0]) return { error: "name_taken", code: dup[0].code };
+      const { rows: seq } = await c.query("select nextval('custom_expense_account_seq')::int as n");
+      if (seq[0].n > 99999) return { error: "no_code_left" };
+      const code = `69${String(seq[0].n).padStart(5, "0")}`;
+      const { rows } = await c.query(
+        `insert into accounts (code, name, parent_code, unit, nature, statement, is_group, pool, method, store_id)
+         values ($1, $2, '6000', 'currency', 'debit', 'income', false, null, null, $3) returning *`, [code, name, storeId]);
+      return { account: accountOf(rows[0]) };
+    });
+    if (out.error) return res.status(out.error === "name_taken" ? 409 : 400).json(out);
+    res.status(201).json(out);
+  } catch (err) { next(err); }
+});
+
+// إخفاءٌ لا حذف: الحساب عليه قيود؛ يُخفى من اختيار المصروف ويبقى في الدفاتر باسمه
+router.patch("/expense-accounts/:code", requireManager, requireNotDenied("chartEdit"), async (req, res, next) => {
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows } = await c.query(
+        `update accounts a set hidden = $3 from branches b
+          where a.code = $1 and b.id = $2 and a.store_id = b.store_id returning a.*`,
+        [req.params.code, req.auth.branchId, !!req.body?.hidden]);
+      return rows[0] ? { account: accountOf(rows[0]) } : { error: "not_found" };
+    });
+    if (out.error) return res.status(404).json(out);
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
 async function openDay(client, branchId) {
   const { rows } = await client.query(
     `select id from business_days where branch_id = $1 and status = 'open'
@@ -137,7 +202,7 @@ router.get("/expenses", async (req, res, next) => {
 router.post("/expenses", async (req, res, next) => {
   const body = req.body || {};
   const amount = roundMoney(body.amount);
-  const category = CATEGORY_ACCOUNTS[body.category] ? body.category : null;
+  const category = CATEGORY_ACCOUNTS[body.category] || CUSTOM_CATEGORY.test(body.category || "") ? body.category : null;
   const fundingSource = CASH_ACCOUNTS[body.fundingSource] ? body.fundingSource : null;
   const name = (body.name || "").trim();
   const isPayroll = category === "salaries" || category === "advance";
@@ -153,6 +218,10 @@ router.post("/expenses", async (req, res, next) => {
 
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
+      // الحساب المخصّص يُتحقَّق منه قبل الاعتماد: لمتجر هذا الفرع، وغير مخفيّ
+      const debitAccount = await expenseAccountOf(client, req.auth.branchId, category);
+      if (!debitAccount) return { error: "invalid_category" };
+
       // ⚖ ما فوق حدّ الاعتماد لا يُنفَّذ بل يُحفظ طلبًا بحمولته
       const gate = await approvalGate(client, req.auth, {
         kind: "expense", amount, approvalId: body.approvalId || null, note: name, category,
@@ -212,7 +281,6 @@ router.post("/expenses", async (req, res, next) => {
         [req.auth.branchId, businessDayId, pool, method, amount, "expenses", expense.id, `مصروف - ${name}`, req.auth.userId]
       );
 
-      const debitAccount = CATEGORY_ACCOUNTS[category];
       const journalEntryId = await postJournalEntry(client, {
         branchId: req.auth.branchId,
         businessDayId,

@@ -38,6 +38,7 @@ const HQ_ACTIONS = [
   { id: "cashMove", label: "تحريك النقد بين الخزنة والصندوق والعهدة", group: "cash" },
   { id: "safeMove", label: "إيداع وسحب الخزنة (نقد وذهب)", group: "cash" },
   { id: "expense", label: "تسجيل مصروف", group: "cash" },
+  { id: "chartEdit", label: "حسابات المصروف المخصّصة (إضافة وإخفاء)", group: "cash" },
   { id: "sale", label: "البيع والمرتجع", group: "trade" },
   { id: "purchase", label: "الشراء والموردون", group: "trade" },
   { id: "buyScrap", label: "شراء كسر من زبون", group: "trade" },
