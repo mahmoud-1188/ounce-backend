@@ -12,6 +12,9 @@ const router = Router();
  *   PUT  /budgets { period, lines:[{account, amount}] }   (0 يحذف السطر)
  *   POST /budgets/copy { from, to }       — ينسخ موازنة شهرٍ لشهرٍ (لا يدوس ما كُتب)
  *   GET  /vat-return?from=YYYY-MM-DD&to=YYYY-MM-DD  — إقرار ضريبة القيمة المضافة من الفواتير والقيود
+ *   GET  /cost-centers?period=YYYY-MM     — مراكز التكلفة (migration 100) ومصروف كلٍّ منها في الشهر
+ *   POST /cost-centers { name }            — مركزٌ جديد (للمدير)
+ *   PATCH /cost-centers/:id { name?, active? } — إعادة تسمية أو إيقاف (لا يُحذف: مصروفاته تبقى منسوبةً إليه)
  * ⚠ الفعلي يُحسب من journal_lines بتاريخ الرياض — لا من شاشة المصروفات — فيشمل كل قيدٍ على الحساب.
  */
 const PERIOD = /^\d{4}-\d{2}$/;
@@ -42,10 +45,11 @@ async function budgetRows(c, branchId, period) {
       pct: planned > 0 ? Math.round((actual / planned) * 100) : null, over,
     };
   });
+  const byCenter = await centerRows(c, branchId, period);
   const planned = rows.filter((r) => r.planned != null);
   const exp = planned.filter((r) => r.nature === "debit");
   return {
-    period, rows,
+    period, rows, byCenter,
     totals: {
       plannedExpense: roundMoney(exp.reduce((s, r) => s + r.planned, 0)),
       actualExpense: roundMoney(exp.reduce((s, r) => s + r.actual, 0)),
@@ -53,6 +57,65 @@ async function budgetRows(c, branchId, period) {
     },
   };
 }
+
+/// مصروف كل مركز تكلفةٍ في الشهر — من المصروفات المنسوبة إليه بتاريخ الرياض
+async function centerRows(c, branchId, period) {
+  const { rows } = await c.query(
+    `select cc.id, cc.name, cc.active,
+            coalesce(sum(e.amount) filter (where to_char(e.created_at at time zone '${TZ}', 'YYYY-MM') = $2), 0)::numeric as amount,
+            count(e.id) filter (where to_char(e.created_at at time zone '${TZ}', 'YYYY-MM') = $2)::int as count
+       from cost_centers cc left join expenses e on e.cost_center_id = cc.id and e.branch_id = cc.branch_id
+      where cc.branch_id = $1
+      group by cc.id order by cc.active desc, cc.name`, [branchId, period]);
+  return rows.map((r) => ({ id: r.id, name: r.name, active: r.active, amount: roundMoney(Number(r.amount)), count: r.count }));
+}
+
+router.get("/cost-centers", authenticate, async (req, res, next) => {
+  const period = PERIOD.test(String(req.query.period || "")) ? String(req.query.period) : new Date().toISOString().slice(0, 7);
+  try {
+    res.json({ period, centers: await withBranch(req.auth.branchId, (c) => centerRows(c, req.auth.branchId, period)) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/cost-centers", authenticate, requireManager, async (req, res, next) => {
+  const name = String(req.body?.name || "").trim().slice(0, 60);
+  if (name.length < 2) return res.status(400).json({ error: "name_required" });
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows: dup } = await c.query(
+        "select id from cost_centers where branch_id = $1 and lower(name) = lower($2)", [req.auth.branchId, name]);
+      if (dup[0]) return { error: "cost_center_exists" };
+      const { rows } = await c.query(
+        "insert into cost_centers (branch_id, name) values ($1, $2) returning id, name, active", [req.auth.branchId, name]);
+      return { center: rows[0] };
+    });
+    if (out.error) return res.status(409).json(out);
+    res.json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch("/cost-centers/:id", authenticate, requireManager, async (req, res, next) => {
+  const b = req.body || {};
+  const name = b.name != null ? String(b.name).trim().slice(0, 60) : null;
+  if (name != null && name.length < 2) return res.status(400).json({ error: "name_required" });
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows } = await c.query(
+        `update cost_centers set name = coalesce($3, name), active = coalesce($4, active)
+          where id = $1 and branch_id = $2 returning id, name, active`,
+        [req.params.id, req.auth.branchId, name, typeof b.active === "boolean" ? b.active : null]);
+      return rows[0] ? { center: rows[0] } : { error: "not_found" };
+    });
+    if (out.error) return res.status(404).json(out);
+    res.json(out);
+  } catch (err) {
+    next(err);
+  }
+});
 
 router.get("/budgets", authenticate, requirePage("budgets"), async (req, res, next) => {
   const period = PERIOD.test(String(req.query.period || "")) ? String(req.query.period) : new Date().toISOString().slice(0, 7);

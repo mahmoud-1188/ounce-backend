@@ -255,11 +255,20 @@ router.post("/expenses", async (req, res, next) => {
         nameId = nameRows[0]?.id || null;
       }
 
+      // مركز التكلفة (migration 100): اختياريّ، ومن مراكز هذا الفرع القائمة وحدها
+      let costCenterId = null;
+      if (body.costCenterId) {
+        const { rows: cc } = await client.query(
+          "select id from cost_centers where id = $1 and branch_id = $2 and active", [body.costCenterId, req.auth.branchId]);
+        if (!cc[0]) return { error: "invalid_cost_center" };
+        costCenterId = cc[0].id;
+      }
+
       const { rows: expRows } = await client.query(
         `insert into expenses
            (branch_id, ref, name, name_id, amount, business_day_id, category, note, recurring,
-            funding_source, employee_id, period_month, created_by, installments, attach_id, vat_amount)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+            funding_source, employee_id, period_month, created_by, installments, attach_id, vat_amount, cost_center_id)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
          returning *`,
         [
           req.auth.branchId, ref, name, nameId, amount, businessDayId, category,
@@ -267,7 +276,7 @@ router.post("/expenses", async (req, res, next) => {
           isPayroll ? body.periodMonth || null : null, req.auth.userId,
           category === "advance" ? Math.min(60, Math.max(1, Math.round(Number(body.installments) || 1))) : 1,
           typeof body.attachId === "string" && body.attachId.length <= 80 ? body.attachId : null,
-          vatAmount,
+          vatAmount, costCenterId,
         ]
       );
       const expense = expRows[0];
