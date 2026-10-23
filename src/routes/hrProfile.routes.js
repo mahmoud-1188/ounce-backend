@@ -163,4 +163,144 @@ router.post("/hr/evaluations", authenticate, requirePage("payroll"), requireMana
 });
 
 export { hrDocAlerts };
+// ══ سياسة الموارد · الإضافي والمكافآت والجزاءات · الحضور بوقته (migration 099 — المرجع HrPage) ══════
+
+const HR_DEFAULT_POLICY = { shiftStart: "09:00", shiftEnd: "21:00", graceMin: 15, weeklyOff: [5], docAlertDays: 30, maxLoanMultiple: 2, maxLoanMonths: 12 };
+const hhmm = (v) => (/^\d{2}:\d{2}$/.test(String(v || "")) ? String(v) : null);
+const minutesOf = (v) => { const m = /^(\d{2}):(\d{2})$/.exec(String(v || "")); return m ? Number(m[1]) * 60 + Number(m[2]) : null; };
+
+async function hrPolicyOf(c, branchId) {
+  const { rows } = await c.query("select hr_policy from branch_settings where branch_id = $1", [branchId]);
+  return { ...HR_DEFAULT_POLICY, ...(rows[0]?.hr_policy || {}) };
+}
+
+function cleanPolicy(b = {}) {
+  const n = (v, lo, hi, d) => { const x = Math.round(Number(v)); return Number.isFinite(x) ? Math.min(hi, Math.max(lo, x)) : d; };
+  return {
+    shiftStart: hhmm(b.shiftStart) || HR_DEFAULT_POLICY.shiftStart,
+    shiftEnd: hhmm(b.shiftEnd) || HR_DEFAULT_POLICY.shiftEnd,
+    graceMin: n(b.graceMin, 0, 180, HR_DEFAULT_POLICY.graceMin),
+    weeklyOff: Array.isArray(b.weeklyOff) ? [...new Set(b.weeklyOff.map(Number).filter((d) => d >= 0 && d <= 6))] : HR_DEFAULT_POLICY.weeklyOff,
+    docAlertDays: n(b.docAlertDays, 1, 365, HR_DEFAULT_POLICY.docAlertDays),
+    maxLoanMultiple: n(b.maxLoanMultiple, 0, 12, HR_DEFAULT_POLICY.maxLoanMultiple),
+    maxLoanMonths: n(b.maxLoanMonths, 1, 60, HR_DEFAULT_POLICY.maxLoanMonths),
+  };
+}
+
+router.get("/hr/policy", authenticate, async (req, res, next) => {
+  try { res.json({ policy: await withBranch(req.auth.branchId, (c) => hrPolicyOf(c, req.auth.branchId)) }); } catch (err) { next(err); }
+});
+
+router.put("/hr/policy", authenticate, requirePage("payroll"), requireManager, async (req, res, next) => {
+  const policy = cleanPolicy(req.body || {});
+  try {
+    await withBranch(req.auth.branchId, (c) => c.query(
+      `insert into branch_settings (branch_id, hr_policy) values ($1, $2::jsonb)
+       on conflict (branch_id) do update set hr_policy = excluded.hr_policy`, [req.auth.branchId, JSON.stringify(policy)]));
+    res.json({ policy });
+  } catch (err) { next(err); }
+});
+
+const adjOf = (r) => ({ id: r.id, employeeId: r.user_id, name: r.name || null, period: r.period, kind: r.kind, hours: Number(r.hours) || 0,
+  amount: Number(r.amount) || 0, reason: r.reason || "", by: r.by_name || "", at: r.created_at, cancelled: !!r.cancelled_at, inRun: !!r.in_run });
+
+router.get("/hr/adjustments", authenticate, requirePage("payroll"), async (req, res, next) => {
+  const period = /^\d{4}-\d{2}$/.test(String(req.query.period || "")) ? String(req.query.period) : null;
+  try {
+    const rows = await withBranch(req.auth.branchId, async (c) => (await c.query(
+      `select a.*, u.name, b.name as by_name,
+              exists (select 1 from payroll_runs r where r.branch_id = a.branch_id and to_char(r.period, 'YYYY-MM') = a.period) as in_run
+         from payroll_adjustments a join users u on u.id = a.user_id left join users b on b.id = a.created_by
+        where a.branch_id = $1 and ($2::text is null or a.period = $2) order by a.created_at desc limit 200`,
+      [req.auth.branchId, period])).rows);
+    res.json({ adjustments: rows.map(adjOf) });
+  } catch (err) { next(err); }
+});
+
+router.post("/hr/adjustments", authenticate, requirePage("payroll"), requireManager, async (req, res, next) => {
+  const b = req.body || {};
+  const kind = ["overtime", "bonus", "penalty"].includes(b.kind) ? b.kind : null;
+  const period = /^\d{4}-\d{2}$/.test(String(b.period || "")) ? String(b.period) : null;
+  const hours = Math.round((Number(b.hours) || 0) * 100) / 100;
+  const reason = String(b.reason || "").trim().slice(0, 200);
+  if (!kind || !period || !b.employeeId) return res.status(400).json({ error: "invalid_adjustment" });
+  if (kind === "penalty" && !reason) return res.status(400).json({ error: "reason_required" });
+  if (kind === "overtime" && !(hours > 0)) return res.status(400).json({ error: "hours_required" });
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows: emp } = await c.query("select id, name, basic_salary, housing, transport, other_allowance from users where id = $1 and branch_id = $2", [b.employeeId, req.auth.branchId]);
+      if (!emp[0]) return { error: "employee_not_found", status: 404 };
+      const { rows: run } = await c.query("select 1 from payroll_runs where branch_id = $1 and to_char(period, 'YYYY-MM') = $2", [req.auth.branchId, period]);
+      if (run[0]) return { error: "payroll_already_run", status: 409 };
+      const e = emp[0];
+      const basic = Number(e.basic_salary) || 0;
+      const gross = basic + (Number(e.housing) || 0) + (Number(e.transport) || 0) + (Number(e.other_allowance) || 0);
+      // الإضافي: أجر الساعة (الإجمالي ÷ 240) + 50٪ من أجر الساعة الأساسي — نظام العمل م107
+      const amount = kind === "overtime" ? Math.round(((gross / 240) + 0.5 * (basic / 240)) * hours * 100) / 100 : Math.round((Number(b.amount) || 0) * 100) / 100;
+      if (!(amount > 0)) return { error: "invalid_amount", status: 400 };
+      const { rows } = await c.query(
+        `insert into payroll_adjustments (branch_id, user_id, period, kind, hours, amount, reason, created_by)
+         values ($1,$2,$3,$4,$5,$6,$7,$8) returning *`,
+        [req.auth.branchId, e.id, period, kind, kind === "overtime" ? hours : 0, amount, reason || null, req.auth.userId]);
+      return { adjustment: adjOf({ ...rows[0], name: e.name }) };
+    });
+    if (out.error) { const { status, ...body } = out; return res.status(status || 400).json(body); }
+    res.status(201).json(out);
+  } catch (err) { next(err); }
+});
+
+router.delete("/hr/adjustments/:id", authenticate, requirePage("payroll"), requireManager, async (req, res, next) => {
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows } = await c.query(
+        `update payroll_adjustments a set cancelled_at = now()
+          where a.id = $1 and a.branch_id = $2 and a.cancelled_at is null
+            and not exists (select 1 from payroll_runs r where r.branch_id = a.branch_id and to_char(r.period, 'YYYY-MM') = a.period)
+          returning a.*`, [req.params.id, req.auth.branchId]);
+      return rows[0] ? { adjustment: adjOf(rows[0]) } : { error: "not_cancellable" };
+    });
+    if (out.error) return res.status(409).json(out);
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
+// الحضور والانصراف بوقته: الموظف لنفسه، والمدير ونائبه لأيّ موظف. التأخير والإضافي من الوردية وسماحها.
+router.post("/hr-check", authenticate, async (req, res, next) => {
+  const action = req.body?.action === "out" ? "out" : "in";
+  const userId = req.body?.userId || req.auth.userId;
+  if (!userId) return res.status(400).json({ error: "employee_required" });
+  if (userId !== req.auth.userId && !["manager", "assistant"].includes(req.auth.role)) return res.status(403).json({ error: "manager_only" });
+  try {
+    const out = await withBranch(req.auth.branchId, async (c) => {
+      const { rows: u } = await c.query("select id from users where id = $1 and branch_id = $2", [userId, req.auth.branchId]);
+      if (!u[0]) return { error: "employee_not_found", status: 404 };
+      const pol = await hrPolicyOf(c, req.auth.branchId);
+      // اليوم والساعة بتوقيت الرياض
+      const now = new Date(Date.now() + 3 * 3600 * 1000);
+      const day = now.toISOString().slice(0, 10);
+      const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
+      if (action === "in") {
+        const late = Math.max(0, mins - (minutesOf(pol.shiftStart) ?? 0) - (Number(pol.graceMin) || 0));
+        const { rows } = await c.query(
+          `insert into attendance (branch_id, user_id, date, status, check_in, late_min)
+           values ($1,$2,$3,$4, now(), $5)
+           on conflict (user_id, date) do update set check_in = coalesce(attendance.check_in, excluded.check_in),
+             status = case when attendance.check_in is null then excluded.status else attendance.status end,
+             late_min = case when attendance.check_in is null then excluded.late_min else attendance.late_min end
+           returning *`, [req.auth.branchId, userId, day, late > 0 ? "late" : "present", late]);
+        return { record: rows[0] };
+      }
+      const over = Math.max(0, mins - (minutesOf(pol.shiftEnd) ?? 24 * 60));
+      const { rows } = await c.query(
+        `update attendance set check_out = now(), overtime_min = $4
+          where user_id = $1 and branch_id = $2 and date = $3 and check_in is not null and check_out is null returning *`,
+        [userId, req.auth.branchId, day, over]);
+      return rows[0] ? { record: rows[0] } : { error: "not_checked_in", status: 409 };
+    });
+    if (out.error) { const { status, ...body } = out; return res.status(status || 400).json(body); }
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
+export { HR_DEFAULT_POLICY };
 export default router;
