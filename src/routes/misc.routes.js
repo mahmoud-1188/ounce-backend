@@ -964,8 +964,49 @@ const USD_TO_SAR_PEG = 3.75;
 let goldPriceCache = { at: 0, data: null };
 const GOLD_PRICE_CACHE_MS = 60 * 1000;
 
+// مزوّدٌ مدفوع اختياري (المرجع 2026-10-10 د): GOLD_PRICE_PROVIDER + GOLD_PRICE_API_KEY في متغيّرات
+// الخادم وحدها (Railway) — لا مفتاح في المتصفّح. يُسأل أوّلًا، وإن تعذّر يُرجع إلى المجاني أدناه.
+// كلٌّ يردّ بسعر الأونصة الترويّة بالريال (XAU→SAR) أو بجرام 24 مباشرة.
+const ozRateToGram24 = (j) => {
+  const oz = Number(j?.rates?.SAR);
+  if (!(oz > 0)) return null;
+  return (oz < 1 ? 1 / oz : oz) / GRAMS_PER_OUNCE;
+};
+const PAID_PRICE_PROVIDERS = {
+  goldapi: { label: "GoldAPI.io", url: () => "https://www.goldapi.io/api/XAU/SAR", headers: (key) => ({ "x-access-token": key }),
+    parse: (j) => { const g = Number(j?.price_gram_24k); if (g > 0) return g; const oz = Number(j?.price); return oz > 0 ? oz / GRAMS_PER_OUNCE : null; } },
+  metalpriceapi: { label: "MetalpriceAPI", url: (key) => `https://api.metalpriceapi.com/v1/latest?api_key=${encodeURIComponent(key)}&base=XAU&currencies=SAR`,
+    headers: () => ({}), parse: ozRateToGram24 },
+  metalsapi: { label: "Metals-API", url: (key) => `https://metals-api.com/api/latest?access_key=${encodeURIComponent(key)}&base=XAU&symbols=SAR`,
+    headers: () => ({}), parse: ozRateToGram24 },
+};
+// حدود المعقول لجرام 24 بالريال — ما خارجها ردٌّ معطوب لا سعر
+const PRICE_SANE = { min: 50, max: 2000 };
+
+async function fetchPaidPrice() {
+  const p = PAID_PRICE_PROVIDERS[String(process.env.GOLD_PRICE_PROVIDER || "").trim().toLowerCase()];
+  const key = String(process.env.GOLD_PRICE_API_KEY || "").trim();
+  if (!p || !key) return null;
+  try {
+    const r = await fetch(p.url(key), { headers: p.headers(key), signal: AbortSignal.timeout(8000) });
+    if (!r.ok) { console.error(`${p.label} price: HTTP ${r.status}`); return null; }
+    const g = p.parse(await r.json());
+    const v = g == null ? null : roundMoney(g);
+    if (!(v >= PRICE_SANE.min && v <= PRICE_SANE.max)) { console.error(`${p.label} price out of range: ${v}`); return null; }
+    return { perGram: v, asOf: new Date().toISOString(), provider: p.label };
+  } catch (err) {
+    console.error(`${p.label} price failed:`, err.message);
+    return null;
+  }
+}
+
 async function fetchWorldPrice() {
   if (goldPriceCache.data && Date.now() - goldPriceCache.at < GOLD_PRICE_CACHE_MS) return goldPriceCache.data;
+  const paid = await fetchPaidPrice();
+  if (paid) {
+    goldPriceCache = { at: Date.now(), data: paid };
+    return paid;
+  }
   const response = await fetch("https://api.gold-api.com/price/XAU");
   if (!response.ok) throw new Error("gold_api_unavailable");
   const body = await response.json();
@@ -990,6 +1031,7 @@ router.get("/gold-price", authenticate, async (req, res, next) => {
       source = "hq";
     } else {
       world = await fetchWorldPrice();
+      if (world.provider) source = "paid";
     }
     res.json({
       ...world,
