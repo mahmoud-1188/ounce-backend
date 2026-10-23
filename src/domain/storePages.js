@@ -41,6 +41,7 @@ const RULES = [
   [null, /^\/store\/ops-log$/, ["opsLog"]],
   [null, /^\/store\/client-errors(\/.*)?$/, ["clientErrors"]],
   [null, /^\/store\/api-keys(\/.*)?$/, ["apiKeys"]],
+  [null, /^\/store\/ai\/chat$/, ["assistant"]],
   [null, /^\/store\/users(\/.*)?$/, ["org"]],
 ];
 
