@@ -838,6 +838,18 @@ router.put("/store/price-policy", requireCanManageBranches, async (req, res, nex
   }
 });
 
+// ══ المحاسبة بسيطة أو مفصّلة في الإدارة (migration 097) — للمالك وحده ══════
+router.put("/store/accounting-mode", requireStoreOwner, async (req, res, next) => {
+  const mode = req.body?.mode === "simple" ? "simple" : req.body?.mode === "detailed" ? "detailed" : null;
+  if (!mode) return res.status(400).json({ error: "invalid_accounting_mode" });
+  try {
+    await withoutBranch((client) => client.query("update stores set accounting_mode = $1 where id = $2", [mode, req.storeAuth.storeId]));
+    res.json({ accountingMode: mode });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ══ إعلانات الإدارة لكل الفروع ══════════════════════════════════════════
 router.get("/store/notices", async (req, res, next) => {
   try {

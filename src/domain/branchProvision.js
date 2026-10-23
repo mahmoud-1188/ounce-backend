@@ -65,6 +65,11 @@ function cleanSettings(s = {}) {
     }
     local.marginByKarat = m;
   }
+  // وضع المحاسبة يصل الفرع مع تجهيزه (المرجع: «اختيار الإدارة يصل الفروع المُدارة»)
+  if (s.accountingMode != null) {
+    if (!["detailed", "simple"].includes(s.accountingMode)) return { error: "invalid_accounting_mode" };
+    local.accountingMode = s.accountingMode;
+  }
   if (s.scrapAssayMode != null) {
     if (!["hq", "branch"].includes(s.scrapAssayMode)) return { error: "invalid_scrap_assay_mode" };
     local.scrapAssayMode = s.scrapAssayMode;

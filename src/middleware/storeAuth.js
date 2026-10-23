@@ -35,7 +35,7 @@ async function authenticateStore(req, res, next) {
   try {
     const { rows } = await withoutBranch((client) =>
       client.query(
-        `select su.*, s.status as store_status, s.subscription_expires_at, s.package as store_package
+        `select su.*, s.status as store_status, s.subscription_expires_at, s.package as store_package, s.accounting_mode
            from store_users su
            join stores s on s.id = su.store_id
           where su.id = $1 and su.store_id = $2 and su.active = true`,
@@ -70,6 +70,7 @@ async function authenticateStore(req, res, next) {
       canManageBranches: !!storeUser.can_manage_branches,
       canSendCoding: !!storeUser.can_send_coding,
       storePackage: storeUser.store_package || "full",
+      accountingMode: storeUser.accounting_mode === "simple" ? "simple" : "detailed",
     };
     // باقة «بدون محاسبة» (migration 070): مسارات الإدارة المحاسبية مرفوضة
     if (hqRouteBlocked(req.storeAuth.storePackage, req.originalUrl)) return res.status(403).json({ error: "package_no_accounting" });
