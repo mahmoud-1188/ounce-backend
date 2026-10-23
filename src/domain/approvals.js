@@ -22,7 +22,7 @@ const ROUTABLE_NONE = ["label_reprint"];
 // مهلة الطلب المعلّق (المرجع ت٢): بعدها يُعلَّم «انتهت مهلته» ولا يُقرَّر ولا يُنفَّذ
 const APPROVAL_EXPIRY_HOURS = 72;
 
-async function approvalGate(client, auth, { kind, amount, payload = null, approvalId = null, note = null }) {
+async function approvalGate(client, auth, { kind, amount, payload = null, approvalId = null, note = null, category = null }) {
   const amt = roundMoney(amount);
   const branchId = auth.branchId;
 
@@ -55,7 +55,9 @@ async function approvalGate(client, auth, { kind, amount, payload = null, approv
   const { rows: ruleRows } = await client.query("select * from approval_rules where id = $1", [kind]);
   const rule = ruleRows[0];
   if (!rule) return { proceed: true };
-  const custom = st[0]?.approval_thresholds?.[kind];
+  // حدٌّ خاصّ بفئة المصروف (الإيجار «expense:rent») يغلب حدّ النوع، وكلاهما من تجهيز الإدارة
+  const catTh = category != null ? st[0]?.approval_thresholds?.[`${kind}:${category}`] : null;
+  const custom = catTh != null && Number.isFinite(Number(catTh)) ? catTh : st[0]?.approval_thresholds?.[kind];
   const threshold = custom != null && Number.isFinite(Number(custom)) ? Number(custom) : Number(rule.threshold) || 0;
   if (amt < threshold) return { proceed: true };
 
