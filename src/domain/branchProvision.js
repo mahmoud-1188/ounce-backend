@@ -28,7 +28,7 @@ function cleanProfile(p) {
 }
 
 // حدود الاعتماد التي تُجهَّز للفرع من الإدارة (من المبلغ فأكثر يحتاج اعتمادًا)
-const PROVISION_THRESHOLD_KINDS = ["expense", "refund", "supplier_settle", "asset_purchase", "payroll_run", "journal_reverse", "count_variance", "safe_audit", "workshop_wastage"];
+const PROVISION_THRESHOLD_KINDS = ["expense", "expense:rent", "refund", "supplier_settle", "asset_purchase", "payroll_run", "journal_reverse", "count_variance", "safe_audit", "workshop_wastage"];
 
 function cleanSettings(s = {}) {
   const server = {};

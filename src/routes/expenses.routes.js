@@ -155,7 +155,7 @@ router.post("/expenses", async (req, res, next) => {
     const result = await withBranch(req.auth.branchId, async (client) => {
       // ⚖ ما فوق حدّ الاعتماد لا يُنفَّذ بل يُحفظ طلبًا بحمولته
       const gate = await approvalGate(client, req.auth, {
-        kind: "expense", amount, approvalId: body.approvalId || null, note: name,
+        kind: "expense", amount, approvalId: body.approvalId || null, note: name, category,
         payload: { ...body, approvalId: undefined },
       });
       if (gate.error) return gate;
