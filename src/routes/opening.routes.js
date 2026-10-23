@@ -57,6 +57,9 @@ router.post("/opening/mode", authenticate, requirePage("openingBalance"), requir
   try {
     const result = await withBranch(req.auth.branchId, async (client) => {
       if (on) {
+        // إعادة فتح الافتتاح للإدارة والمالك وحدهما (المرجع HqOpeningPhaseForm) — الفرع التابع لمتجرٍ لا يفتحه بنفسه
+        const { rows: br } = await client.query("select store_id from branches where id = $1", [req.auth.branchId]);
+        if (br[0]?.store_id) return { error: "opening_reopen_hq_only" };
         // ⚠ للمحل الجديد قبل أول بيع: بضاعةٌ تُدخل رصيدًا افتتاحيًّا بعد أن
         //   باع المحل تخلط الافتتاح بالتشغيل.
         const { rows } = await client.query("select 1 from sales where branch_id = $1 limit 1", [req.auth.branchId]);
