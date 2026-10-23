@@ -71,8 +71,9 @@ const shapeYearClose = (r) => ({
  * إقفال السنة: قيدٌ ينقل رصيد كل حساب دخلٍ (منذ آخر إقفال) إلى 3300 الأرباح المحتجزة،
  * فتبدأ السنة التالية بحسابات دخلٍ صفرية. `snapshot` أرصدة الواجهة الختامية كما يحسبها التطبيق
  * (أساس التدفّقات بعده) تُحفظ كما هي. تحذيرٌ لا منع: أشهرٌ ماضية لم تُقفل.
+ * `by` لإقفال الإدارة عن بُعد (المرجع HqFiscalTab): اسمها يُحفظ في اللقطة والسجلّ، ولا مستخدم فرعٍ وراءه.
  */
-async function closeYear(client, branchId, { userId, snapshot = {}, notes = "", postJournal }) {
+async function closeYear(client, branchId, { userId, snapshot = {}, notes = "", postJournal, by = null }) {
   await client.query("select pg_advisory_xact_lock(hashtext('yearclose:' || $1::text))", [branchId]);
   const { rows: last } = await client.query(
     "select closed_at from fiscal_closures where branch_id = $1 and ref is not null order by closed_at desc limit 1", [branchId]);
@@ -98,8 +99,9 @@ async function closeYear(client, branchId, { userId, snapshot = {}, notes = "", 
   const ref = `FYC-${String(cnt[0].n).padStart(4, "0")}`;
   const entryId = await postJournal({
     branchId, businessDayId: null, opType: "year_close", refTable: "fiscal_closures", refId: null,
-    description: `إقفال السنة المالية ${ref}`, createdBy: userId, lines,
+    description: `إقفال السنة المالية ${ref}${by ? ` — ${by}` : ""}`, createdBy: userId, lines,
   });
+  if (by) snapshot = { ...(snapshot || {}), closedByName: by, closedByKind: "store" };
   const { rows: ins } = await client.query(
     `insert into fiscal_closures (branch_id, period, closed_by, ref, period_start, revenue, expenses, net_income, closing_entry_id, snapshot, notes)
      values ($1, (now() at time zone '${TZ}')::date, $2, $3, $4, $5, $6, $7, $8, $9, $10) returning *`,
@@ -107,7 +109,7 @@ async function closeYear(client, branchId, { userId, snapshot = {}, notes = "", 
   await client.query("update journal_entries set ref_id = $1 where id = $2", [ins[0].id, entryId]);
   await client.query(
     `insert into audit_log (branch_id, event_type, actor_id, ref_table, ref_id, details) values ($1,'create',$2,'fiscal_closures',$3,$4)`,
-    [branchId, userId, ins[0].id, JSON.stringify({ kind: "close_year", ref, netIncome: -netH / 100 })]);
+    [branchId, userId, ins[0].id, JSON.stringify({ kind: "close_year", ref, netIncome: -netH / 100, ...(by ? { by, byKind: "store" } : {}) })]);
   return { closure: shapeYearClose(ins[0]) };
 }
 

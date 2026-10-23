@@ -2,7 +2,8 @@ import { Router } from "express";
 import { withBranch, withoutBranch } from "../db.js";
 import { wastageReport } from "./workshop.routes.js";
 import { authenticateStore, requireCanManageBranches, requireCanSendCoding, requireStoreOwner } from "../middleware/storeAuth.js";
-import { closeMonth, fiscalStatus } from "../domain/periodClose.js";
+import { closeMonth, closeYear, fiscalStatus, listYearCloses, yearCloseChecks } from "../domain/periodClose.js";
+import { postJournalEntry } from "../domain/journal.js";
 import { issueEnrollCode } from "../domain/enroll.js";
 import { branchDevices, revokeDevice } from "../domain/devices.js";
 import { codeRemnant, listRemnants } from "../domain/remnants.js";
@@ -66,6 +67,50 @@ router.post("/store/branches/:branchId/close-month", requireCanManageBranches, a
     }
     const r = await withBranch(req.params.branchId, (c) => closeMonth(c, req.params.branchId, String(req.body?.period || ""), { by: `الإدارة — ${req.storeAuth.name || ""}`.trim(), kind: "store" }));
     if (r.error) return res.status(r.error === "invalid_period" ? 400 : 409).json(r);
+    res.status(201).json(r);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * إقفال السنة المالية لفرعٍ من الإدارة (المرجع HqFiscalTab):
+ *   GET  /store/branches/:branchId/fiscal-year  — دخل الفترة منذ آخر إقفال وتحذيراتها وسجلّ الإقفالات
+ *   POST /store/branches/:branchId/close-year { notes } — قيد الإقفال إلى 3300 باسم الإدارة
+ * ⚠ يُقفل كل ما قبل لحظة الإقفال: حسابات الدخل تبدأ صفرًا بعده. الأشهر الماضية غير المُقفلة تحذيرٌ لا منع، كما في الفرع.
+ *   ودفتر الإدارة نفسه لا تُقفل سنته قبل أن تُقفل الفروع سنتها — فلا تُقفل المجموعة على أرقامٍ تتحرّك.
+ */
+router.get("/store/branches/:branchId/fiscal-year", async (req, res, next) => {
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    res.json(await withBranch(req.params.branchId, async (c) => ({
+      ...(await yearCloseChecks(c, req.params.branchId)), closures: await listYearCloses(c, req.params.branchId),
+    })));
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/store/branches/:branchId/close-year", requireCanManageBranches, async (req, res, next) => {
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    const { rows: brs } = await withoutBranch((c) => c.query(
+      "select id, name, is_hq from branches where store_id = $1 and deleted_at is null", [req.storeAuth.storeId]));
+    if (brs.find((b) => b.id === req.params.branchId)?.is_hq) {
+      // فرعٌ له دخلٌ بعد آخر إقفالٍ لسنته = سنته مفتوحة
+      const open = [];
+      for (const b of brs.filter((x) => !x.is_hq)) {
+        const chk = await withBranch(b.id, (c) => yearCloseChecks(c, b.id));
+        if (Math.abs(chk.revenue) > 0.004 || Math.abs(chk.expenses) > 0.004) open.push(b.name);
+      }
+      if (open.length) return res.status(409).json({ error: "branches_year_not_closed", branches: open });
+    }
+    const by = `الإدارة — ${req.storeAuth.name || ""}`.trim();
+    const r = await withBranch(req.params.branchId, (c) => closeYear(c, req.params.branchId, {
+      userId: null, notes: String(req.body?.notes || "").slice(0, 500), by,
+      postJournal: (entry) => postJournalEntry(c, entry),
+    }));
+    if (r.error) return res.status(409).json(r);
     res.status(201).json(r);
   } catch (err) {
     next(err);
