@@ -42,9 +42,7 @@ async function approvalGate(client, auth, { kind, amount, payload = null, approv
     return { proceed: true, approvalId: ap.id };
   }
 
-  // ⚖ «بلا موافقات» من الإدارة: لا طلبات اعتمادٍ أصلًا
   const deleg = await branchDelegation(client, branchId);
-  if (deleg.noApprovals) return { proceed: true };
   // ⚖ «مخزون وجرد فقط» (باقة بلا محاسبة): إدخالٌ وإخراجٌ بلا موافقاتٍ ولا طلبات
   if (auth.storePackage === "no_accounting") return { proceed: true };
   const { rows: st } = await client.query(
@@ -60,6 +58,11 @@ async function approvalGate(client, auth, { kind, amount, payload = null, approv
   const custom = catTh != null && Number.isFinite(Number(catTh)) ? catTh : st[0]?.approval_thresholds?.[kind];
   const threshold = custom != null && Number.isFinite(Number(custom)) ? Number(custom) : Number(rule.threshold) || 0;
   if (amt < threshold) return { proceed: true };
+  // ⚖ «بلا موافقات» من الإدارة: لا طلبات اعتمادٍ أصلًا — وما فوق الحدّ يُدوَّن (migration 102)
+  if (deleg.noApprovals) {
+    await logWaiver(client, auth, { kind, amount: amt, threshold, reason: "delegation", note });
+    return { proceed: true, waived: true };
+  }
 
   const { rows: nRows } = await client.query(
     "select count(*)::int + 1 as n from approvals where branch_id = $1",
@@ -73,7 +76,10 @@ async function approvalGate(client, auth, { kind, amount, payload = null, approv
     [branchId]
   );
   // «بلا موافقة» (للأنواع التي تسمح بها الإدارة — إعادة طباعة الملصق): يمضي ويُدوَّن في سجلّ العملية نفسها
-  if (rt[0]?.approval_routing?.[kind] === "none" && ROUTABLE_NONE.includes(kind)) return { proceed: true };
+  if (rt[0]?.approval_routing?.[kind] === "none" && ROUTABLE_NONE.includes(kind)) {
+    await logWaiver(client, auth, { kind, amount: amt, threshold, reason: "routing_none", note });
+    return { proceed: true, waived: true };
+  }
   // «تفويض كامل للفرع»: لا شيء يصعد للإدارة، والمعتمِد في الفرع يعتمد ما يطلبه
   const noSelf = NO_SELF_KINDS.includes(kind) && !deleg.full;
   // من لا يعتمد نفسه وهو أعلى معتمِدٍ في الفرع: طلبه للإدارة
@@ -101,6 +107,27 @@ async function approvalGate(client, auth, { kind, amount, payload = null, approv
   );
   if (selfApprove) return { proceed: true, approvalId: apRows[0].id, selfApproved: true };
   return { pending: shapeApproval(apRows[0], rule) };
+}
+
+/// ما مضى بلا موافقة (migration 102): أثرٌ لكل عمليةٍ فوق الحدّ مضت بتفويض الإدارة
+async function logWaiver(client, auth, { kind, amount, threshold, reason, note }) {
+  await client.query(
+    `insert into approval_waivers (branch_id, kind, amount, threshold, reason, note, actor_id, actor_name, actor_role)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [auth.branchId, kind, amount, threshold, reason, note ? String(note).slice(0, 200) : null,
+      auth.userId || null, auth.user?.name || null, auth.role || null]);
+}
+
+/// سجلّ ما مضى بلا موافقة لفرع — الأحدث أوّلًا
+async function listWaivers(client, branchId, days = 30) {
+  const { rows } = await client.query(
+    `select w.*, coalesce(r.label, w.kind) as kind_label from approval_waivers w left join approval_rules r on r.id = w.kind
+      where w.branch_id = $1 and w.created_at > now() - make_interval(days => $2::int)
+      order by w.created_at desc limit 300`, [branchId, days]);
+  return rows.map((w) => ({
+    id: w.id, kind: w.kind, kindLabel: w.kind_label, amount: Number(w.amount) || 0, threshold: w.threshold == null ? null : Number(w.threshold),
+    reason: w.reason, note: w.note || "", actor: w.actor_name || "", actorRole: w.actor_role || null, at: w.created_at,
+  }));
 }
 
 function shapeApproval(a, rule = null) {
@@ -168,4 +195,4 @@ async function expireStaleApprovals(client, branchId) {
   );
 }
 
-export { ROUTABLE_NONE, APPROVAL_EXPIRY_HOURS, approvalExpiryHours, NO_SELF_KINDS, expireStaleApprovals, approvalGate, shapeApproval, loadBranchApprovalRouting, routesToHq };
+export { ROUTABLE_NONE, APPROVAL_EXPIRY_HOURS, approvalExpiryHours, NO_SELF_KINDS, expireStaleApprovals, approvalGate, shapeApproval, loadBranchApprovalRouting, routesToHq, listWaivers };

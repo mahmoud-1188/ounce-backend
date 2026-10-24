@@ -9,7 +9,7 @@ import { hashPin, verifyPin } from "../auth/hashPin.js";
 import { postJournalEntry } from "../domain/journal.js";
 import { roundMoney } from "../domain/money.js";
 import { getOpenBusinessDay } from "../domain/saleOps.js";
-import { approvalExpiryHours, NO_SELF_KINDS, expireStaleApprovals, shapeApproval } from "../domain/approvals.js";
+import { approvalExpiryHours, NO_SELF_KINDS, expireStaleApprovals, listWaivers, shapeApproval } from "../domain/approvals.js";
 import { logPermission } from "../domain/permissionLog.js";
 import { ENROLL_TTL_MIN, codeHash, issueEnrollCode } from "../domain/enroll.js";
 import { branchDevices, createDevice, deviceLabel, revokeDevice } from "../domain/devices.js";
@@ -103,6 +103,16 @@ router.get("/approvals", authenticate, requireAnyPage("approvals", "accountantRe
     res.json({
       approvals: rows.filter((a) => all || a.requested_by === req.auth.userId).map((a) => shapeApproval(a, { label: a.rule_label })),
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** GET /api/approvals/waived?days=30 — ما مضى بلا موافقة بتفويض الإدارة (migration 102) — لمن يملك شاشة الاعتمادات */
+router.get("/approvals/waived", authenticate, requireAnyPage("approvals"), async (req, res, next) => {
+  const days = Math.min(365, Math.max(1, Math.round(Number(req.query.days) || 30)));
+  try {
+    res.json({ days, waived: await withBranch(req.auth.branchId, (c) => listWaivers(c, req.auth.branchId, days)) });
   } catch (err) {
     next(err);
   }

@@ -129,6 +129,10 @@ router.get("/store/alerts", async (req, res, next) => {
     const alerts = [];
     for (const b of branches) {
       const push = (level, kind, label, page) => alerts.push({ branchId: b.id, name: b.name, level, kind, label, page });
+      // ما مضى بلا موافقة بتفويض الإدارة في 30 يومًا (migration 102) — للاطّلاع
+      const [wv] = await withBranch(b.id, async (c) => (await c.query(
+        "select count(*)::int as n, coalesce(sum(amount), 0) as t from approval_waivers where branch_id = $1 and created_at > now() - interval '30 days'", [b.id])).rows);
+      if (wv.n > 0) push("info", "waived", `${wv.n} عمليةً مضت بلا موافقة بتفويض الإدارة (30 يومًا) بمجموع ${roundMoney(wv.t)}`, "branches");
       const r = await withBranch(b.id, async (c) => {
         const q = async (sql, args = [b.id]) => (await c.query(sql, args)).rows;
         const [last] = await q("select max(created_at) as at from journal_entries where branch_id = $1");

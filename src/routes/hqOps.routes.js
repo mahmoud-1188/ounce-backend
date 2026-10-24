@@ -9,6 +9,7 @@ import { branchDevices, revokeDevice } from "../domain/devices.js";
 import { codeRemnant, listRemnants } from "../domain/remnants.js";
 import { codeLotItems } from "./items.routes.js";
 import { openingStats } from "./opening.routes.js";
+import { listWaivers } from "../domain/approvals.js";
 
 const router = Router();
 
@@ -259,6 +260,17 @@ router.get("/store/branches/:branchId/remote-stocktakes", requireCanManageBranch
       `select r.*, u.name as decided_by_name from remote_stocktakes r left join users u on u.id = r.decided_by
         where r.branch_id = $1 order by r.requested_at desc limit 50`, [req.params.branchId])).rows);
     res.json({ stocktakes: rows.map(shapeRst) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** GET /store/branches/:branchId/waived?days=30 — ما مضى بلا موافقة في الفرع بتفويض الإدارة (migration 102) */
+router.get("/store/branches/:branchId/waived", async (req, res, next) => {
+  const days = Math.min(365, Math.max(1, Math.round(Number(req.query.days) || 30)));
+  try {
+    if (!(await inStore(req.storeAuth.storeId, req.params.branchId))) return res.status(404).json({ error: "branch_not_found" });
+    res.json({ days, waived: await withBranch(req.params.branchId, (c) => listWaivers(c, req.params.branchId, days)) });
   } catch (err) {
     next(err);
   }
