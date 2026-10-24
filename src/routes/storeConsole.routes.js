@@ -27,11 +27,15 @@ const router = Router();
 router.use("/store", authenticateStore);
 
 const actorOf = (req) => req.storeAuth.name || "الإدارة";
+const TZ = "Asia/Riyadh";
+// مهل التنبيه كما في المرجع (hqAlerts): تكويد الافتتاح 30 يومًا، وبقايا الأطقم 7 أيام
+const OPENING_DEADLINE_DAYS = 30;
+const REMNANT_STALE_DAYS = 7;
 
 async function storeBranches(storeId) {
   const { rows } = await withoutBranch((client) =>
     client.query(
-      "select id, ref, name, is_hq, target30 from branches where store_id = $1 and deleted_at is null order by name",
+      "select id, ref, name, is_hq, target30, expense_cap from branches where store_id = $1 and deleted_at is null order by name",
       [storeId]
     )
   );
@@ -156,9 +160,51 @@ router.get("/store/alerts", async (req, res, next) => {
            where a.branch_id = $1 and a.status = 'approved' and a.executed_at is null and a.decided_at < now() - interval '2 hours'
            order by a.decided_at`);
         const hrDocs = (await hrDocAlerts(c, b.id, 30)).filter((a) => a.daysLeft <= 30);
-        return { wrapped: { last, stale, neg, aps, ar, mtd, dead, bal, negGold, idle, hrDocs } };
+        // ── من المرجع (hqAlerts) ──
+        // مصروفات الشهر مقابل موازنته (حسابات المصروف ذات الموازنة) ومقابل سقف الإدارة
+        const MONTH = `to_char(now() at time zone '${TZ}', 'YYYY-MM')`;
+        const [expM] = await q(`select coalesce(sum(amount), 0) as t from expenses
+           where branch_id = $1 and to_char(created_at at time zone '${TZ}', 'YYYY-MM') = ${MONTH}`);
+        const [bud] = await q(`select coalesce(sum(b.amount), 0) as planned from account_budgets b join accounts a on a.code = b.account_code
+           where b.branch_id = $1 and a.nature = 'debit' and b.period = ${MONTH}`);
+        const [budAct] = await q(`select coalesce(sum(case when l.side = 'debit' then l.amount else -l.amount end), 0) as actual
+             from journal_lines l join journal_entries e on e.id = l.entry_id
+            where e.branch_id = $1 and to_char(e.created_at at time zone '${TZ}', 'YYYY-MM') = ${MONTH}
+              and l.account_code in (select b.account_code from account_budgets b join accounts a on a.code = b.account_code
+                                      where b.branch_id = $1 and a.nature = 'debit' and b.period = ${MONTH})`);
+        // تكويد الافتتاح مفتوحٌ وفيه قطع — منذ أوّل دفعة افتتاحية مفتوحة
+        const [opening] = await q(`select s.opening_mode as open,
+              (select min(l.date) from lots l where l.branch_id = $1 and l.source = 'opening' and l.status = 'open') as since,
+              (select count(u.id)::int from lots l join items i on i.lot_id = l.id join item_units u on u.item_id = i.id
+                where l.branch_id = $1 and l.source = 'opening') as pieces
+             from branch_settings s where s.branch_id = $1`);
+        // بقايا أطقم تنتظر التكويد
+        const [rem] = await q(`select count(*)::int as n, coalesce(sum(i.weight), 0) as w, min(i.date_added) as oldest from items i
+           where i.branch_id = $1 and i.remnant = true
+             and exists (select 1 from item_units u where u.item_id = i.id and u.sold = false and u.issued = false)`);
+        // قطعٌ مسجّلة مباعة وُجدت في الجرد — تنتظر قرار المدير
+        const [sf] = await q("select count(*)::int as n from stocktake_sold_found where branch_id = $1 and status = 'pending'");
+        // اعتمادٌ ذاتي (المعتمِد هو الطالب) في 30 يومًا
+        const [selfAp] = await q("select count(*)::int as n from approvals where branch_id = $1 and self_approved and created_at > now() - interval '30 days'");
+        return { wrapped: { last, stale, neg, aps, ar, mtd, dead, bal, negGold, idle, hrDocs, expM, bud, budAct, opening, rem, sf, selfAp } };
       });
-      const { last, stale, neg, aps, ar, mtd, dead, bal, negGold, idle, hrDocs } = r.wrapped;
+      const { last, stale, neg, aps, ar, mtd, dead, bal, negGold, idle, hrDocs, expM, bud, budAct, opening, rem, sf, selfAp } = r.wrapped;
+      const expMtd = roundMoney(expM.t);
+      if (Number(bud.planned) > 0 && Number(budAct.actual) > Number(bud.planned) + 0.005)
+        push("warn", "budget_over", `مصروفات الشهر ${roundMoney(budAct.actual)} تجاوزت موازنته ${roundMoney(bud.planned)}`, "expenses");
+      if (Number(b.expense_cap) > 0 && expMtd > Number(b.expense_cap) + 0.005)
+        push("warn", "expense_cap", `مصروفات الشهر ${expMtd} تجاوزت سقف الإدارة ${roundMoney(b.expense_cap)}`, "expenses");
+      if (opening?.open && Number(opening.pieces) > 0) {
+        const days = opening.since ? Math.floor((Date.now() - new Date(opening.since).getTime()) / 86400000) : 0;
+        const late = days > OPENING_DEADLINE_DAYS;
+        push(late ? "warn" : "info", "opening_open", `تكويد الافتتاح مفتوح — ${opening.pieces} قطعة${late ? ` — منذ ${days} يومًا، تجاوز ${OPENING_DEADLINE_DAYS} يومًا` : ""}`, "branches");
+      }
+      if (rem.n > 0) {
+        const d = rem.oldest ? Math.floor((Date.now() - new Date(rem.oldest).getTime()) / 86400000) : 0;
+        push(d > REMNANT_STALE_DAYS ? "warn" : "info", "set_remnants", `${rem.n} بقايا أطقم للتكويد (${roundWeight(rem.w)} جم)${d ? ` — أقدمها منذ ${d} يومًا` : ""}`, "branches");
+      }
+      if (sf.n > 0) push("warn", "sold_found", `${sf.n} قطعة مسجّلة مباعة وُجدت في الجرد — تنتظر مراجعة المدير`, "branches");
+      if (selfAp.n > 0) push("info", "self_approved", `${selfAp.n} اعتمادًا ذاتيًّا في 30 يومًا`, "approvals");
       hrDocs.forEach((a) => push(a.daysLeft < 0 ? "warn" : "info", "hr_doc", `${a.doc} ${a.name} ${a.daysLeft < 0 ? `انتهت منذ ${-a.daysLeft} يومًا` : `تنتهي خلال ${a.daysLeft} يومًا`} (${a.date})`, "ops"));
       if (Math.abs(Number(bal.diff)) >= 0.01) push("block", "unbalanced_book", `دفتره غير متوازن بفرق ${roundMoney(bal.diff)}`, "books");
       negGold.forEach((g) => push("block", "negative_gold", `ذهبٌ سالب في ${g.name || g.code}: ${roundWeight(g.fine)} جم 24`, "books"));
@@ -187,6 +233,14 @@ router.get("/store/alerts", async (req, res, next) => {
       alerts.push({ branchId: null, name: "تحويلات النقد", level: "block", kind: "cash_transit",
         label: `لا تتطابق بين الإدارة والفروع بفرق ${transit.diff} (في الدفاتر ${transit.ledger} · بانتظار الاستلام ${transit.pending})`, page: "hqDocs" });
     }
+    // بضاعةٌ في الطريق: وصلت ناقصةً ولم يُقرَّر فيها، أو أُرسلت منذ أيام ولم تُستلم
+    const goods = await goodsTransitRecon(req.storeAuth.storeId);
+    goods.items.filter((t) => t.status === "short").forEach((t) =>
+      alerts.push({ branchId: null, name: t.to, level: "warn", kind: "transit_short", label: `${t.ref} وصل ناقصًا (${t.missing} قطعة) — قرّر: عجزٌ أو إرجاع`, page: "transit" }));
+    const staleBy = new Map();
+    goods.items.filter((t) => t.stale).forEach((t) => { const x = staleBy.get(t.to) || { n: 0, days: 0 }; x.n += 1; x.days = Math.max(x.days, t.ageDays); staleBy.set(t.to, x); });
+    staleBy.forEach((x, to) => alerts.push({ branchId: null, name: to, level: "warn", kind: "transit_stale",
+      label: `${x.n} في الطريق منذ أكثر من 3 أيام (أقدمها ${x.days} يومًا)`, page: "transit" }));
     const order = { block: 0, warn: 1, info: 2 };
     alerts.sort((a, b) => order[a.level] - order[b.level]);
     res.json({ alerts });
@@ -415,26 +469,39 @@ router.get("/store/targets", async (req, res, next) => {
       )
     );
     const s30 = new Map(rows.map((r) => [r.branch_id, roundMoney(r.s)]));
+    const { rows: ex } = await withoutBranch((c) =>
+      c.query(`select branch_id, coalesce(sum(amount), 0) as t from expenses where branch_id = any($1::uuid[])
+                 and to_char(created_at at time zone '${TZ}', 'YYYY-MM') = to_char(now() at time zone '${TZ}', 'YYYY-MM') group by 1`, [ids]));
+    const exM = new Map(ex.map((r) => [r.branch_id, roundMoney(r.t)]));
     res.json({ branches: branches.map((b) => {
       const target = Number(b.target30) || 0;
       const sales30 = s30.get(b.id) || 0;
-      return { id: b.id, name: b.name, target30: target, sales30, pct: target > 0 ? Math.round((sales30 / target) * 1000) / 10 : null };
+      const expenseCap = Number(b.expense_cap) || 0;
+      const expensesMtd = exM.get(b.id) || 0;
+      return { id: b.id, name: b.name, target30: target, sales30, pct: target > 0 ? Math.round((sales30 / target) * 1000) / 10 : null,
+        expenseCap, expensesMtd, overCap: expenseCap > 0 && expensesMtd > expenseCap + 0.005 };
     }) });
   } catch (err) {
     next(err);
   }
 });
 
+// «هدف وسقف» (المرجع): هدف مبيعات ٣٠ يومًا، وسقف مصروفات الشهر (migration 101) — أيّهما أُرسل يُحفظ
 router.patch("/store/branches/:branchId/target", requireCanManageBranches, async (req, res, next) => {
-  const t = Number(req.body?.target30);
-  if (!Number.isFinite(t) || t < 0) return res.status(400).json({ error: "invalid_target" });
+  const body = req.body || {};
+  const t = body.target30 != null ? Number(body.target30) : null;
+  const cap = body.expenseCap != null ? Number(body.expenseCap) : null;
+  if (t == null && cap == null) return res.status(400).json({ error: "invalid_target" });
+  if (t != null && (!Number.isFinite(t) || t < 0)) return res.status(400).json({ error: "invalid_target" });
+  if (cap != null && (!Number.isFinite(cap) || cap < 0)) return res.status(400).json({ error: "invalid_expense_cap" });
   try {
     const { rows } = await withoutBranch((c) =>
-      c.query("update branches set target30 = $1 where id = $2 and store_id = $3 and deleted_at is null returning id, target30",
-        [roundMoney(t), req.params.branchId, req.storeAuth.storeId])
+      c.query(`update branches set target30 = coalesce($1, target30), expense_cap = coalesce($4, expense_cap)
+                where id = $2 and store_id = $3 and deleted_at is null returning id, target30, expense_cap`,
+        [t == null ? null : roundMoney(t), req.params.branchId, req.storeAuth.storeId, cap == null ? null : roundMoney(cap)])
     );
     if (!rows[0]) return res.status(404).json({ error: "branch_not_found" });
-    res.json({ id: rows[0].id, target30: Number(rows[0].target30) });
+    res.json({ id: rows[0].id, target30: Number(rows[0].target30), expenseCap: Number(rows[0].expense_cap) });
   } catch (err) {
     notFoundOn22P02(err, res, next);
   }
