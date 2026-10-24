@@ -138,7 +138,11 @@ router.post(
         }
 
         const stonesMarginEst = grossWeight != null ? Math.max(0, roundWeight(grossWeight - weight)) : 0;
-        const stage = stonesMarginEst > 0.0005 ? "pending_break" : "in_box";
+        // مسار الكسر «مباشرةً إلى الخزنة» (المرجع scrapFlow=direct): بلا موظف كسرٍ ولا فحص — يدخل الخزنة بوزن الشراء.
+        //   ما فيه فصوصٌ يبقى للتكسير أوّلًا: وزنه الصافي لم يُعرف بعد.
+        const { rows: prefRows } = await client.query("select sale_prefs from branch_settings where branch_id = $1", [req.auth.branchId]);
+        const direct = prefRows[0]?.sale_prefs?.scrapFlow === "direct";
+        const stage = stonesMarginEst > 0.0005 ? "pending_break" : direct ? "in_safe" : "in_box";
 
         const { rows: refRows } = await client.query(
           `select count(*)::int + 1 as n from scrap_items where branch_id = $1`,
@@ -160,6 +164,15 @@ router.post(
           ]
         );
         const item = itemRows[0];
+        if (stage === "in_safe") {
+          await client.query(
+            `update scrap_items set karat_final = $1, weight_final = $2, weight_remaining = $2, confirmed_by = $3, confirmed_at = now() where id = $4`,
+            [karat, weight, req.auth.userId, item.id]);
+          await client.query(
+            `insert into safe_gold_tx (branch_id, business_day_id, direction, karat, weight, destination, supplier_id, note, created_by)
+             values ($1,$2,'in',$3,$4,'scrap_deposit',null,$5,$6)`,
+            [req.auth.branchId, businessDayId, karat, weight, `كسر ${item.ref} — مباشرةً إلى الخزنة`, req.auth.userId]);
+        }
 
         await client.query(
           `insert into scrap_custody (branch_id, business_day_id, direction, amount, note, created_by)

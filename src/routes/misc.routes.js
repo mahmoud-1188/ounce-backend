@@ -144,6 +144,12 @@ router.get("/reservations", async (req, res, next) => {
   }
 });
 
+/// عربون الحجز إلزاميٌّ ما لم يجعله المدير اختياريًّا (المرجع reservationDepositRequired)
+async function depositOptional(branchId) {
+  const rows = await withBranch(branchId, async (c) => (await c.query("select sale_prefs from branch_settings where branch_id = $1", [branchId])).rows);
+  return rows[0]?.sale_prefs?.reservationDepositRequired === false;
+}
+
 router.post("/reservations", async (req, res, next) => {
   const body = req.body || {};
   const total = roundMoney(body.total);
@@ -152,6 +158,7 @@ router.post("/reservations", async (req, res, next) => {
   if (!body.customerId) return res.status(400).json({ error: "customer_required" });
   if (!(total > 0)) return res.status(400).json({ error: "invalid_total" });
   if (deposit < 0 || deposit > total) return res.status(400).json({ error: "invalid_deposit" });
+  if (!(deposit > 0) && !(await depositOptional(req.auth.branchId))) return res.status(400).json({ error: "deposit_required" });
   if (body.holdUntil && !YMD.test(String(body.holdUntil))) return res.status(400).json({ error: "invalid_hold_until" });
   const plan = body.plan && Number(body.plan.count) > 0 && deposit < total
     ? { initialDeposit: deposit, everyDays: Math.round(Number(body.plan.everyDays) || 30),

@@ -113,6 +113,10 @@ router.patch("/settings/branch", requirePage("settings"), requireManager, async 
         if (body.salePrefs.postSaleSheet != null) p.postSaleSheet = !!body.salePrefs.postSaleSheet;
         if (body.salePrefs.sellDuringStocktake != null) p.sellDuringStocktake = !!body.salePrefs.sellDuringStocktake;
         if (body.salePrefs.quoteDays != null) p.quoteDays = Math.max(1, Math.min(60, Math.round(Number(body.salePrefs.quoteDays) || 7)));
+        // مسار الكسر (المرجع scrapFlow): «review» يمرّ بموظف الكسر والفحص قبل الخزنة، و«direct» يدخلها مباشرةً
+        if (body.salePrefs.scrapFlow != null) p.scrapFlow = body.salePrefs.scrapFlow === "direct" ? "direct" : "review";
+        // عربون الحجز (المرجع reservationDepositRequired): إلزاميٌّ افتراضًا
+        if (body.salePrefs.reservationDepositRequired != null) p.reservationDepositRequired = !!body.salePrefs.reservationDepositRequired;
         // الهدر والفروق: المسموح الافتراضي للورشة وتسامح فرق التكويد ووزن الميزان
         const w = body.salePrefs.wastage;
         if (w && typeof w === "object") {
